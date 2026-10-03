@@ -154,9 +154,11 @@ public actor PlatformSupervisor {
             ]),
             "appleAvailability": .string(AppleModelAvailability.status().rawValue),
             "categories": .object([
-                "appleFoundationModels": .string(CategoryStatus.observing.rawValue),
+                "appleFoundationModels": .string(appleCategory().rawValue),
                 "ownedOpenWeight": .string(CategoryStatus.notConfigured.rawValue),
-                "typedML": .string(CategoryStatus.notConfigured.rawValue),
+                "typedML": .string(mlPredictors.isEmpty
+                                   ? CategoryStatus.notConfigured.rawValue
+                                   : CategoryStatus.qualified.rawValue),
             ]),
             "counts": .object([
                 "activeInference": .int(Int64(activeJobs.count)),
@@ -164,6 +166,14 @@ public actor PlatformSupervisor {
                 "inferenceBlocked": .bool(inferenceBlocked),
             ]),
         ])
+    }
+
+    /// Truthful category status: qualified only when a real provider instance
+    /// is registered; observing when availability is observable but nothing
+    /// is qualified; notConfigured when neither holds.
+    private func appleCategory() -> CategoryStatus {
+        if llmProviders[AppleFoundationProvider.id] != nil { return .qualified }
+        return AppleModelAvailability.status() == .notPresent ? .notConfigured : .observing
     }
 
     public func registrySnapshot() async -> JSONValue {

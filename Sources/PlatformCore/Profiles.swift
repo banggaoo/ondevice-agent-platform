@@ -14,6 +14,7 @@ public enum ProviderCategory: String, Sendable, Codable, CaseIterable {
 }
 
 public enum CategoryStatus: String, Sendable, Codable {
+    case qualified       // at least one executable route is registered
     case observing       // platform can observe availability, nothing qualified
     case notConfigured   // no registered/qualified profile exists
 }
