@@ -1,6 +1,6 @@
 # Repository instructions
 
-This project began a bounded M1 implementation phase on 2026-10-04 after the user's explicit approval ("approve proposal, proceed development"). The authoritative implementation plan is `docs/development.md`. Work beyond that approved increment — new providers, models, services, automation, training, or distribution — still requires a separate explicit request.
+This project began implementation on 2026-10-04 after the user's explicit approval ("approve proposal, proceed development"), and the user has since directed continued autonomous development ("do not stop until complete project development"). The authoritative implementation plan is `docs/development.md`. Completed so far: the M1 serving foundation, the opt-in Apple Foundation Models provider, and the `builtin.linear` registry-declared typed-ML route. Still out of scope without a separate explicit request: model downloads, third-party dependencies, the Operator, cloud providers, ARTEMIS mutation, training, automation executors, and distribution.
 
 - Read `README.md`, `docs/proposal.md`, `docs/decisions.md`, and `docs/development.md` before substantial changes.
 - Keep runtime code within the approved M1 scope in `docs/development.md`. Do not add dependency manifests, installation scripts, services, downloaded models, or executable configuration beyond it without a later explicit implementation request.

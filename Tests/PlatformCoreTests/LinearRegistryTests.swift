@@ -149,4 +149,19 @@ final class LinearRegistryTests: XCTestCase {
             XCTAssertEqual(e.code, .invalidRequest)
         }
     }
+
+    /// Category status derives from real registrations: typedML flips to
+    /// qualified only when a predictor is actually attached.
+    func testCategoryStatusIsTruthful() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        var categories = await stack.supervisor.statusSnapshot()
+            .objectValue?["categories"]?.objectValue
+        XCTAssertEqual(categories?["typedML"]?.stringValue, "notConfigured")
+        let entry = try ModelRegistry.parse(registry([entry()]))[0]
+        await stack.supervisor.registerModel(entry.profile, predictor: entry.mlPredictor)
+        categories = await stack.supervisor.statusSnapshot()
+            .objectValue?["categories"]?.objectValue
+        XCTAssertEqual(categories?["typedML"]?.stringValue, "qualified")
+    }
 }
