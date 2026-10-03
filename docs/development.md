@@ -209,3 +209,9 @@ binary are bound to that build's identity, so recompiling and then reading
 previously minted credentials triggers a Keychain approval prompt. Fresh
 data roots mint and serve cleanly every build; signing removes the class of
 prompt entirely and is already listed as required release engineering.
+
+Observation, not benchmark: on the M4 Air development host the first
+live Apple completion through full admission took ~16.5 s (includes model
+load); later calls in the same process were materially faster. Thermal
+state sat at `fair` after sustained builds and correctly deferred new
+inference - the resource gate working as designed, not a fault.
