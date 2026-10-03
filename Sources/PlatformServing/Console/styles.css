@@ -1,0 +1,150 @@
+:root {
+  --paper: #f5f1e8;
+  --paper-deep: #ece6d8;
+  --ink: #20242b;
+  --ink-soft: #4a505b;
+  --teal: #1f6f6b;
+  --teal-deep: #155451;
+  --amber: #b8860b;
+  --line: #d8d0bd;
+  --radius: 10px;
+  --font-sans: "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+  --font-serif: Baskerville, "Palatino Linotype", Georgia, serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  background:
+    linear-gradient(rgba(31, 111, 107, 0.04), rgba(31, 111, 107, 0.01)),
+    repeating-linear-gradient(0deg, transparent, transparent 23px,
+      rgba(32, 36, 43, 0.05) 24px),
+    var(--paper);
+  min-height: 100vh;
+}
+
+.panel {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+.masthead h1 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 2rem;
+  letter-spacing: 0.02em;
+  margin: 0 0 0.25rem;
+}
+
+.tagline {
+  color: var(--ink-soft);
+  margin: 0 0 1.5rem;
+  font-size: 0.9rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card {
+  background: var(--paper-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.card h2 {
+  font-family: var(--font-serif);
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+  color: var(--teal-deep);
+}
+
+.card h3 {
+  font-size: 0.85rem;
+  margin: 0.75rem 0 0.25rem;
+  color: var(--ink-soft);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+.gauge .reading {
+  font-size: 1.5rem;
+  font-family: var(--font-serif);
+  margin: 0.25rem 0 0;
+  color: var(--teal);
+}
+
+.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+
+.plain { list-style: none; margin: 0.25rem 0; padding: 0; }
+.plain li { padding: 0.15rem 0; }
+
+form label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  margin-bottom: 0.35rem;
+}
+
+input[type="password"] {
+  width: 100%;
+  padding: 0.55rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+input[type="password"]:focus {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+button {
+  background: var(--teal);
+  color: var(--paper);
+  border: none;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+button:hover { background: var(--teal-deep); }
+button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+.hint { color: var(--ink-soft); font-size: 0.9rem; }
+.error { color: var(--amber); font-size: 0.9rem; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--line); }
+th { color: var(--ink-soft); font-weight: 500; }
+
+code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+  background: rgba(32, 36, 43, 0.06);
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .card { animation: reveal 200ms ease-out; }
+  @keyframes reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+}
+
+@media (max-width: 640px) {
+  .row { grid-template-columns: repeat(2, 1fr); }
+  .panel { padding: 1rem 0.75rem 3rem; }
+}

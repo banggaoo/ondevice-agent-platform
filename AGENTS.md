@@ -1,9 +1,9 @@
 # Repository instructions
 
-This project is in a documentation-only strategy phase. The user asked to revise and discuss the proposal before implementation.
+This project began a bounded M1 implementation phase on 2026-10-04 after the user's explicit approval ("approve proposal, proceed development"). The authoritative implementation plan is `docs/development.md`. Work beyond that approved increment — new providers, models, services, automation, training, or distribution — still requires a separate explicit request.
 
-- Read `README.md`, `docs/proposal.md`, and `docs/decisions.md` before substantial changes.
-- Revise documentation and plans within the current request. Do not add runtime code, dependency manifests, installation scripts, services, downloaded models, or executable configuration without a later explicit implementation request.
+- Read `README.md`, `docs/proposal.md`, `docs/decisions.md`, and `docs/development.md` before substantial changes.
+- Keep runtime code within the approved M1 scope in `docs/development.md`. Do not add dependency manifests, installation scripts, services, downloaded models, or executable configuration beyond it without a later explicit implementation request.
 - Label recommendations, assumptions, evidence, and accepted decisions distinctly. A proposed decision is not user approval.
 - Preserve `docs/references/original-proposal.md` as the unmodified source reference. Its sample code is not an implementation specification.
 - Verify changing or niche technical claims against primary sources. Record verification dates and links in the source notes.

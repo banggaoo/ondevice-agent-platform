@@ -1,0 +1,165 @@
+import Foundation
+import PlatformCore
+import PlatformServing
+
+/// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent]`
+/// Starts the one shared core and the loopback boundary. Prints the readiness
+/// URL and nonsecret diagnostics only - never credentials.
+enum ServeCommand {
+    struct Config {
+        var schemaVersion = 1
+        var port: UInt16?
+        var enableReferenceAgent = false
+    }
+
+    static func run(args: [String]) async throws {
+        guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 else {
+            throw PlatformError(.versionUnsupported, detail: "macOS 27+ required")
+        }
+        #if !arch(arm64)
+        throw PlatformError(.versionUnsupported, detail: "Apple Silicon required")
+        #endif
+
+        // Daemon-wide private default: every file created below (db, WAL,
+        // config, markers) is owner-only even when the creator applies a
+        // default mode rather than an explicit one.
+        _ = umask(0o077)
+
+        let root = RuntimeRoot(url: CredentialCommand.rootURL(args: args))
+        try root.prepare()
+        try root.acquireLock()
+        try root.checkStateFiles()
+
+        var config = Config()
+        if let raw = try root.readOwnedJSON(root.configURL) {
+            guard let object = raw.objectValue else { throw PlatformError(.invalidRequest, detail: "config malformed") }
+            for key in object.keys {
+                guard ["schemaVersion", "port", "enableReferenceAgent"].contains(key) else {
+                    throw PlatformError(.invalidRequest, detail: "unknown config key")
+                }
+            }
+            if let v = object["schemaVersion"]?.intValue {
+                guard v == 1 else { throw PlatformError(.versionUnsupported) }
+            }
+            if let p = object["port"]?.intValue {
+                guard p > 0, p <= 65_535 else { throw PlatformError(.invalidRequest, detail: "bad port") }
+                config.port = UInt16(p)
+            }
+            config.enableReferenceAgent = object["enableReferenceAgent"] == .bool(true)
+        } else {
+            try root.writeOwnedJSON(.object(["schemaVersion": .int(1)]), to: root.configURL)
+        }
+        if args.contains("--enable-reference-agent") { config.enableReferenceAgent = true }
+        if let p = value(forFlag: "--port", in: args), let n = UInt16(p) { config.port = n }
+
+        // Nonsecret empty registry: model namespaces stay empty until M2;
+        // agent metadata is compiled in, not promoted from arbitrary JSON.
+        if try root.readOwnedJSON(root.registryURL) == nil {
+            try root.writeOwnedJSON(.object([
+                "schemaVersion": .int(1),
+                "models": .array([]),
+            ]), to: root.registryURL)
+        }
+
+        let credentials = KeychainCredentialStore()
+        let monitor = NativeResourceMonitor()
+        let supervisor = PlatformSupervisor(
+            root: root, credentials: credentials, resourceSource: monitor,
+            options: .init(enableReferenceAgent: config.enableReferenceAgent))
+        try await supervisor.start()
+        // Every scope must already have a credential; missing scopes fail
+        // truthfully rather than minting silently at runtime. The only
+        // deliberate mint-and-display path is `credential --scope`.
+        var missing: [String] = []
+        for scope in CredentialScope.allCases {
+            let key = CredentialKey.key(root: root.url, scope: scope)
+            if try credentials.secret(forKey: key) == nil {
+                missing.append(scope.rawValue)
+            }
+        }
+        guard missing.isEmpty else {
+            let hint = "missing credentials for \(missing.joined(separator: ", ")); " +
+                "run: ondevice-agent-platform credential --scope <scope>\n"
+            FileHandle.standardError.write(Data(hint.utf8))
+            throw PlatformError(.unauthorized)
+        }
+        try await supervisor.loadCredentials()
+
+        let sessions = ConsoleSessions(clock: Clock())
+        let acp = ACPService(supervisor: supervisor, clock: Clock())
+        let port = config.port ?? 8080
+        let routerBox = RouterBox()
+        let server = HTTPServer { request, respond in
+            guard let router = routerBox.router else {
+                respond(.error(PlatformError(.internal), status: 500))
+                return
+            }
+            Task { await router.handle(request, respond: respond) }
+        }
+        try server.start(port: port)
+        let boundPort = try server.waitForPort()
+        routerBox.assign(Router(supervisor: supervisor, sessions: sessions, acp: acp,
+                                port: boundPort, clock: Clock()))
+        try root.writeDaemonMarker(port: boundPort)
+
+        print("ready http://127.0.0.1:\(boundPort)")
+        FileHandle.standardError.write(Data(
+            "ondevice-agent-platform M1 serving on 127.0.0.1:\(boundPort); no providers qualified\n".utf8))
+
+        let shutdown = CancelSignal()
+        shutdown.install {
+            Task {
+                await supervisor.shutdown()
+                server.stop()
+                root.removeDaemonMarker()
+                Foundation.exit(0)
+            }
+        }
+        // Run until signalled.
+        while true { try await Task.sleep(for: .seconds(60)) }
+    }
+}
+
+/// Lock-confined late binding for the router (bound port known after listen).
+final class RouterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _router: Router?
+
+    var router: Router? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _router
+    }
+
+    func assign(_ router: Router) {
+        lock.lock()
+        _router = router
+        lock.unlock()
+    }
+}
+
+/// SIGINT/SIGTERM handling; single-shot dispatch on the first signal.
+final class CancelSignal: @unchecked Sendable {
+    private var fired = false
+    private let lock = NSLock()
+    /// Sources must be retained: a released source is cancelled and its
+    /// handler never runs.
+    private var sources: [DispatchSourceSignal] = []
+
+    func install(_ action: @escaping @Sendable () -> Void) {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                if self.fired { self.lock.unlock(); return }
+                self.fired = true
+                self.lock.unlock()
+                action()
+            }
+            source.resume()
+            sources.append(source)
+        }
+    }
+}

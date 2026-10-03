@@ -9,13 +9,13 @@ Status: template for a proposed review workflow. Filling out or accepting this d
 | Proposal ID | <server-generated identifier> |
 | Version | <immutable version> |
 | Originating job ID | <server-generated identifier> |
-| Consumer / task identity | <Operator Agent first; ARTEMIS gateway second; exact task ID> |
+| Consumer / task identity | <consumer: optional Operator profile, ARTEMIS gateway, or hosted agent run; exact task ID> |
 | State | <draft / pending_review / accepted_for_manual_action / rejected / expired / superseded / cancelled / closed> |
 | Created at | <timestamp with timezone> |
 | Expires at | <timestamp; proposed default: 7 days after creation> |
 | Canonical payload SHA-256 | <digest of the validated structured record> |
 
-The authoritative identity, digest, preconditions, and decisions live in the proposed SQLite record. This Markdown file is its readable view/export. The model must not assign its own authorization or alter a decision record. The digest identifies content; it does not certify that the recommendation is safe.
+The authoritative identity, digest, preconditions, and decisions live in the planned record in the selected SQLite store. This Markdown file is its readable view/export. The model must not assign its own authorization or alter a decision record. The digest identifies content; it does not certify that the recommendation is safe.
 
 ## Problem and intended outcome
 
@@ -25,7 +25,7 @@ The authoritative identity, digest, preconditions, and decisions live in the pro
 
 | Field | Value |
 | --- | --- |
-| Consumer and task scope | <Operator telemetry/status/registry snapshots or selected ARTEMIS request> |
+| Consumer and task scope | <optional Operator telemetry/status/registry snapshots, selected ARTEMIS request, or optional hosted-agent run> |
 | Supervisor read allowlist | <specific platform records/fields; no worker grant to private state or traces> |
 | Broker-supplied input digest | <approved input snapshot identity; omit unnecessary private paths from export> |
 | Telemetry observation window | <time range and relevant sampling limits> |

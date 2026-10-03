@@ -2,6 +2,8 @@
 
 Status: v0.3 discussion draft, verified 2026-10-03. This is documentation only. ARTEMIS was not installed, executed or edited, and no configuration was applied. Configuration-only integration remains a testable target, not a confirmed result.
 
+**Current strategy scope (confirmed follow-up answers, 2026-10-03):** ARTEMIS is the inference consumer and ondevice-agent-platform is the provider, not an automation backend. Prioritize the declared agent/LLM serving contract, not exhaustive mobile automation QA. Android and iOS testing are later user goals; this audit does not verify iOS support. Internal provider or bounded harness/agent choices do not establish complete wire compatibility or offline operation; those claims still require the pinned source and runtime evidence. The Operator is a separate optional consumer role, provider-neutral like ARTEMIS; neither owns the serving core.
+
 ## Source identity
 
 The existing checkout at `artemis/` reports clean working-tree status and commit `351ca8422f7b5b54e80a9c1ce03a222e02415b6b` (2026-09-29 UTC). Its origin is [banggaoo/artemis](https://github.com/banggaoo/artemis), the user's fork. The same SHA was independently returned by Google's public main-branch metadata during this review. Evidence links below pin [google/artemis at that commit](https://github.com/google/artemis/tree/351ca8422f7b5b54e80a9c1ce03a222e02415b6b); future source changes require a fresh audit.

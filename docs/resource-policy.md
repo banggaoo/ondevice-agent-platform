@@ -4,7 +4,7 @@
 
 ## Signals and authority
 
-The deterministic supervisor owns admission, cancellation, and policy. The Operator explains decisions and proposes adjustments; it cannot change limits. Use public thermal state, memory pressure, power state, measured process/provider behavior, and workload headroom. Sources: [ProcessInfo](https://developer.apple.com/documentation/foundation/processinfo), [memory-pressure notifications](https://developer.apple.com/documentation/dispatch/dispatchsourcememorypressure).
+The code-owned PlatformSupervisor owns admission, cancellation, and policy independently of any agent. An optional Operator can explain decisions and propose adjustments, but it does not own global limits. Use public thermal state, memory pressure, power state, measured process/provider behavior, and workload headroom. Sources: [ProcessInfo](https://developer.apple.com/documentation/foundation/processinfo), [memory-pressure notifications](https://developer.apple.com/documentation/dispatch/dispatchsourcememorypressure).
 
 Replace the proposed 82°C/85%-used-memory rule. Raw temperature tools may be optional diagnostics; total used-memory percentage does not reliably describe pressure or reclaimable caches. Measure owned workers, platform overhead, ARTEMIS processes, and any emulator; do not double-count shared CPU/GPU allocations. Artifact size and engine counters alone are incomplete.
 
@@ -28,22 +28,30 @@ For an owned worker: stop admission → cancel generation → release context/ca
 
 For Apple-managed inference: release/cancel the application's session and stop submitting work. Verify cancellation behavior and observed system recovery; do not kill Apple services or claim ownership of their weight residency. Cancellation acknowledgement and actual compute/memory cessation are separate measurements. See [hardware and models](hardware-and-models.md).
 
+## Research and calibration
+
+Public provider documentation, device specifications, and reproducible published results may seed conservative starting profiles. Record source date, provider/model version, and workload assumptions; label unsourced or transferred numbers as estimates. Internet research is not device calibration and cannot establish current memory headroom, thermal behavior, latency, or quality on a user's running machine. Use native availability/pressure observations and bounded workload measurements to validate the profile before claiming performance or capacity. This does not require exhaustive benchmarking of every Mac before the first local experiment; unsupported or unmeasured combinations remain explicit.
+
 ## Initial bounds to calibrate
 
 | Setting | Proposed starting value |
 | --- | --- |
-| Active inference | 1 platform slot shared by Operator and ARTEMIS |
+| Active inference | 1 platform slot shared by admitted inference consumers |
 | Pending queue | At most 4; expired/excess requests fail clearly |
-| Operator output / loop / task budget | At most 512 tokens per generation, 6 tool rounds, 2,048 total generated tokens, 120 seconds |
+| Example optional lightweight-agent output / loop / task budget | At most 512 tokens per generation, 6 tool rounds, 2,048 total generated tokens, 120 seconds |
 | Context | Provider-reported capacity minus measured prompt/tool/output margin; no silent truncation |
 | ARTEMIS request limits | Derive from real node payloads and client deadlines; reject unsupported/oversized inputs |
 | Monitoring | Initial 1–2 second sample target; critical observations stale after 5 seconds |
 | Owned-model idle timeout | 5 minutes, subordinate to pressure escalation |
 | Application cancellation grace | Initial 5 seconds; provider limitations must be measured and reported |
 
-One platform slot bounds admission; it does not prove one Apple model is resident or control unrelated Apple Intelligence requests. Operator and ARTEMIS queues need explicit fair scheduling and per-consumer limits. User stop controls remain available without needing a model slot.
+One platform slot bounds admission, not the number of registered providers or agents, and it does not control unrelated Apple Intelligence work. Apply fair scheduling and per-consumer limits to all admitted model calls. Core status and stop controls require no model slot. A hosted AgentRun must not retain an inference slot while waiting for tools, human review, or another model request; each child generation is separately admitted and charged against the parent run budget. Cancellation propagates to queued and active child requests.
 
-An 8 GB Apple-provider profile has no mandatory custom model. For a 16 GB test machine, an optional owned worker could start with a 6 GiB aggregate platform admission budget, including control/worker/cache overhead; lower it when emulator/foreground load requires more headroom. Larger-memory profiles still require calibration. Apple-managed residency cannot be treated as an enforceable per-process budget.
+Baseline LLM and ML support describes available serving facilities, not eager model residency or unrestricted concurrency. Both generative calls and ML predictions pass core admission and consume their declared resource budgets; record their call counts separately, and never report an ML prediction as a zero-cost operation merely because it generates no tokens. Core status, registry, and stop operations require neither LLM generation nor ML prediction. Per-task ML feature/output limits are schema-bound, not inherited token caps; no numerical profile changes are established by this documentation revision.
+
+Device tiers bound feasible context, artifact residency, and concurrency; purpose profiles choose suitable model/agent behavior. These are separate axes. Purpose-specific output/loop/deadline profiles must be validated rather than copying the lightweight-agent example to every reasoning or vision route. A route that cannot meet its declared purpose within the current budget is unavailable or deferred, not silently weakened.
+
+An 8 GB planning profile has no mandatory custom artifact or Apple-model dependency for core administrative operation. For a 16 GB test machine, an optional owned worker could start with a 6 GiB aggregate platform admission budget, including control/worker/cache overhead; lower it when emulator/foreground load requires more headroom. Larger-memory profiles still require calibration. Apple-managed residency cannot be treated as an enforceable per-process budget.
 
 The listed 5.78 GB Qwen GGUF artifact may not fit comfortably inside that optional 6 GiB envelope once runtime state is added. Reduce model/context or reject admission; do not silently enlarge limits. Reserve host headroom empirically rather than assigning the same ceiling to all M2 devices.
 

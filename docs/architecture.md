@@ -1,61 +1,91 @@
 # Proposed architecture
 
-Status: v0.3 discussion draft, 2026-10-03. Consumer order is confirmed: the platform's Operator Agent first, Google ARTEMIS second. Technical choices remain proposed; this document does not authorize implementation.
+Status: v0.9 discussion draft, 2026-10-04; bounded M1 implementation in progress per user approval (see [development](development.md)). Core scope corrected per the user's latest direction: the platform serves models and hosted agents through deterministic code; ACP agent serving and the OpenAI-compatible LLM interface are baseline facilities, while installed agents - including the Operator - are optional. Remaining technical designs are proposed; this document does not authorize work beyond the approved increment.
 
-## Consumers and topology
+## Layers and components
 
-The Operator explains platform health, provider availability, deferred requests and resource costs, then drafts bounded optimization proposals. It receives approved platform metadata and redacted diagnostics. General repository analysis and arbitrary file inspection are outside this initial workflow.
+| Layer | Components | Notes |
+| --- | --- | --- |
+| Client/UI adapters | Local console, OpenAI-compatible model adapter, ACP agent adapter | Separate contracts; the model API is the tested OpenAI subset and ACP is the default agent-facing protocol |
+| Shared control plane | `PlatformSupervisor`: startup/shutdown, config and registry validation, auth and consumer scopes, resource governor/scheduler, backend lifecycle, quotas/deadlines/cancellation, authoritative SQLite state, bounded telemetry, admin API | Deterministic code; no LLM or agent is required for any of these operations |
+| Model-serving plane | `ModelService` (LLM), `MLService` (typed non-generative ML), `InferenceRouter`, provider/runtime adapters | Contract validation, purpose/capability selection, bounded backend execution |
+| Agent-serving plane | `AgentService`/`AgentRuntime`, versioned `AgentProfile`s and per-agent harnesses | Baseline facility; consumes model serving; never sits above control-plane authority |
+| Runtime/hardware substrate | Apple native framework, qualified owned inference worker, optional constrained agent worker, native pressure/power/thermal observations | Logical layers are not process-isolation boundaries; claim confinement only after a verified boundary |
 
-ARTEMIS is a later inference consumer. It owns Android observation, automation loops, tools and device authority. The platform supplies a tested inference contract and resource governance; it does not execute ARTEMIS tool calls or assume control over the device.
+This is not a strict all-down stack: the control plane governs both model and optional agent work, and the agent module calls the model module through the same client contract external consumers use.
+
+## Topology
 
 ```mermaid
 flowchart TD
-    Console[Same-origin local console] --> Supervisor[Deterministic Swift supervisor]
-    Supervisor --> Operator[On-demand Operator role]
-    Operator --> Broker[Allowlisted metadata broker]
-    Broker --> Snapshots[Redacted platform snapshots]
-    Operator --> Router[Capability and disclosure policy]
-    Artemis[ARTEMIS inference consumer] --> Gateway[Authenticated loopback gateway]
-    Gateway --> Router
-    Router --> Apple[Native Apple provider adapter]
-    Router -. Explicit eligibility and policy .-> PCC[Conditional Apple PCC provider]
-    Router -. Later capability need .-> Worker[One optional owned inference worker]
-    Supervisor --> State[Durable jobs and immutable proposals]
+    Console[Local web console] --> Admin[Authenticated admin API]
+    Admin --> Supervisor[PlatformSupervisor deterministic core]
+    AgentClient[Console or other ACP client] --> ACPAdapter[Default ACP adapter]
+    ACPAdapter --> AgentRT[AgentService and AgentRuntime]
+    AgentRT --> Operator[Optional OperatorAgent with own harness]
+    AgentRT --> Harness[Per-agent versioned harness]
+    Operator --> OpenAI[OpenAI-compatible model adapter]
+    Harness --> OpenAI
+    Artemis[ARTEMIS external consumer] --> OpenAI
+    OpenAI --> ModelService[ModelService and InferenceRouter]
+    ModelService --> Apple[Apple on-device adapter]
+    ModelService -. Conditional eligibility and disclosure .-> PCC[Optional Apple PCC adapter]
+    ModelService -. Qualified artifact .-> Owned[One qualified owned open-weight worker]
+    MLService --> MLRT[Qualified ML runtime]
+    Harness --> MLService[MLService typed prediction]
+    Supervisor --> ModelService
+    Supervisor --> MLService
+    Supervisor --> AgentRT
+    Supervisor --> State[Authoritative SQLite state]
     Supervisor --> Governor[Native resource observations]
 ```
 
-Swift is the proposed control plane because the initial provider and macOS resource APIs are native. The Apple adapter is proposed trusted code in that process; model-generated tool requests still pass through the broker. XPC separation is an alternative to evaluate, not an equivalent proven boundary. Start with one inference admission slot shared on demand. Apple controls its system-model residency; the platform can evict only an optional owned worker's allocations.
+The supervisor governs all serving modules without an Operator in the loop. Administrative, registry, status, and stop paths use neither LLM generation nor ML prediction. ModelService invokes LLM adapters and MLService invokes typed prediction runtimes, each after shared-core admission. Agent harnesses submit generative steps through the OpenAI-compatible client and ML steps through the registered typed prediction seam.
 
-## Provider and capability registry
+## Model serving
 
-Prefer the Apple Foundation Models on-device adapter for the Operator on eligible Macs, including M2-class devices. Check runtime availability and expose reasons for unavailability. Hardware family alone does not establish OS support, enabled/downloaded system models, app eligibility or task suitability. [Hardware and models](hardware-and-models.md) records verified Apple API constraints.
+`POST /v1/chat/completions`, plus `GET /v1/models` where needed, is the declared model-serving subset; see the [gateway contract](gateway-contract.md). Model-only serving returns suggestions or tool-call data; it never executes a consumer's tool declarations. Configured aliases and purpose profiles, declared capabilities, context, tool/schema, streaming, and disclosure requirements select a provider deterministically against the actual device budget. There is no model-driven mandatory intent router and no substring/length routing; the shared core validates every admitted model request.
 
-Private Cloud Compute is conditional on supported OS/API, managed entitlement, distribution eligibility, service availability and quota. Verify permitted use for the proposed generic ARTEMIS gateway before any live ARTEMIS-to-PCC request. Local-only requests cannot use it. Display actual provider use and fail transparently when unavailable; cloud-inference permission does not authorize a patch executor.
+Provider adapters are peer categories selected by purpose and evidence, not an Apple default with an emergency fallback:
 
-Stable model aliases map to verified provider capabilities: input modalities, tool-call and schema support, context/output limits, streaming behavior, availability, ownership and allowed disclosure policy. Consumer identity and explicit requirements participate in selection. Model-name substrings, message counts and Flash/Pro labels do not establish capability. Validate the full conversation, including embedded images and tool results, before admission. Reject unsupported requirements instead of stripping them or inventing a successful answer.
+- Apple on-device Foundation Models, where OS, availability, and capability checks pass; Apple owns its model residency.
+- Owned open-weight runtime adapters are first-class. The initial qualification considers one artifact/runtime pair, with the Empero Qwen distill GGUF as a candidate, not a committed choice; additional registered model profiles and adapters require their own compatibility/resource evidence rather than implementing every engine at once.
+- Conditional Apple PCC subject to its separate entitlement/disclosure gate; see the [cloud policy](safety-and-approvals.md#foundation-models-and-optional-apple-cloud-inference). It is a conditional provider, not the project backbone.
 
-ARTEMIS screenshot requests require tested image understanding and visual grounding. Apple's macOS 27 multimodal API accepts image attachments, so native on-device image inference is the first candidate on that OS tier; this does not prove Android automation quality or wire compatibility. Earlier OS tiers need separate capability handling. [Apple multimodal prompting](https://developer.apple.com/documentation/foundationmodels/analyzing-images-with-multimodal-prompting). A text model plus OCR is not automatically equivalent.
+The core remains operable when Apple Intelligence or any model is unavailable and can still serve an eligible owned route; no single provider is a prerequisite.
 
-If native providers cannot satisfy the captured contract within policy and budget, evaluate one MLX or llama.cpp worker with a verified image-capable artifact; select one backend rather than implementing both. Empero's Qwen3.8-9B-Distill GGUF is an optional third-party candidate, not the mandatory Operator or a proven vision model. Its Q4_K_M artifact is listed as 5.78 decimal GB before runtime overhead. Pin publisher, revision, checksum, license, quantization, template and compatible engine. [Publisher card](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF).
+## Agent serving
+
+`AgentRuntime` is a baseline hosted facility sharing core-owned facilities; the platform starts, administrates, and serves models whether or not any agent profile is installed, and an absent profile yields an explicit unavailable/not-configured result rather than disabling the facility. Clients reach agents through the default ACP adapter; each hosted `AgentProfile` runs its own harness: code steps, tools, validators, context construction, retries, state, and optional model steps. There is no single global harness controlling all agents and no per-step LLM requirement. Every harness model call uses a scoped OpenAI-compatible `ModelClient` through the same interface and admission as external consumers; the Operator has no private direct-Apple SDK bypass. Versioned fields and update/cancellation rules are in [agent serving](agent-serving.md), and the pinned ACP profile is in [ACP integration](acp-integration.md). A harness waiting on tools or review holds no inference slot.
+
+The `OperatorAgent` is an optional served profile: an ACP client interacts with it while its own `OperatorHarness` explains approved runtime snapshots and drafts proposals; it does not own global limits, state, or authority, and its approved tool scopes grant no admin powers. Its staged project/data/training/distribution vision remains optional future consumer work, not a platform prerequisite. ARTEMIS is an external consumer of the OpenAI model endpoint with its own harness and device authority; the platform never hosts or invokes it as an automation backend.
+
+Non-generative ML inference is a baseline capability, not an extension reserved for later training. MLService predicts from typed features through a qualified runtime using the same registry, identity/scope, admission, budgets, lifecycle, and disclosure facilities as LLM serving. ModelProfile distinguishes kind (llm or ml), task, input_schema, and output_schema in addition to model/provider/version/device metadata. An agent harness may call the registered ML prediction seam; classifier, extractor, or embedding outputs remain typed data rather than invented chat completions or token usage. Direct OpenAI bindings apply only where a matching task contract exists and is tested. No extra generic public ML protocol, arbitrary artifact loader, training job, or automatic model download is selected by this document.
+
+## Purpose profiles versus device tiers
+
+Independent axes: purpose profiles pick model/agent behavior; device tiers bound feasible context, artifact residency, and concurrency. They do not rank provider intelligence.
+
+| Purpose profile | Candidate direction |
+| --- | --- |
+| low-latency/local-native | Apple candidate for bounded text, structured, and tool-suggestion work and OS framework integration; speed/battery advantages need target measurements |
+| reasoning-code | Qwen-class open-weight candidate for complex reasoning, math, and code; exact artifact, quantization, template, context/output, and quality/resource evidence qualify the route |
+| vision | Separately verified image-capable artifact or provider; the text distill's vision is untested and OCR is not a substitute |
+| cloud-large-context | Conditional PCC; a local-only request never falls back |
+| deterministic/control | Native code handlers, never a fake model alias |
+
+Brand does not guarantee purpose fit; an open-weight route may be the better choice where evidence shows it. No provider is promoted, downloaded, or selected by this document.
 
 ## Authority and process boundaries
 
-The supervisor owns policy, admission, persistent state and proposal validation. The Operator broker exposes typed status snapshots and selected diagnostics; it has no general filesystem, shell, raw-trace or direct database-read tool. The supervisor may read its own durable state through its separate allowlist and sanitize the result before providing it to inference. Model output cannot expand either allowlist.
-
-An optional owned worker uses versioned, bounded framed stdio with request IDs, typed payloads, explicit errors and cancellation. This isolates failures and avoids another worker network listener. A same-user subprocess is not a security sandbox. Before private diagnostics or screenshots reach it, demonstrate actual confinement against unauthorized files, platform state, outbound network and child execution. Use synthetic/redacted fixtures until that gate passes. Apple-provider access and disclosure require their own documented checks.
-
-ARTEMIS supplies tool declarations for its own harness. Returning a proposed tool call grants no new platform capability. Device-action permission, consumer task limits and stop behavior stay in ARTEMIS; admission limits on one inference call cannot bound its entire automation session.
+The `PlatformSupervisor` owns policy, admission, persistent state, and record validation. An optional owned worker uses versioned, bounded framed stdio with request IDs, typed payloads, explicit errors, and cancellation; a same-user subprocess is not a security sandbox, and confinement must be demonstrated before private data reaches it. Model output expands no allowlist, and an LLM decision or confidence never grants rights. Consumer-supplied tool declarations and agent-run requests are validated data, not rights.
 
 ## Resource and request lifecycle
 
-The deterministic governor uses thermal state, memory pressure, measured headroom and power conditions. Apple exposes nominal, fair, serious and critical thermal states; an unverified 82°C cutoff is not the portable contract. [Apple thermal states](https://developer.apple.com/documentation/foundation/processinfo/thermalstate-swift.enum).
+The governor uses thermal state, memory pressure, measured headroom, and power conditions; the detailed policy is [resource policy](resource-policy.md). Bound context, images, output, retries, queue size, and deadlines; prompt text cannot enforce these limits, which remain a [harness responsibility](harness-contract.md#context-limits-are-a-harness-responsibility) shared with core-enforced global caps. Reject excess work with protocol errors and bounded retry guidance; never return a normal completion containing a busy notice. The initial experiment budget is one shared inference admission slot, not a limit of one provider; native core status and stop controls need no slot. Apple system-model eviction is outside this platform's authority; an owned worker is separately managed.
 
-Bound context, images, output, retries, queue size and deadlines. Fair scheduling prevents a long ARTEMIS session from indefinitely starving Operator requests. Reject excess work with appropriate HTTP 429/503 errors and bounded retry guidance; never return a normal chat completion containing a busy notice. Streaming failures remain failures. See [gateway contract](gateway-contract.md).
+## State, console, and review
 
-Stop background admission under pressure, cancel at supported provider boundaries, and use hysteresis for recovery. For owned workers, release contexts/model references or terminate after a bounded grace period. MLX's memory limit is a guideline; clearing its allocation cache does not unload live tensors. [MLX memory limit](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.set_memory_limit.html), [cache clearing](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.clear_cache.html). Apple system-model eviction is outside this platform's authority. Validate cancellation and resource recovery separately for each provider.
+Embedded SQLite is the selected engine for durable core jobs, registry/config metadata, decisions, and optional agent checkpoints/proposals; schema and record protocol remain proposed. The user has selected `~/.ondevice-agent-platform/` as the runtime-data root, with per-session directories only when needed; see [runtime layout](runtime-layout.md). Raw diagnostics and screenshots are not logged by default.
 
-## State, console and review
-
-Recommend embedded SQLite for durable jobs, immutable proposal versions and decisions, bounded metadata JSONL for metrics, and Markdown exports. Raw diagnostics/screenshots are not logged by default. Application Support is conventional storage, not sandbox isolation. [Apple sandbox containers](https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox).
-
-The console uses authenticated same-origin loopback HTTP and SSE. Validate host/origin, reject cross-origin mutation and separate Operator/ARTEMIS credentials. Approval binds an exact proposal digest, scope, base version and expiry; edits invalidate it. Waiting for review releases inference capacity. The MVP ends with reviewed proposals and manual export, without applying changes. Source-verified ARTEMIS configuration and offline limitations are documented in [ARTEMIS integration](artemis-integration.md).
+The console is a code-powered status, registry, job, and control UI over authenticated same-origin loopback HTTP and SSE; it works with no agent installed. An optional chat/Operator feature may be off; chat text is never authorization. The delivery direction remains a GitHub-downloadable per-user executable running this local server and console; see [distribution and responsible use](distribution-and-responsible-use.md). Source-verified ARTEMIS configuration and offline limits are in [ARTEMIS integration](artemis-integration.md).

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ondevice-agent-platform</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main class="panel">
+  <header class="masthead">
+    <h1>ondevice-agent-platform</h1>
+    <p class="tagline">local instrument panel &middot; M1</p>
+  </header>
+
+  <section id="login-card" class="card" aria-labelledby="login-heading">
+    <h2 id="login-heading">Console sign-in</h2>
+    <p class="hint">Enter the console credential shown by
+      <code>credential --scope console</code>.</p>
+    <form id="login-form">
+      <label for="credential">Console credential</label>
+      <input id="credential" name="credential" type="password"
+             autocomplete="off" required>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="login-error" class="error" role="alert" hidden></p>
+  </section>
+
+  <section id="dashboard" hidden>
+    <div class="row">
+      <div class="card gauge">
+        <h2>Thermal</h2>
+        <p id="thermal" class="reading">unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Memory pressure</h2>
+        <p id="pressure" class="reading">unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Low power</h2>
+        <p id="lowpower" class="reading">unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Apple models</h2>
+        <p id="apple" class="reading">unknown</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Serving</h2>
+      <p>Active inference <span id="active" class="mono">0</span>
+         &middot; pending <span id="pending" class="mono">0</span>
+         &middot; blocked <span id="blocked" class="mono">false</span></p>
+      <p id="offline" class="error" role="status" hidden>
+        Cannot reach the platform service. Check that the daemon is running.
+      </p>
+      <p id="denied" class="error" role="status" hidden>
+        Provider conditions deny inference; administration remains available.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Provider categories</h2>
+      <ul class="plain">
+        <li>Apple Foundation Models: <span id="cat-apple" class="mono">-</span></li>
+        <li>Owned open-weight LLM: <span id="cat-owned" class="mono">-</span></li>
+        <li>Typed ML: <span id="cat-ml" class="mono">-</span></li>
+      </ul>
+      <h3>Registered profiles</h3>
+      <ul id="models" class="plain"></ul>
+      <h3>Agents</h3>
+      <ul id="agents" class="plain"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Jobs</h2>
+      <table>
+        <thead>
+          <tr><th>id</th><th>kind</th><th>consumer</th><th>state</th><th></th></tr>
+        </thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <button id="logout" type="button">Sign out</button>
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

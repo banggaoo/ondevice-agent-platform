@@ -1,10 +1,10 @@
 # Proposed inference gateway contract
 
-**Status:** documentation specification, not an implemented endpoint. Goal: the OpenAI-compatible subset needed by a pinned ARTEMIS revision, rather than blanket API emulation. ARTEMIS support follows the Operator milestone.
+**Status:** documentation specification with an implemented M1 subset. Goal: the tested OpenAI-compatible subset serving every model consumer - ARTEMIS, hosted-agent harness steps including the optional Operator's, and other clients - paired with the default ACP agent interface described in [agent serving](agent-serving.md). It does not depend on or wait for any Operator milestone; the Operator is exposed over ACP while its model calls use this same contract and admission. **Implemented subset (M1):** `POST /v1/chat/completions` (ordered roles, text parts, bounded options, strict rejection of tools/images/streaming/unknown fields), `GET /v1/models` over registered profiles only, and the platform-specific `POST /api/ml/predictions` typed-ML seam - all behind shared admission with truthful 400/404/413/429/503/504 and OpenAI-shaped errors. No real provider is registered.
 
 ## Endpoints and identity
 
-Propose authenticated loopback `POST /v1/chat/completions` and, if the consumer needs it, `GET /v1/models`. Port 8080 is configurable; binding and port conflict handling are explicit. This service is an inference gateway, not MCP and not inherently a reverse proxy to an upstream HTTP server. An Apple framework adapter translates an API contract in process.
+Propose authenticated loopback `POST /v1/chat/completions` and, if the consumer needs it, `GET /v1/models`. Port 8080 is configurable; binding and port conflict handling are explicit. This service is an inference gateway, not MCP and not inherently a reverse proxy to an upstream HTTP server. An Apple framework adapter translates an API contract in process. Hosted agents are served through the default ACP adapter rather than a custom public run endpoint, and core administration uses its own channel; an ordinary completion never silently becomes an agent run, and model-returned tool declarations remain data - ModelService does not execute them. Typed ML predictions use their own registered schema seam and are not wrapped in chat completions unless a matching task contract exists and is tested; no `/v1/embeddings` endpoint is promised at this stage. Within the platform, hosted agents and the Operator must use the model interface rather than a direct provider-SDK shortcut; alias, capability, and core checks apply identically. External consumer traffic outside this gateway is not governed by it and remains part of the ARTEMIS route audit.
 
 Issue distinct scoped consumer credentials. A browser console session must not confer ARTEMIS access or approval rights. Keep tokens out of Git, URLs, logs, and model context. Stable local aliases identify registered capabilities and permitted provider policies, rather than impersonating a frontier cloud model.
 
@@ -38,8 +38,12 @@ Bound aggregate retries and wall time. Provider-local retry is distinct from a n
 
 ## Local-only and Apple cloud policies
 
-Local-only requests never fall back to PCC, remote OCR, or another cloud model. Where PCC is eligible, enable an explicit consumer/session policy with allowed input classes, limits, and visible actual-provider records. A screenshot can be disclosed only if that policy permits it and the provider supports the required image semantics. Do not reinterpret text-only OCR as equivalent perception without evaluation.
+Local-only requests never fall back to PCC, remote OCR, or another cloud model. Where PCC is eligible, enable one explicit local-only/eligible-Apple-cloud mode choice per consumer or session that covers repeated in-scope requests rather than prompting per generation; see the [cloud policy](safety-and-approvals.md#foundation-models-and-optional-apple-cloud-inference). The mode still records allowed input classes, limits, and the actual provider used. A screenshot can be disclosed only if that policy permits it and the provider supports the required image semantics. Do not reinterpret text-only OCR as equivalent perception without evaluation.
 
 Quota/network/unavailability errors use a tested fallback only when it preserves capabilities and the approved policy; otherwise return a clear error. Apple cloud inference does not grant a remote agent execution authority.
+
+## Consumer boundary
+
+The user has confirmed that ARTEMIS is an inference consumer and ondevice-agent-platform is the provider; this contract does not invoke ARTEMIS as an automation executor. The client-facing serving interface is independent of whether permitted internals use Apple on-device inference, eligible Apple PCC, an owned local model, or bounded harness/agent orchestration. Each route must preserve the declared conversation, modality, tool/schema, stream, error, resource, and disclosure semantics; internal orchestration does not grant additional tool or execution authority. Platform acceptance covers that declared subset, not exhaustive Android/iOS consumer QA. Future iOS testing is an intended consumer-side exercise, not verified support at the pinned revision.
 
 No endpoint, token, live request, or conformance test exists yet. The ARTEMIS source audit determines which rows become required gates.
