@@ -177,3 +177,29 @@ including request-to-transcript mapping, refusal of malformed final turns,
 stable provider identity, and truthful complete-or-unavailable behavior
 through shared admission. No downloaded artifact, cloud call, PCC use, or
 quality claim is implied.
+
+## Typed-ML registry + model-step harness increment (2026-10-04)
+
+`builtin.linear` is the first qualified typed-ML provider: a pure-Swift
+linear classifier whose artifact (ordered features, labels, weight matrix,
+optional bias) is declared as bounded JSON data in `registry.json`. The
+compiled-in runtime computes `bias + W*x` per label and a deterministic
+stable-softmax argmax; it is honestly `builtin.linear`, not a disguised
+Core ML or downloaded runtime. `ModelRegistry.parse` validates strictly -
+unknown keys, wrong kinds/providers/tasks, nonnumeric features, ragged or
+nonfinite weights, and duplicate aliases all fail startup loudly rather
+than partially registering. LLM entries remain code-registered only.
+
+`reference.echo` is the second reference harness: a bounded single-call
+model-step agent that forwards prompt text through the scoped `ModelClient`
+(same admission as external consumers), emits the reply, and stops. It is
+registered only when `--enable-reference-agent` is set AND a declared model
+alias exists (currently the Apple opt-in); calls to unavailable models end
+in truthful error. It demonstrates the hosted-agent model path the
+optional Operator will later use - it is not the Operator.
+
+Suite status: 71 software-contract tests pass, covering strict registry
+validation, deterministic prediction math, schema enforcement through
+submitML admission, harness stop semantics (refusal/error/cancel), and the
+bounded token cap. Live check: `registry.json` entry -> banner reports the
+alias -> typed-ML endpoint serves it under scoped credentials.

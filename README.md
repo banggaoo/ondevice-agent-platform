@@ -31,7 +31,8 @@ ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
 
 - The model registry starts empty: OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
 - `serve --enable-apple-model` (or the `enableAppleModel` config key) is the only provider opt-in: it registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
-- `serve --enable-reference-agent` installs only the deterministic `reference.status` harness; there is no Operator and no general tool execution.
+- `serve --enable-reference-agent` installs the deterministic `reference.status` harness plus the bounded single-call `reference.echo` model-step harness when a declared model alias exists (currently the Apple opt-in). There is no Operator and no general tool execution.
+- `registry.json` accepts declared `builtin.linear` typed-ML models (features, labels, weights, optional bias); malformed entries fail startup. LLM aliases remain code-registered only.
 - ACP is the documented v1 subset: initialize/session-new/prompt/cancel with text and resource-link blocks; MCP servers are refused before any process boundary.
 - No arbitrary file serving, code execution, MCP process launch, non-loopback traffic, or public release.
 

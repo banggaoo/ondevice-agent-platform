@@ -6,6 +6,9 @@ import PlatformServing
 /// Starts the one shared core and the loopback boundary. Prints the readiness
 /// URL and nonsecret diagnostics only - never credentials.
 enum ServeCommand {
+    /// Serving alias for the opt-in Apple provider route.
+    static let appleModelAlias = "apple-foundation-model"
+
     struct Config {
         var schemaVersion = 1
         var port: UInt16?
@@ -59,20 +62,28 @@ enum ServeCommand {
         if args.contains("--enable-apple-model") { config.enableAppleModel = true }
         if let p = value(forFlag: "--port", in: args), let n = UInt16(p) { config.port = n }
 
-        // Nonsecret empty registry: model namespaces stay empty until M2;
-        // agent metadata is compiled in, not promoted from arbitrary JSON.
+        // Declared model registry: builtin.linear typed-ML entries are
+        // validated and loaded; LLM routes stay code-registered behind their
+        // own opt-ins. A malformed registry fails startup, never partially
+        // loads.
         if try root.readOwnedJSON(root.registryURL) == nil {
             try root.writeOwnedJSON(.object([
                 "schemaVersion": .int(1),
                 "models": .array([]),
             ]), to: root.registryURL)
         }
+        guard let registryJSON = try root.readOwnedJSON(root.registryURL) else {
+            throw PlatformError(.storageFailure, detail: "registry unreadable")
+        }
+        let registryEntries = try ModelRegistry.parse(registryJSON)
 
         let credentials = KeychainCredentialStore()
         let monitor = NativeResourceMonitor()
         let supervisor = PlatformSupervisor(
             root: root, credentials: credentials, resourceSource: monitor,
-            options: .init(enableReferenceAgent: config.enableReferenceAgent))
+            options: .init(
+                enableReferenceAgent: config.enableReferenceAgent,
+                referenceEchoModelAlias: config.enableAppleModel ? appleModelAlias : nil))
         try await supervisor.start()
         // Every scope must already have a credential; missing scopes fail
         // truthfully rather than minting silently at runtime. The only
@@ -98,7 +109,7 @@ enum ServeCommand {
         if config.enableAppleModel {
             let available = AppleModelAvailability.status() == .available
             await supervisor.registerModel(
-                ModelProfile(alias: "apple-foundation-model",
+                ModelProfile(alias: appleModelAlias,
                              providerID: AppleFoundationProvider.id,
                              kind: .llm, task: "chat",
                              purposes: ["lightweight", "system-integration"],
@@ -109,6 +120,11 @@ enum ServeCommand {
                     "apple model enabled but device reports unavailable; " +
                     "alias serves provider-unavailable\n").utf8))
             }
+        }
+
+        // Registry-declared typed-ML routes (builtin.linear).
+        for entry in registryEntries {
+            await supervisor.registerModel(entry.profile, predictor: entry.mlPredictor)
         }
 
         let sessions = ConsoleSessions(clock: Clock())
@@ -128,9 +144,11 @@ enum ServeCommand {
                                 port: boundPort, clock: Clock()))
         try root.writeDaemonMarker(port: boundPort)
 
-        let qualified = config.enableAppleModel
-            ? (AppleModelAvailability.status() == .available ? "apple-foundation-model" : "none")
-            : "none"
+        var qualifiedNames = registryEntries.map(\.profile.alias)
+        if config.enableAppleModel, AppleModelAvailability.status() == .available {
+            qualifiedNames.append(appleModelAlias)
+        }
+        let qualified = qualifiedNames.isEmpty ? "none" : qualifiedNames.sorted().joined(separator: ",")
         print("ready http://127.0.0.1:\(boundPort)")
         FileHandle.standardError.write(Data(
             "ondevice-agent-platform serving on 127.0.0.1:\(boundPort); providers qualified: \(qualified)\n".utf8))

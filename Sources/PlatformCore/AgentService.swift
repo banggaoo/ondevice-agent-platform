@@ -69,6 +69,26 @@ public actor AgentService {
         )
     }
 
+    /// Bounded model-step reference agent: registered only when its declared
+    /// model alias exists as a serving route (qualified, never assumed).
+    public func registerBuiltInEcho(modelAlias: String) {
+        register(
+            profile: AgentProfile(
+                id: "reference.echo", version: 1,
+                harnessID: ReferenceEchoHarness.id,
+                harnessVersion: ReferenceEchoHarness.version,
+                stateSchemaVersion: 1,
+                toolScope: [], modelProfileAlias: modelAlias,
+                implementationRef: "builtin:reference.echo"
+            ),
+            harness: HarnessEntry(
+                make: { ReferenceEchoHarness(modelAlias: modelAlias) },
+                harnessID: ReferenceEchoHarness.id,
+                harnessVersion: ReferenceEchoHarness.version
+            )
+        )
+    }
+
     public func profileIDs() -> [String] { profiles.keys.sorted() }
 
     public func profile(id: String) -> AgentProfile? { profiles[id] }

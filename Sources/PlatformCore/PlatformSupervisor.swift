@@ -6,8 +6,12 @@ import Foundation
 public actor PlatformSupervisor {
     public struct Options: Sendable {
         public var enableReferenceAgent: Bool
-        public init(enableReferenceAgent: Bool = false) {
+        /// When set and the reference agent is enabled, also registers the
+        /// bounded model-step `reference.echo` harness bound to this alias.
+        public var referenceEchoModelAlias: String?
+        public init(enableReferenceAgent: Bool = false, referenceEchoModelAlias: String? = nil) {
             self.enableReferenceAgent = enableReferenceAgent
+            self.referenceEchoModelAlias = referenceEchoModelAlias
         }
     }
 
@@ -65,6 +69,9 @@ public actor PlatformSupervisor {
         }
         if options.enableReferenceAgent {
             await agentService.registerBuiltInReference()
+            if let alias = options.referenceEchoModelAlias {
+                await agentService.registerBuiltInEcho(modelAlias: alias)
+            }
         }
     }
 

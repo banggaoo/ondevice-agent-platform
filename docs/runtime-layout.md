@@ -13,7 +13,7 @@ Packaging must be compatible with this location: an unsandboxed per-user utility
 ```text
 ~/.ondevice-agent-platform/
 ├── config.json                 # Versioned nonsecret settings; user-managed changes
-├── registry.json               # Validated provider/model/agent/profile definitions and policy references
+├── registry.json               # Validated model declarations (implemented: builtin.linear ml entries; agent/harness metadata stays compiled-in)
 ├── state.sqlite3               # Selected SQLite store; core jobs, config metadata, optional agent checkpoints/proposals; schema/protocol proposed
 ├── proposals/                  # Regenerable Markdown views of immutable records
 ├── exports/                    # Explicitly previewed local review packages
