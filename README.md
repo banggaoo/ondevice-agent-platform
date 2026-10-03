@@ -2,7 +2,7 @@
 
 A proposed local-first, resource-aware agent serving platform for Apple Silicon macOS, intended for engineers broadly. Local, free-to-use, and performant operation are product goals, not measured performance, an established license, or authorization to publish or distribute.
 
-**Status: strategy draft v0.9 + bounded M1 implementation, 2026-10-04.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, and local console described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite. No real inference provider, downloaded model, cloud integration, ARTEMIS mutation, automation, or release artifact exists yet; M2/M3 qualification is not done.
+**Status: strategy draft v0.9 + bounded M1 implementation and opt-in Apple provider, 2026-10-04.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, and local console described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite. The Apple Foundation Models provider is implemented behind the explicit `--enable-apple-model` opt-in with observed availability; no downloaded model, cloud integration, ARTEMIS mutation, automation, or release artifact exists yet, and the remaining M2/M3 qualification (owned open-weight route, typed ML runtime) is not done.
 
 ## Build and run (M1)
 
@@ -18,7 +18,7 @@ Commands:
 
 ```sh
 ondevice-agent-platform credential --scope console|model|agent [--data-root PATH]
-ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent]
+ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]
 ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
 ```
 
@@ -30,6 +30,7 @@ ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
 ## Explicit limits of this increment
 
 - The model registry starts empty: OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
+- `serve --enable-apple-model` (or the `enableAppleModel` config key) is the only provider opt-in: it registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
 - `serve --enable-reference-agent` installs only the deterministic `reference.status` harness; there is no Operator and no general tool execution.
 - ACP is the documented v1 subset: initialize/session-new/prompt/cancel with text and resource-link blocks; MCP servers are refused before any process boundary.
 - No arbitrary file serving, code execution, MCP process launch, non-loopback traffic, or public release.
@@ -76,7 +77,7 @@ Trying Apple Foundation Models first is a confirmed experiment direction, not pr
 - ARTEMIS compatibility means the tested client contract at a pinned source revision. Endpoint shape alone does not establish compatibility or offline operation.
 - Local-only requests must not silently fall back to cloud. Apple cloud use is supported conditionally through one explicit local-only/eligible-cloud mode choice per consumer or session rather than a prompt per generation, with visible policy, no credential or logging-scope relaxation, and no automatic external patch executor.
 - Model discovery, automatic upgrades, general shell execution, training, and patch application are deferred.
-- Embedded SQLite is the confirmed engine for durable local state; its schema, transition protocol, logging, and retention remain proposed, and nothing is implemented.
+- Embedded SQLite is the confirmed engine for durable local state; schema v1 (content-free job/session/profile records, WAL, interrupted-on-restart) is implemented, while logging and retention policy remain proposed.
 - Runtime data uses the user-selected `~/.ondevice-agent-platform/` root; per-session directories are created only when artifacts or scratch require them. The chosen directory is not a sandbox.
 - ACP is the default agent-facing protocol; no particular client or editor integration is mandatory.
 

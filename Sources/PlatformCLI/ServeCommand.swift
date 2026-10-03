@@ -2,7 +2,7 @@ import Foundation
 import PlatformCore
 import PlatformServing
 
-/// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent]`
+/// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]`
 /// Starts the one shared core and the loopback boundary. Prints the readiness
 /// URL and nonsecret diagnostics only - never credentials.
 enum ServeCommand {
@@ -10,9 +10,14 @@ enum ServeCommand {
         var schemaVersion = 1
         var port: UInt16?
         var enableReferenceAgent = false
+        var enableAppleModel = false
     }
 
     static func run(args: [String]) async throws {
+        if args.contains("--help") {
+            print("serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]")
+            return
+        }
         guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 else {
             throw PlatformError(.versionUnsupported, detail: "macOS 27+ required")
         }
@@ -34,7 +39,7 @@ enum ServeCommand {
         if let raw = try root.readOwnedJSON(root.configURL) {
             guard let object = raw.objectValue else { throw PlatformError(.invalidRequest, detail: "config malformed") }
             for key in object.keys {
-                guard ["schemaVersion", "port", "enableReferenceAgent"].contains(key) else {
+                guard ["schemaVersion", "port", "enableReferenceAgent", "enableAppleModel"].contains(key) else {
                     throw PlatformError(.invalidRequest, detail: "unknown config key")
                 }
             }
@@ -46,10 +51,12 @@ enum ServeCommand {
                 config.port = UInt16(p)
             }
             config.enableReferenceAgent = object["enableReferenceAgent"] == .bool(true)
+            config.enableAppleModel = object["enableAppleModel"] == .bool(true)
         } else {
             try root.writeOwnedJSON(.object(["schemaVersion": .int(1)]), to: root.configURL)
         }
         if args.contains("--enable-reference-agent") { config.enableReferenceAgent = true }
+        if args.contains("--enable-apple-model") { config.enableAppleModel = true }
         if let p = value(forFlag: "--port", in: args), let n = UInt16(p) { config.port = n }
 
         // Nonsecret empty registry: model namespaces stay empty until M2;
@@ -85,6 +92,25 @@ enum ServeCommand {
         }
         try await supervisor.loadCredentials()
 
+        // Explicit opt-in only: registers the Apple model profile with a real
+        // provider when the device reports availability; otherwise the alias
+        // exists but every request returns truthful provider-unavailable.
+        if config.enableAppleModel {
+            let available = AppleModelAvailability.status() == .available
+            await supervisor.registerModel(
+                ModelProfile(alias: "apple-foundation-model",
+                             providerID: AppleFoundationProvider.id,
+                             kind: .llm, task: "chat",
+                             purposes: ["lightweight", "system-integration"],
+                             capabilities: ["text"]),
+                provider: available ? AppleFoundationProvider() : nil)
+            if !available {
+                FileHandle.standardError.write(Data((
+                    "apple model enabled but device reports unavailable; " +
+                    "alias serves provider-unavailable\n").utf8))
+            }
+        }
+
         let sessions = ConsoleSessions(clock: Clock())
         let acp = ACPService(supervisor: supervisor, clock: Clock())
         let port = config.port ?? 8080
@@ -102,9 +128,12 @@ enum ServeCommand {
                                 port: boundPort, clock: Clock()))
         try root.writeDaemonMarker(port: boundPort)
 
+        let qualified = config.enableAppleModel
+            ? (AppleModelAvailability.status() == .available ? "apple-foundation-model" : "none")
+            : "none"
         print("ready http://127.0.0.1:\(boundPort)")
         FileHandle.standardError.write(Data(
-            "ondevice-agent-platform M1 serving on 127.0.0.1:\(boundPort); no providers qualified\n".utf8))
+            "ondevice-agent-platform serving on 127.0.0.1:\(boundPort); providers qualified: \(qualified)\n".utf8))
 
         let shutdown = CancelSignal()
         shutdown.install {

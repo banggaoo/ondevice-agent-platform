@@ -150,3 +150,30 @@ The `credential --scope` command remains the only deliberate token display;
 v1 subset only; MCP definitions are refused before any process boundary.
 Contract tests are software evidence, not model-quality, battery, or ARTEMIS
 compatibility evidence.
+
+## Apple provider increment (2026-10-04)
+
+First M2 seam work: `AppleFoundationProvider` implements the `LLMProvider`
+contract against the installed macOS 27 `FoundationModels` Swift interface
+(`SystemLanguageModel.default.availability`, `LanguageModelSession` with a
+mapped `Transcript`, `GenerationOptions.maximumResponseTokens`, real usage
+counts). Mapping preserves ordered system/developer instructions, prior
+user/assistant turns, and requires a final nonempty user turn. `cancel`
+cooperatively interrupts the single in-flight generation through task
+cancellation; the provider holds no policy, admission, or scheduling
+authority.
+
+Registration is opt-in only: `serve --enable-apple-model` or the
+`enableAppleModel` config key registers the `apple-foundation-model` alias.
+The provider instance is attached only when the device reports availability;
+otherwise the alias exists and every request returns truthful
+provider-unavailable. The availability check runs again per request, so a
+device that loses eligibility stops serving rather than fabricating. This is
+one purpose-tagged provider (`lightweight`, `system-integration`), not a
+universal default; open-weight routes remain complementary M2 work.
+
+Suite status after the increment: 61 software-contract tests pass,
+including request-to-transcript mapping, refusal of malformed final turns,
+stable provider identity, and truthful complete-or-unavailable behavior
+through shared admission. No downloaded artifact, cloud call, PCC use, or
+quality claim is implied.

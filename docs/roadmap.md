@@ -18,6 +18,8 @@ After an explicit implementation request, build the platform lifecycle, authenti
 
 Implement the declared OpenAI-compatible model subset behind shared core admission and provider interfaces. Qualify Apple on-device and one owned open-weight artifact/runtime candidate as complementary LLM routes, and the typed MLService with a qualified runtime and registered input/output schemas as a baseline facility; an Apple trial does not make it the universal default. Select per-purpose model profiles from explicit caller requirements, verified capabilities, and device/resource fit. Verify complete conversations, required tools/schema/images, streaming, deadlines, cancellation, and truthful provider identity. Native tool integration does not grant system privileges.
 
+Partial progress (2026-10-04): the Apple on-device route is implemented behind the explicit `--enable-apple-model` opt-in - `apple-foundation-model` serves only when the device reports availability and returns truthful provider-unavailable otherwise. The owned open-weight route and qualified typed-ML runtime remain open.
+
 **Exit:** declared model-serving routes pass their contract and resource checks without the Operator; purpose claims and unsupported capabilities are explicit. Test with controlled API clients before live consumer work. PCC is a separate conditional provider gate, not a core prerequisite. No requirement to implement every backend at once.
 
 ## M3 - ACP agent serving and versioned harnesses

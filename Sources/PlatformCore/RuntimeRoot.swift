@@ -15,7 +15,15 @@ public final class RuntimeRoot: @unchecked Sendable {
     ]
 
     public init(url: URL) {
-        self.url = url.standardizedFileURL
+        // Canonicalize only the deepest existing ancestor, keeping the final
+        // component literal. standardizedFileURL resolves symlinks only for
+        // components that exist at call time, so its result changes once the
+        // root is created - the Keychain key and lock path must not depend on
+        // whether credential or serve ran first.
+        let parent = url.deletingLastPathComponent().resolvingSymlinksInPath()
+        let name = url.lastPathComponent
+        self.url = name.isEmpty ? url.standardizedFileURL
+                                : parent.appendingPathComponent(name, isDirectory: true)
     }
 
     public static var defaultURL: URL {

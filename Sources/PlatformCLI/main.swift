@@ -9,7 +9,7 @@ func printUsage() {
     ondevice-agent-platform - local model and agent serving platform (M1)
 
     Usage:
-      ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent]
+      ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]
       ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
       ondevice-agent-platform credential --scope console|model|agent [--data-root PATH]
       ondevice-agent-platform --help

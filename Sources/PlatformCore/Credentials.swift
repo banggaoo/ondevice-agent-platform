@@ -46,6 +46,10 @@ public final class KeychainCredentialStore: CredentialStore, @unchecked Sendable
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            // Pin to the file-based keychain: the data-protection keychain is
+            // unavailable to unsigned binaries, and an explicit pin keeps the
+            // backend stable regardless of future signing/entitlement changes.
+            kSecUseDataProtectionKeychain as String: false,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
@@ -63,6 +67,7 @@ public final class KeychainCredentialStore: CredentialStore, @unchecked Sendable
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            kSecUseDataProtectionKeychain as String: false,
         ]
         let status = SecItemUpdate(base as CFDictionary,
                                    [kSecValueData as String: secret] as CFDictionary)
