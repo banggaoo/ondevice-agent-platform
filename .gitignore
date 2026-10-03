@@ -1,0 +1,22 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+models/
+datasets/
+runtime-data/
+exports/
+.venv/
+__pycache__/
+node_modules/
+.build/
+dist/
+
+# Separate user-provided consumer reference checkout
+/artemis/
