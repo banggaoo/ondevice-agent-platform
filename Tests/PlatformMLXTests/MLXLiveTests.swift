@@ -211,8 +211,8 @@ final class MLXLiveTests: XCTestCase {
         let routes: [(alias: String, source: ModelSource)] = [
             ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit",
                                  revision: "main")),
-            ("qwen3-4b", .init(repo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-                               revision: "main")),
+            ("qwen3.8-9b", .init(repo: "nvythong/Qwen3.8-9B-Distill-mlx-4Bit",
+                                 revision: "e827c31fbd588828f43180a87ab34415a6d8a4bf")),
         ]
         let stack = try await makeStack()
         defer { stack.root.releaseLock() }
@@ -254,8 +254,8 @@ final class MLXLiveTests: XCTestCase {
 
         let routes: [(alias: String, source: ModelSource)] = [
             ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit", revision: "main")),
-            ("qwen3-4b", .init(repo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-                               revision: "main")),
+            ("qwen3.8-9b", .init(repo: "nvythong/Qwen3.8-9B-Distill-mlx-4Bit",
+                                 revision: "e827c31fbd588828f43180a87ab34415a6d8a4bf")),
         ]
         let prompts: [(id: String, text: String)] = [
             ("math", "Compute 17*23+19. Show your reasoning, then give the final answer."),

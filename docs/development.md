@@ -718,7 +718,8 @@ Artifact qualification (checked 2026-10-05 via the Hugging Face API):
   5,058,246,338 bytes, manifest-verified (sizes + LFS sha256), resolved
   revision `e827c31fbd58`. Registry entry: purposes
   `reasoning,coding,runtime-explanation`, capabilities `text`,
-  maxOutputTokens 4096. `qwen3-4b` remains a declared serving alias.
+  maxOutputTokens 4096. `qwen3-4b` was subsequently removed at the user's
+  direction (below).
 
 Binding change: `ServeCommand.operatorDefaultModelAlias` is now
 `qwen3.8-9b`; `serve --enable-operator` and `--operator-model` validation
@@ -751,3 +752,17 @@ Verification on the real artifact and native daemon:
   output is passed verbatim. This is functional-serving evidence only -
   answer quality, capacity over time, battery, and thermal characteristics
   remain unmeasured.
+
+Following the correction the user directed removal of the interim
+artifact: "remove mlx-community--Qwen3-4B-Instruct-2507-4bit__main. make
+sure provide qwen 9b and qwen vl for artemis and opencode". The artifact
+was deleted via governed `model remove --alias qwen3-4b` and the registry
+entry dropped; `/v1/models` now serves `qwen3.8-9b`, `qwen-vl`,
+`qwen-small`, and `apple-foundation-model` - the two routes ARTEMIS and
+OpenCode require (text reasoning + vision). The local OpenCode client
+configuration was updated to the `qwen3.8-9b` serving alias. A live
+completion on the restarted daemon was refused with `resource_denied`
+under a real OS `warning` memory-pressure event (`dispatch_event`) on the
+unloaded fresh process - the host itself was under pressure; this is the
+governor, not a serving defect, and the earlier same-session 9B evidence
+stands.

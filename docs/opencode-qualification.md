@@ -10,7 +10,9 @@ not an automation backend invoked by this platform.
 The installed OpenCode executable reports version `1.18.34`. Its existing
 user-managed configuration declares an `ondevice` provider using
 `@ai-sdk/openai-compatible`, with a base URL of
-`http://127.0.0.1:8080/v1` and `ondevice/qwen3-4b` as its selected model.
+`http://127.0.0.1:8080/v1` and `ondevice/qwen3.8-9b` as its selected model
+(the earlier `ondevice/qwen3-4b` selection was updated when that alias was
+removed 2026-10-05).
 The model declarations also include the small Qwen, Qwen vision, and Apple
 aliases. Credential values are not part of this record.
 
@@ -118,8 +120,8 @@ excluded from that receipt.
 
 The normal runtime root contains the pulled Qwen artifacts. Its
 registry declares the `qwen3.8-9b` model alias as the Operator binding
-(D51; `qwen3-4b` remains a declared serving alias); the runtime Operator
-is registered only by an explicit serving opt-in. As prior 2026-10-04
+(D51; `qwen3-4b` was removed 2026-10-05); the runtime Operator is
+registered only by an explicit serving opt-in. As prior 2026-10-04
 observations - not the current listening state - the 8081 instance answered
 a model list and ACP initialize/session setup, while a native Operator
 prompt expired at the queue deadline with thermal state `fair`; that is not
