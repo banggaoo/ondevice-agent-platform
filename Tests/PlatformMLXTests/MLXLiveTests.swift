@@ -192,6 +192,88 @@ final class MLXLiveTests: XCTestCase {
         png.append(chunk("IEND", Data()))
         return png
     }
+
+    /// D41 first paired measurement: identical fixed prompts across the
+    /// Apple provider and pulled MLX routes, direct provider calls (no
+    /// admission - measures the model, not the gate). Prints one JSON line
+    /// per (prompt, route) for recording in docs. Not a benchmark: three
+    /// prompts, single run, one warm host at thermal fair.
+    func testLivePairedMeasurement() async throws {
+        try XCTSkipUnless(live(), "set OAP_LIVE_MLX=1 to run the live model test")
+        guard let dir = ProcessInfo.processInfo.environment["OAP_LIVE_MLX_STORE"] else {
+            throw XCTSkip("set OAP_LIVE_MLX_STORE to a pulled models dir")
+        }
+        let store = ModelStore(modelsDir: URL(fileURLWithPath: dir))
+        let mlx = MLXProvider(store: store)
+
+        let routes: [(alias: String, source: ModelSource)] = [
+            ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit", revision: "main")),
+            ("qwen3-4b", .init(repo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+                               revision: "main")),
+        ]
+        let prompts: [(id: String, text: String)] = [
+            ("math", "Compute 17*23+19. Show your reasoning, then give the final answer."),
+            ("code", "Write a Swift function `isPalindrome(_ s: String) -> Bool` ignoring case and non-letters. Code only."),
+            ("instruction", "List exactly three colors, one per line, no numbering or extra words."),
+        ]
+        let maxTokens = 256
+
+        var lines: [String] = []
+        // Apple route (skipped truthfully if unavailable).
+        let apple = AppleFoundationProvider()
+        let appleProfile = ModelProfile(alias: "apple-foundation-model",
+                                        providerID: AppleFoundationProvider.id,
+                                        kind: .llm, task: "chat", maxOutputTokens: maxTokens)
+        for p in prompts {
+            let req = ChatRequest(model: appleProfile.alias, messages: [
+                ChatMessage(role: .user, parts: [p.text])], maxOutputTokens: maxTokens,
+                                  temperature: 0)
+            let t0 = Date()
+            do {
+                let r = try await apple.complete(req, profile: appleProfile)
+                lines.append(Self.line(route: "apple-fm", prompt: p.id,
+                                       seconds: Date().timeIntervalSince(t0),
+                                       usage: r.usage, content: r.content))
+            } catch {
+                lines.append(Self.line(route: "apple-fm", prompt: p.id,
+                                       seconds: Date().timeIntervalSince(t0),
+                                       usage: nil, content: "ERROR: \(error)"))
+            }
+        }
+        for (alias, source) in routes where store.isReady(source: source) {
+            let profile = ModelProfile(alias: alias, providerID: MLXProviderContract.id,
+                                       kind: .llm, task: "chat", source: source)
+            for p in prompts {
+                let req = ChatRequest(model: alias, messages: [
+                    ChatMessage(role: .user, parts: [p.text])], maxOutputTokens: maxTokens,
+                                      temperature: 0)
+                let t0 = Date()
+                do {
+                    let r = try await mlx.complete(req, profile: profile)
+                    lines.append(Self.line(route: alias, prompt: p.id,
+                                           seconds: Date().timeIntervalSince(t0),
+                                           usage: r.usage, content: r.content))
+                } catch {
+                    lines.append(Self.line(route: alias, prompt: p.id,
+                                           seconds: Date().timeIntervalSince(t0),
+                                           usage: nil, content: "ERROR: \(error)"))
+                }
+            }
+        }
+        for line in lines { print("MEASURE \(line)") }
+        XCTAssertFalse(lines.isEmpty, "no route was measurable")
+    }
+
+    private static func line(route: String, prompt: String, seconds: Double,
+                             usage: ChatUsage?, content: String) -> String {
+        let escaped = content.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .prefix(400)
+        return """
+        {"route":"\(route)","prompt":"\(prompt)","seconds":\(String(format: "%.2f", seconds)),"promptTokens":\(usage?.promptTokens ?? -1),"completionTokens":\(usage?.completionTokens ?? -1),"content":"\(escaped)"}
+        """
+    }
 }
 
 private extension FixedWidthInteger {

@@ -83,3 +83,25 @@ Local-only tests remove inherited cloud/OCR credentials, audit native provider b
 The ARTEMIS compatibility gate covers only the declared serving contract. It does not certify exhaustive consumer mobile QA, iOS support, or any ARTEMIS-based automation executor. Any local-only or zero-source-change claim still needs the corresponding consumer-route and egress evidence.
 
 The 90% and 10% targets require discussion and adequate samples. Proposed resource bounds in [resource policy](resource-policy.md) also require device-tier calibration. A failed task cannot count as efficient because it used less compute. Prefer deterministic tools, context reduction and valid caches before training. Classifier promotion requires approved labels, holdout/shadow evaluation, abstention, rollback and lifecycle-cost amortization. The 90% Operator target gates only that optional consumer; it does not gate core serving.
+
+## First paired measurement (recorded, 2026-10-04)
+
+Conditions: M4 Air 16 GB, thermal `fair`, single run, `temperature: 0`,
+`max_tokens: 256`, direct provider calls (admission not in the path -
+this measures model behavior, not the resource gate). Three fixed prompts.
+This is one data point, not a benchmark; spread and repeats are pending.
+
+| Prompt | apple-fm | qwen3-4b | qwen-small (0.6B) |
+|---|---|---|---|
+| math (17*23+19) | 4.9s, correct (410) | 18.1s, correct, verbose | 8.1s, truncated in `<think>` - no answer within cap |
+| code (isPalindrome) | 2.0s, correct, idiomatic | 3.6s, correct, idiomatic | 6.1s, truncated in `<think>` |
+| instruction (3 colors) | 0.67s, exact format | 0.53s, correct | 3.3s, thinking chatter |
+
+Observations consistent with (not proof of) the user's purpose hypothesis:
+the Apple route is materially faster and reliably format-exact on short
+system-style tasks; qwen3-4b matches quality on reasoning/code at higher
+latency; the 0.6B variant's chain-of-thought spillover makes it a poor fit
+for short-capped utility calls - a real purpose-fit finding, not a quality
+rank. MLX tok/s under thermal-fair conditions on this host is plausible
+(~60-100 gen tok/s observed for 4B-4bit). No claim about the 9B class or
+battery-normalized cost until repeated measurement under controlled load.
