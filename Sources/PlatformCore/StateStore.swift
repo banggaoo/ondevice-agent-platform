@@ -192,6 +192,19 @@ public actor StateStore {
         }
     }
 
+    /// Highest `job-<n>` suffix already persisted, so a restarted daemon
+    /// never re-issues an id that collides with a durable row.
+    public func maxJobSequence() throws -> Int {
+        var maxN = 0
+        try query("SELECT id FROM jobs") { stmt in
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            if id.hasPrefix("job-"), let n = Int(id.dropFirst(4)) {
+                maxN = max(maxN, n)
+            }
+        }
+        return maxN
+    }
+
     public func insertJob(_ job: JobRecord) throws {
         try checkCapacity()
         try runStatement("""

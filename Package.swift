@@ -10,6 +10,11 @@ let package = Package(
         .executable(name: "ondevice-agent-platform", targets: ["PlatformCLI"]),
         .executable(name: "acp-fixture", targets: ["ACPFixture"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.31.4"),
+        .package(url: "https://github.com/huggingface/swift-huggingface", exact: "0.11.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.4"),
+    ],
     targets: [
         .systemLibrary(name: "CSQLite", path: "Sources/CSQLite"),
         .target(name: "PlatformCore", dependencies: ["CSQLite"], path: "Sources/PlatformCore"),
@@ -19,9 +24,22 @@ let package = Package(
             path: "Sources/PlatformServing",
             resources: [.process("Console")]
         ),
+        /// Owned open-weight LLM runtime behind the LLMProvider seam. Kept out
+        /// of PlatformCore so the deterministic core has no third-party code.
+        .target(
+            name: "PlatformMLX",
+            dependencies: [
+                "PlatformCore",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/PlatformMLX"
+        ),
         .executableTarget(
             name: "PlatformCLI",
-            dependencies: ["PlatformCore", "PlatformServing"],
+            dependencies: ["PlatformCore", "PlatformServing", "PlatformMLX"],
             path: "Sources/PlatformCLI"
         ),
         .target(
@@ -45,6 +63,11 @@ let package = Package(
             name: "PlatformServingTests",
             dependencies: ["PlatformCore", "PlatformServing", "PlatformTestSupport"],
             path: "Tests/PlatformServingTests"
+        ),
+        .testTarget(
+            name: "PlatformMLXTests",
+            dependencies: ["PlatformCore", "PlatformMLX", "PlatformTestSupport"],
+            path: "Tests/PlatformMLXTests"
         ),
     ]
 )

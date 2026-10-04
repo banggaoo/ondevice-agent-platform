@@ -19,6 +19,20 @@ public enum CategoryStatus: String, Sendable, Codable {
     case notConfigured   // no registered/qualified profile exists
 }
 
+/// Declared provenance of a downloadable model artifact. Pure data: a source
+/// declaration never causes a download by itself; acquisition is an explicit
+/// code-owned operation (`model pull`). `repo` is an owner/name repository id,
+/// `revision` a pinned ref (tag/commit/branch) recorded in the pull manifest.
+public struct ModelSource: Sendable, Codable, Equatable {
+    public let repo: String
+    public let revision: String
+
+    public init(repo: String, revision: String) {
+        self.repo = repo
+        self.revision = revision
+    }
+}
+
 /// Immutable registered model record. `inputSchema`/`outputSchema` apply to
 /// kind .ml; context/output token bounds apply to kind .llm.
 public struct ModelProfile: Sendable, Codable, Equatable {
@@ -32,11 +46,16 @@ public struct ModelProfile: Sendable, Codable, Equatable {
     public let capabilities: [String]
     public let maxInputBytes: Int?
     public let maxOutputTokens: Int?
+    /// Declared artifact source for providers whose weights live under the
+    /// managed model store (e.g. the MLX route). Nil for providers that carry
+    /// no external artifact (Apple, builtin.linear).
+    public let source: ModelSource?
 
     public init(alias: String, providerID: String, kind: ModelKind, task: String,
                 purposes: [String] = [], inputSchema: [String: FeatureType]? = nil,
                 outputSchema: [String: FeatureType]? = nil, capabilities: [String] = [],
-                maxInputBytes: Int? = nil, maxOutputTokens: Int? = nil) {
+                maxInputBytes: Int? = nil, maxOutputTokens: Int? = nil,
+                source: ModelSource? = nil) {
         self.alias = alias
         self.providerID = providerID
         self.kind = kind
@@ -47,6 +66,7 @@ public struct ModelProfile: Sendable, Codable, Equatable {
         self.capabilities = capabilities
         self.maxInputBytes = maxInputBytes
         self.maxOutputTokens = maxOutputTokens
+        self.source = source
     }
 }
 

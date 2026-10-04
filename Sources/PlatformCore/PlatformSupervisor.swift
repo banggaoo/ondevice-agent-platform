@@ -63,6 +63,7 @@ public actor PlatformSupervisor {
     /// Boot the core: prepared root, state store, credential presence, monitor.
     public func start() async throws {
         try await store.open()
+        jobSequence = try await store.maxJobSequence()
         latestSnapshot = resourceSource.currentSnapshot()
         resourceSource.start { [weak self] snapshot in
             Task { await self?.resourceChanged(snapshot) }
@@ -155,7 +156,7 @@ public actor PlatformSupervisor {
             "appleAvailability": .string(AppleModelAvailability.status().rawValue),
             "categories": .object([
                 "appleFoundationModels": .string(appleCategory().rawValue),
-                "ownedOpenWeight": .string(CategoryStatus.notConfigured.rawValue),
+                "ownedOpenWeight": .string(openWeightCategory().rawValue),
                 "typedML": .string(mlPredictors.isEmpty
                                    ? CategoryStatus.notConfigured.rawValue
                                    : CategoryStatus.qualified.rawValue),
@@ -174,6 +175,19 @@ public actor PlatformSupervisor {
     private func appleCategory() -> CategoryStatus {
         if llmProviders[AppleFoundationProvider.id] != nil { return .qualified }
         return AppleModelAvailability.status() == .notPresent ? .notConfigured : .observing
+    }
+
+    /// The MLX route is qualified only when a pulled, validated artifact
+    /// exists under the managed store. A registered provider with nothing
+    /// pulled reports `observing`; no route at all reports `notConfigured`.
+    private func openWeightCategory() -> CategoryStatus {
+        guard let provider = llmProviders[MLXProviderContract.id] else {
+            return modelProfiles.values.contains {
+                $0.providerID == MLXProviderContract.id
+            } ? .observing : .notConfigured
+        }
+        return (provider as? ProviderReadiness)?.hasReadyArtifact == true
+            ? .qualified : .observing
     }
 
     public func registrySnapshot() async -> JSONValue {

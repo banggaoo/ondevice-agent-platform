@@ -1,5 +1,6 @@
 import Foundation
 import PlatformCore
+import PlatformMLX
 import PlatformServing
 
 /// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]`
@@ -122,9 +123,18 @@ enum ServeCommand {
             }
         }
 
-        // Registry-declared typed-ML routes (builtin.linear).
+        // Registry-declared routes. builtin.linear entries carry their own
+        // predictor; mlx entries share one provider that resolves each
+        // profile's pinned source to a pulled artifact at request time - a
+        // declared-but-unpulled model stays registered and serves
+        // providerUnavailable truthfully.
+        let mlx = MLXProvider(store: ModelStore(root: root))
         for entry in registryEntries {
-            await supervisor.registerModel(entry.profile, predictor: entry.mlPredictor)
+            if let predictor = entry.mlPredictor {
+                await supervisor.registerModel(entry.profile, predictor: predictor)
+            } else {
+                await supervisor.registerModel(entry.profile, provider: mlx)
+            }
         }
 
         let sessions = ConsoleSessions(clock: Clock())
@@ -144,7 +154,13 @@ enum ServeCommand {
                                 port: boundPort, clock: Clock()))
         try root.writeDaemonMarker(port: boundPort)
 
-        var qualifiedNames = registryEntries.map(\.profile.alias)
+        var qualifiedNames = registryEntries.compactMap { entry -> String? in
+            // Declared-but-unpulled mlx routes are not qualified.
+            if let source = entry.profile.source, !mlx.store.isReady(source: source) {
+                return nil
+            }
+            return entry.profile.alias
+        }
         if config.enableAppleModel, AppleModelAvailability.status() == .available {
             qualifiedNames.append(appleModelAlias)
         }

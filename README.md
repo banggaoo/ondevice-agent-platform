@@ -2,11 +2,11 @@
 
 A proposed local-first, resource-aware agent serving platform for Apple Silicon macOS, intended for engineers broadly. Local, free-to-use, and performant operation are product goals, not measured performance, an established license, or authorization to publish or distribute.
 
-**Status: strategy draft v0.9 + bounded M1 implementation and opt-in Apple provider, 2026-10-04.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, and local console described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite. The Apple Foundation Models provider is implemented behind the explicit `--enable-apple-model` opt-in with observed availability; no downloaded model, cloud integration, ARTEMIS mutation, automation, or release artifact exists yet, and the remaining M2/M3 qualification (owned open-weight route, typed ML runtime) is not done.
+**Status: strategy draft v0.9 + bounded implementation, 2026-10-04.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console, opt-in Apple Foundation Models provider, and the owned open-weight MLX route described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
 
 ## Build and run (M1)
 
-Requires macOS 27+ on Apple Silicon and the installed Xcode 27 / Swift 6.4 toolchain. No third-party dependencies; the package links only system frameworks and system SQLite.
+Requires macOS 27+ on Apple Silicon and the installed Xcode 27 / Swift 6.4 toolchain (including the downloadable Metal toolchain component: `xcodebuild -downloadComponent MetalToolchain`). Third-party runtime dependencies are pinned exactly in `Package.resolved`: `mlx-swift-lm` 3.31.4 (MLX Swift LLM runtime), `swift-huggingface` 0.11.0 (hub downloads), and `swift-transformers` 1.3.4 (tokenizer loading). They are confined to the `PlatformMLX` target; `PlatformCore` links only system frameworks and system SQLite.
 
 ```sh
 swift build                                  # build the package
@@ -20,19 +20,24 @@ Commands:
 ondevice-agent-platform credential --scope console|model|agent [--data-root PATH]
 ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]
 ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
+ondevice-agent-platform model pull --alias ALIAS | --repo ORG/NAME --revision REV [--data-root PATH]
+ondevice-agent-platform model list [--data-root PATH]
+ondevice-agent-platform model remove --alias ALIAS [--data-root PATH]
 ```
 
 - `credential` is the only deliberate token display: it prints the secret alone on stdout. `serve` refuses to start while any scope credential is missing.
 - `serve` binds loopback only (default 127.0.0.1:8080) and writes a nonsecret `daemon.json` marker under the data root (default `~/.ondevice-agent-platform`).
+- `model pull` is the only acquisition path: it downloads a registry-declared (or explicit repo+revision) artifact from Hugging Face into `<data-root>/models/` with staging, per-file size checks, and LFS sha256 verification recorded in a manifest. Inference never downloads; a declared-but-unpulled model serves truthful provider-unavailable.
 - `acp` is a stdio facade that forwards JSON-RPC to the running daemon's private bridge; it never starts a second core.
 - Credentials live in Keychain keyed to the resolved data root. The console is a loopback development surface; `Secure` cookies are not possible on plain HTTP, so this is not hardened for distribution.
 
 ## Explicit limits of this increment
 
 - The model registry starts empty: OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
-- `serve --enable-apple-model` (or the `enableAppleModel` config key) is the only provider opt-in: it registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
+- `serve --enable-apple-model` (or the `enableAppleModel` config key) registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
+- `registry.json` accepts `provider: "mlx"` LLM entries with a pinned `source` (`repo` + `revision`); `serve` registers them behind the shared MLX provider, and a pulled, verified artifact makes them executable. Verified live on this host: `mlx-community/Qwen3-0.6B-4bit` and `mlx-community/Qwen3-4B-Instruct-2507-4bit`.
 - `serve --enable-reference-agent` installs the deterministic `reference.status` harness plus the bounded single-call `reference.echo` model-step harness when a declared model alias exists (currently the Apple opt-in). There is no Operator and no general tool execution.
-- `registry.json` accepts declared `builtin.linear` typed-ML models (features, labels, weights, optional bias); malformed entries fail startup. LLM aliases remain code-registered only.
+- `registry.json` accepts declared `builtin.linear` typed-ML models (features, labels, weights, optional bias); malformed entries fail startup.
 - ACP is the documented v1 subset: initialize/session-new/prompt/cancel with text and resource-link blocks; MCP servers are refused before any process boundary.
 - No arbitrary file serving, code execution, MCP process launch, non-loopback traffic, or public release.
 
@@ -84,4 +89,4 @@ Trying Apple Foundation Models first is a confirmed experiment direction, not pr
 
 The observed development host is an M4 MacBook Air with 16 GB memory; the requested device range includes other eligible Apple Silicon Macs. Hardware eligibility does not establish that a 9B model or Android emulator will fit.
 
-Implemented so far: the code-owned core lifecycle, the OpenAI-compatible endpoint and ACP agent adapter, typed-ML inference through the `builtin.linear` registry route, and the opt-in Apple Foundation Models provider; installed agent profiles and the Operator remain optional. Still open: an owned open-weight LLM route (needs an artifact/runtime qualification, no downloads authorized yet), remaining M3+ gates, and the engineering checks of signing/notarization/build/release/license, PCC eligibility for the chosen GitHub-delivered executable plus the cloud payload policy, RAM/provider/context calibration, and the pinned wire-compatibility/offline routes. PCC eligibility is a separate cloud gate, not a blocker for local-only feasibility. Public research can seed starting device/provider profiles; native observations and bounded measurements still validate them. This is a local Git repository; GitHub is the selected delivery target; licensing and release details remain open. No publication is performed by this revision.
+Implemented so far: the code-owned core lifecycle, the OpenAI-compatible endpoint and ACP agent adapter, typed-ML inference through the `builtin.linear` registry route, the opt-in Apple Foundation Models provider, and the owned open-weight MLX route with governed pull/manifest/lazy-load and real token usage; installed agent profiles and the Operator remain optional. Still open: remaining M3+ gates, and the engineering checks of signing/notarization/build/release/license, PCC eligibility for the chosen GitHub-delivered executable plus the cloud payload policy, RAM/provider/context calibration, and the pinned wire-compatibility/offline routes. PCC eligibility is a separate cloud gate, not a blocker for local-only feasibility. Public research can seed starting device/provider profiles; native observations and bounded measurements still validate them. This is a local Git repository; GitHub is the selected delivery target; licensing and release details remain open. No publication is performed by this revision.

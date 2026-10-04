@@ -9,13 +9,16 @@ public struct RegistryEntry: Sendable {
 /// Validates registry.json model declarations. The file is bounded data, so
 /// every key is checked explicitly; a malformed registry fails startup loudly
 /// rather than silently registering a different model than the owner wrote.
-/// Only `builtin.linear` typed-ML entries are loadable from JSON; LLM routes
-/// are registered in code behind their own opt-ins.
+/// Two loadable routes: `builtin.linear` typed-ML entries carry their weights
+/// inline; `mlx` LLM entries declare a `source` repo/revision whose artifact
+/// must already exist under the managed model store (populated only by the
+/// explicit `model pull` command - a registry entry never triggers downloads).
 public enum ModelRegistry {
     private static let topKeys: Set<String> = ["schemaVersion", "models"]
     private static let modelKeys: Set<String> = [
         "alias", "kind", "task", "provider", "purposes", "capabilities",
-        "inputSchema", "outputSchema", "maxInputBytes", "linear",
+        "inputSchema", "outputSchema", "maxInputBytes", "maxOutputTokens",
+        "linear", "source",
     ]
 
     public static func parse(_ root: JSONValue) throws -> [RegistryEntry] {
@@ -53,11 +56,20 @@ public enum ModelRegistry {
         guard let alias = object["alias"]?.stringValue, !alias.isEmpty else {
             throw PlatformError(.invalidRequest, detail: "model alias required")
         }
-        guard object["kind"]?.stringValue == "ml" else {
-            throw PlatformError(.invalidRequest, detail: "only ml registry models supported")
+        let kind = object["kind"]?.stringValue
+        let provider = object["provider"]?.stringValue
+        if kind == "llm" {
+            return try parseLLM(object, alias: alias, provider: provider)
         }
-        guard object["provider"]?.stringValue == LinearPredictor.id else {
+        guard kind == "ml" else {
+            throw PlatformError(.invalidRequest, detail: "unknown model kind")
+        }
+        guard provider == LinearPredictor.id else {
             throw PlatformError(.invalidRequest, detail: "unknown model provider")
+        }
+        guard object["source"] == nil, object["maxOutputTokens"] == nil else {
+            throw PlatformError(.invalidRequest,
+                                detail: "source/maxOutputTokens are llm-only keys")
         }
         guard object["task"]?.stringValue == "classification" else {
             throw PlatformError(.invalidRequest, detail: "linear models require task classification")
@@ -84,6 +96,79 @@ public enum ModelRegistry {
             inputSchema: inputSchema, outputSchema: outputSchema,
             capabilities: capabilities, maxInputBytes: maxInputBytes)
         return RegistryEntry(profile: profile, mlPredictor: LinearPredictor(spec: spec))
+    }
+
+    /// LLM registry entries are declarative routes to the managed model
+    /// store. `source` pins repo+revision; the artifact must be pulled
+    /// explicitly before the route can execute. `inputSchema`/`outputSchema`
+    /// and `linear` are not meaningful here and are rejected.
+    private static func parseLLM(_ object: [String: JSONValue], alias: String,
+                                 provider: String?) throws -> RegistryEntry {
+        guard provider == MLXProviderContract.id else {
+            throw PlatformError(.invalidRequest, detail: "unknown llm provider")
+        }
+        guard object["inputSchema"] == nil, object["outputSchema"] == nil,
+              object["linear"] == nil else {
+            throw PlatformError(.invalidRequest,
+                                detail: "schemas/linear are typed-ml only")
+        }
+        guard let sourceObject = object["source"]?.objectValue else {
+            throw PlatformError(.invalidRequest, detail: "llm models require source")
+        }
+        for key in sourceObject.keys where !["repo", "revision"].contains(key) {
+            throw PlatformError(.invalidRequest, detail: "unknown source key: \(key)")
+        }
+        guard let repo = sourceObject["repo"]?.stringValue,
+              let revision = sourceObject["revision"]?.stringValue,
+              isValidRepo(repo), isValidRevision(revision) else {
+            throw PlatformError(.invalidRequest, detail: "source repo/revision malformed")
+        }
+        let task = object["task"]?.stringValue ?? "chat"
+        guard task == "chat" else {
+            throw PlatformError(.invalidRequest, detail: "mlx models require task chat")
+        }
+        let purposes = try strings(object["purposes"], field: "purposes")
+        let capabilities = try strings(object["capabilities"], field: "capabilities")
+        var maxInputBytes: Int?
+        if let raw = object["maxInputBytes"]?.intValue {
+            guard raw > 0, raw <= Int64(PlatformLimits.requestBodyBytes) else {
+                throw PlatformError(.invalidRequest, detail: "maxInputBytes out of bounds")
+            }
+            maxInputBytes = Int(raw)
+        }
+        var maxOutputTokens: Int?
+        if let raw = object["maxOutputTokens"]?.intValue {
+            guard raw > 0, raw <= 32_768 else {
+                throw PlatformError(.invalidRequest, detail: "maxOutputTokens out of bounds")
+            }
+            maxOutputTokens = Int(raw)
+        }
+        let profile = ModelProfile(
+            alias: alias, providerID: MLXProviderContract.id,
+            kind: .llm, task: task, purposes: purposes,
+            capabilities: capabilities, maxInputBytes: maxInputBytes,
+            maxOutputTokens: maxOutputTokens,
+            source: ModelSource(repo: repo, revision: revision))
+        return RegistryEntry(profile: profile, mlPredictor: nil)
+    }
+
+    /// owner/name, no traversal or URL tricks.
+    public static func isValidRepo(_ repo: String) -> Bool {
+        let parts = repo.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return false }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+        return parts.allSatisfy {
+            !$0.isEmpty && $0.unicodeScalars.allSatisfy(allowed.contains)
+                && !$0.hasPrefix(".") && !$0.hasSuffix(".")
+        }
+    }
+
+    /// Branch, tag, or commit hex; bounded and path-safe.
+    public static func isValidRevision(_ revision: String) -> Bool {
+        guard !revision.isEmpty, revision.count <= 128 else { return false }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_./"))
+        return revision.unicodeScalars.allSatisfy(allowed.contains)
+            && !revision.contains("..") && !revision.hasPrefix("/") && !revision.hasSuffix("/")
     }
 
     /// Strict flat schema; for linear models every feature must be numeric.

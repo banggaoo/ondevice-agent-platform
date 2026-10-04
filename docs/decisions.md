@@ -49,6 +49,7 @@
 | D43 | Confirmed scope | Typed non-generative ML inference is a baseline serving capability, not training | User instruction on 2026-10-04; artifacts qualify per ModelProfile; training and promotion remain a separate consented scope |
 | D44 | Proposed | Stable ACP v1 as the initial pinned conformance profile; draft v2 only when separately tested | Verified 2026-10-04: upstream navigation marks v1 Latest and v2 Draft; no multi-version claim until tested |
 | D45 | Confirmed scope | Begin the bounded M1 implementation increment defined in [development](development.md) | Direct approval 2026-10-04: "approve proposal, proceed development". Covers the deterministic core, baseline ACP/OpenAI/typed-ML surfaces, and local console only; signing/notarization, release/build, license, PCC feasibility, and artifact qualification remain open (D21, D31, D41) |
+| D46 | Confirmed scope | Downloads are authorized; the owned open-weight route uses MLX Swift (`mlx-swift-lm` 3.31.4 + `swift-huggingface` 0.11.0 + `swift-transformers` 1.3.4, exact pins) confined to a new `PlatformMLX` target | User instruction 2026-10-04: "download is not forbidden, you should run now". MLX Swift selected as the single qualified owned worker per the one-worker policy (Apple-native MLX, exact pins, artifact verification). `PlatformCore` remains dependency-free. Acquisition stays explicit via `model pull` - no inference-time downloads |
 
 ## Alternatives and tradeoffs
 

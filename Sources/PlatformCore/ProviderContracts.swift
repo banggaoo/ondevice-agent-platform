@@ -24,6 +24,23 @@ public extension MLPredictor {
     func cancel(jobID: String) async {}
 }
 
+/// Provider id shared by the registry parser, the supervisor's category
+/// status, and the PlatformMLX provider implementation. Declared in the core
+/// so all three sides agree without the core importing the MLX runtime.
+public enum MLXProviderContract {
+    public static let id = "mlx"
+}
+
+/// Optional readiness reporting for providers whose weights are external
+/// artifacts. The supervisor uses it to report truthful category status:
+/// a registered provider with no usable artifact is `observing`, not
+/// `qualified`.
+public protocol ProviderReadiness: Sendable {
+    /// True when at least one declared model artifact is present and valid
+    /// under the managed store. Must be cheap (filesystem stat only).
+    var hasReadyArtifact: Bool { get }
+}
+
 /// Injectable clock for deterministic tests. `sleep` is the only timing
 /// source the core uses for deadlines/grace; it is cancellation-aware so
 /// task-group deadline timers exit promptly instead of pinning scope exit.

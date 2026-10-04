@@ -11,7 +11,7 @@ public final class RuntimeRoot: @unchecked Sendable {
     private static let ownedNames: Set<String> = [
         "config.json", "registry.json", "state.sqlite3",
         "state.sqlite3-wal", "state.sqlite3-shm",
-        "lock.fd", "daemon.json", "sessions",
+        "lock.fd", "daemon.json", "sessions", "models",
     ]
 
     public init(url: URL) {

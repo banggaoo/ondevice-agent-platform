@@ -1,6 +1,6 @@
 # Proposed runtime storage layout
 
-**Status:** root and SQLite engine confirmed by the user (2026-10-03); implemented in M1 for `config.json`, `registry.json`, `state.sqlite3`, the exclusive `lock.fd`, and the nonsecret `daemon.json` port marker, all under the resolved root (default `~/.ondevice-agent-platform`, overridable by absolute `--data-root`). Owned directories are 0700, owned files 0600; symlinks, non-owned state, and unrelated nonempty roots are refused. One resolved application-data root per installation; directory placement does not establish a sandbox. The platform repository and the separate ARTEMIS source checkout are not runtime state directories.
+**Status:** root and SQLite engine confirmed by the user (2026-10-03); implemented in M1 for `config.json`, `registry.json`, `state.sqlite3`, the exclusive `lock.fd`, and the nonsecret `daemon.json` port marker, all under the resolved root (default `~/.ondevice-agent-platform`, overridable by absolute `--data-root`), plus `models/` for pulled open-weight artifacts (2026-10-04). Owned directories are 0700, owned files 0600; symlinks, non-owned state, and unrelated nonempty roots are refused. One resolved application-data root per installation; directory placement does not establish a sandbox. The platform repository and the separate ARTEMIS source checkout are not runtime state directories.
 
 ## Root selection
 
@@ -13,7 +13,10 @@ Packaging must be compatible with this location: an unsandboxed per-user utility
 ```text
 ~/.ondevice-agent-platform/
 ├── config.json                 # Versioned nonsecret settings; user-managed changes
-├── registry.json               # Validated model declarations (implemented: builtin.linear ml entries; agent/harness metadata stays compiled-in)
+├── registry.json               # Validated model declarations (builtin.linear ml entries and mlx llm source entries; agent/harness metadata stays compiled-in)
+├── models/                     # Pulled open-weight artifacts (explicit `model pull` only)
+│   ├── .staging-*/             # In-flight download; renamed into place on success, never served
+│   └── <owner--name__rev>/     # Verified snapshot + manifest.json (repo, revision, files, sha256)
 ├── state.sqlite3               # Selected SQLite store; core jobs, config metadata, optional agent checkpoints/proposals; schema/protocol proposed
 ├── proposals/                  # Regenerable Markdown views of immutable records
 ├── exports/                    # Explicitly previewed local review packages
@@ -27,7 +30,7 @@ Packaging must be compatible with this location: an unsandboxed per-user utility
 
 This is a documentation example, not executable configuration. Simple status operations need no per-session directory, and durable authorization/decision records do not depend on session folders. Session identifiers are opaque validated values scoped to a consumer, not arbitrary caller-supplied paths, and a session directory is not a sandbox or an authority boundary. Provider, model, agent, and harness-profile definitions are distinct versioned logical namespaces in the registry; an agent or harness version reference is a reviewed registry record, not a code downloader or a training directory. A model entry records kind (`llm` or `ml`), task, and input/output schema metadata in addition to its identity and capacity fields. An ACP session maps logically to a pinned agent/harness run record; the baseline serving facility does not require the Operator or a per-session folder. Embedded SQLite is the selected engine for core jobs, configuration metadata, and optional agent checkpoints/proposals; the Operator is not a prerequisite for any of it, and no file-only alternative is currently required.
 
-Apple-managed model weights live under OS management, not in this tree. Use Foundation-resolved cache locations for any future owned model cache, with independent quotas and artifact checks. Do not create training folders/datasets merely because a future roadmap mentions them.
+Apple-managed model weights live under OS management, not in this tree. Owned open-weight weights live under `models/` and are populated only by the explicit `model pull` command: downloads land in a `.staging-*` sibling, every manifest-listed file is verified (size, and sha256 for LFS objects) before the directory is renamed into place, and a directory without a complete manifest is never treated as ready. Manifest paths are validated as safe relative paths; symlinked files or directories and traversal paths are refused. Do not create training folders/datasets merely because a future roadmap mentions them.
 
 ## State and isolation
 

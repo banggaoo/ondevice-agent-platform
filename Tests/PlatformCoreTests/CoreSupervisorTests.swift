@@ -90,6 +90,32 @@ final class CoreSupervisorTests: XCTestCase {
         } catch let e as PlatformError { XCTAssertEqual(e.code, .forbidden) }
     }
 
+    /// Restart regression: a new supervisor on the same root must continue
+    /// the persisted job id sequence, not collide with `job-1`.
+    func testRestartedSupervisorContinuesJobSequence() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await stack.supervisor.registerModel(Self.llmProfile(),
+                                             provider: FakeLLMProvider(autoFinish: true))
+        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        _ = try await stack.supervisor.submitLLM(principal: modelPrincipal,
+                                                 request: Self.chatRequest())
+        await stack.supervisor.shutdown()
+
+        let second = PlatformSupervisor(
+            root: stack.root, credentials: MemoryCredentialStore(),
+            resourceSource: stack.resources, clock: stack.clock.clock)
+        try await second.start()
+        await second.registerModel(Self.llmProfile(),
+                                   provider: FakeLLMProvider(autoFinish: true))
+        await second.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        _ = try await second.submitLLM(principal: modelPrincipal,
+                                       request: Self.chatRequest())
+        let jobs = try await second.listJobs()
+        XCTAssertTrue(jobs.contains { $0.id == "job-2" })
+        await second.shutdown()
+    }
+
     // MARK: admission queue
 
     func testActivePlusFourPendingThen429() async throws {

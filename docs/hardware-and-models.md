@@ -52,3 +52,21 @@ Public provider documentation, device specifications, and reproducible published
 Apple manages system-model versions and residency. The platform can release its sessions and bound submitted work, but cannot promise to unload Apple's model weights or free a known amount of unified memory. Capture the exposed model/OS identity and acknowledge opaque provider state.
 
 An owned artifact needs publisher, revision, digest, license, tokenizer/template, quantization, and runtime verification before advertised support. The Empero Qwen3.8-9B-Distill cards (checked 2026-10-03) state an Apache-2.0 license, a Qwen3.5-9B base with distillation claims toward a Qwen3.8 teacher, and a text-only fine-tune - vision is not evaluated. The GGUF Q4_K_M file is listed as 5.780 decimal GB before runtime overhead and requires a recent llama.cpp with Qwen3.5/Gated DeltaNet support; no MLX compatibility is demonstrated, and disk size is not peak memory. The publisher's benchmarks compare the distill to its Qwen3.5 base, not to Apple models, and its advertised context is not a device budget; treat these as publisher claims requiring this platform's own quality/resource checks. [Distill card](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill), [GGUF card](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF). Promotion requires the same measured workload and hardware evidence as any other provider, and no checked source supplies a matched Apple macOS 27 versus Qwen 9B quality, latency, or battery comparison - the user's stated comparison is a purpose hypothesis, not a measured result.
+
+## Qualified MLX artifacts (2026-10-04)
+
+The owned open-weight route is qualified on `mlx-swift-lm` 3.31.4 with two
+real artifacts pulled through `model pull` on the M4/16 GB host:
+
+| Alias | Repository | Verified size | Notes |
+|---|---|---|---|
+| `qwen-small` | `mlx-community/Qwen3-0.6B-4bit` | 351 MB, 11 files | Live completion through admission verified; quality unmeasured |
+| `qwen3-4b` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | 2.28 GB, 13 files | Pulled + qualified route; generation not yet observed on host (thermal gate) |
+
+Disk size is not peak memory; MLX allocates KV and activation headroom
+beyond the weight bytes. The route qualification answers "can the
+platform serve this" - it is not evidence for or against the user's
+Qwen-vs-Apple purpose hypothesis, which still needs the paired measured
+comparison in the proposal. The 9B distill above was not pulled: at
+~5.8 GB of weights plus runtime overhead it needs a capacity/thermal
+measurement first on a 16 GB host.

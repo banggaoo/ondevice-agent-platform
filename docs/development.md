@@ -215,3 +215,63 @@ live Apple completion through full admission took ~16.5 s (includes model
 load); later calls in the same process were materially faster. Thermal
 state sat at `fair` after sustained builds and correctly deferred new
 inference - the resource gate working as designed, not a fault.
+
+## Owned open-weight MLX route (2026-10-04)
+
+The user authorized downloads explicitly, unblocking the owned open-weight
+LLM route. The runtime is MLX Swift (`mlx-swift-lm` pinned exactly at
+3.31.4, plus `swift-huggingface` 0.11.0 and `swift-transformers` 1.3.4 -
+the two HF packages are required because mlx-swift-lm 3.x moved hub
+downloading and tokenization behind caller-provided macros). All three are
+confined to a new `PlatformMLX` target; `PlatformCore` still links only
+system frameworks and system SQLite, and `Package.resolved` records the
+exact pin set.
+
+Artifact governance is code-owned and explicit. `registry.json` accepts
+`kind: "llm"`, `provider: "mlx"` entries with a pinned `source` {repo,
+revision}; the entry declares intent only. `model pull` (new CLI command)
+enumerates the repo tree, downloads each file directly into a `.staging-*`
+sibling (no HF cache layer - no doubled disk usage), verifies per-file
+sizes and the LFS sha256 when the hub reports one, records a manifest
+(repo, revision, resolved commit, file list), then renames into
+`models/<owner--name__rev>/`. `model list` and `model remove` are the
+other two verbs. Nothing downloads at inference time, nothing follows
+arbitrary paths, and a directory without a complete verified manifest is
+never treated as ready. `RuntimeRoot` now owns `models/` in its
+allowed-names set.
+
+`MLXProvider` implements `LLMProvider` behind the same seam as the Apple
+route: identical message mapping (system/developer -> instructions,
+ordered history, final nonempty user turn), `GenerateParameters.maxTokens`
+from the request bound, temperature fixed at 0 (the serving contract has
+no sampling fields; determinism is the platform default), real
+prompt/generation token counts and true stop reasons from
+`GenerateCompletionInfo`, and cooperative cancellation via task
+cancellation into `ChatSession`'s termination path. Providers conform to
+the new `ProviderReadiness` protocol so `ownedOpenWeight` reports
+`qualified` only when a pulled, valid artifact exists - `observing` when a
+route is declared but nothing is pulled.
+
+Verified live on this host (M4 Air, 16 GB): `model pull` of
+`mlx-community/Qwen3-0.6B-4bit` (~351 MB) and
+`mlx-community/Qwen3-4B-Instruct-2507-4bit` (~2.28 GB) with manifest
+verification; `serve` reports `providers qualified: qwen-small,qwen3-4b`
+and `ownedOpenWeight: qualified`; `/v1/models` lists both aliases. The
+gated `MLXLiveTests` (`OAP_LIVE_MLX=1`) prove real generation through
+shared admission with real usage counts, and `cancelJob` -> provider
+cancel -> `.cancelled` to the caller in well under the full generation
+time. Observation, not benchmark: on this host the 0.6B-4bit live test
+complete path (pull + load + short generation) took ~31 s; sustained
+builds keep the thermal state at `fair`, where the resource policy
+correctly defers inference - the gate working as designed.
+
+One toolchain note: Xcode 27's Metal compile step for mlx-swift requires
+the downloadable Metal toolchain (`xcodebuild -downloadComponent
+MetalToolchain`); without it `swift build` fails inside `Cmlx` Metal
+targets. This is a host setup step, not a code dependency.
+
+Suite status: 95 tests pass (59 core + 23 serving + 13 MLX; the 2 live
+tests skip unless `OAP_LIVE_MLX=1` and were exercised manually). Known
+boundaries unchanged: no streaming/SSE, no tool dispatch to executors,
+no cloud fallback, and the Operator remains unimplemented pending its
+own scoped request.
