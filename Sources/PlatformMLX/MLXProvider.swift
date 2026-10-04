@@ -1,6 +1,8 @@
 import Foundation
+import CoreImage
 import MLXLMCommon
 import MLXLLM
+import MLXVLM
 import PlatformCore
 import Tokenizers
 
@@ -104,13 +106,27 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
         let task = Task<ChatResult, Error> {
             var params = GenerateParameters()
             params.maxTokens = request.maxOutputTokens
-            params.temperature = 0
-            let session = ChatSession(container, instructions: mapped.instructions,
+            // Unset sampling hints mean the platform default: greedy.
+            params.temperature = Float(request.temperature ?? 0)
+            if let topP = request.topP { params.topP = Float(topP) }
+            if let seed = request.seed { params.seed = seed }
+            if let presence = request.presencePenalty {
+                params.presencePenalty = Float(presence)
+            }
+            if let frequency = request.frequencyPenalty {
+                params.frequencyPenalty = Float(frequency)
+            }
+            var instructions = mapped.instructions
+            if let guidance = Self.formatGuidance(request.responseFormat) {
+                instructions = instructions.map { $0 + "\n" + guidance } ?? guidance
+            }
+            let session = ChatSession(container, instructions: instructions,
                                       history: mapped.history,
                                       generateParameters: params)
             var content = ""
             var info: GenerateCompletionInfo?
-            for try await generation in session.streamDetails(to: mapped.prompt) {
+            for try await generation in session.streamDetails(to: mapped.prompt,
+                                                              images: mapped.promptImages) {
                 switch generation {
                 case .chunk(let text): content += text
                 case .info(let completion): info = completion
@@ -145,14 +161,17 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
     }
 
     /// Maps a validated request to instructions + ordered history + final
-    /// user prompt. Same refusal rules as the Apple route: assistant-final
-    /// conversations and empty final turns are rejected, never improvised.
+    /// user prompt with its images. Same refusal rules as the Apple route:
+    /// assistant-final conversations and empty final turns are rejected,
+    /// never improvised. Images attach to the user turn that carried them.
     static func map(_ request: ChatRequest) throws -> (instructions: String?,
                                                        history: [Chat.Message],
-                                                       prompt: String) {
+                                                       prompt: String,
+                                                       promptImages: [UserInput.Image]) {
         var history: [Chat.Message] = []
         var instructions: [String] = []
         var prompt: String?
+        var promptImages: [UserInput.Image] = []
         let last = request.messages.count - 1
         for (index, message) in request.messages.enumerated() {
             let text = message.combinedText
@@ -160,10 +179,12 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
             case .system, .developer:
                 if !text.isEmpty { instructions.append(text) }
             case .user:
+                let mlxImages = try message.images.map { try image($0) }
                 if index == last {
                     prompt = text
+                    promptImages = mlxImages
                 } else {
-                    history.append(.user(text))
+                    history.append(.user(text, images: mlxImages))
                 }
             case .assistant:
                 guard index != last else {
@@ -174,11 +195,36 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
             }
         }
         guard let prompt,
-              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !promptImages.isEmpty else {
             throw PlatformError(.invalidRequest, detail: "final user message required")
         }
         return (instructions.isEmpty ? nil : instructions.joined(separator: "\n"),
-                history, prompt)
+                history, prompt, promptImages)
+    }
+
+    /// Decode a validated image payload to a CIImage. Decoded data that is
+    /// not a real image fails here, before generation consumes a slot.
+    private static func image(_ image: ChatImage) throws -> UserInput.Image {
+        guard let ciImage = CIImage(data: image.data),
+              !ciImage.extent.isEmpty else {
+            throw PlatformError(.invalidRequest, detail: "image data is not a decodable image")
+        }
+        return .ciImage(ciImage)
+    }
+
+    /// Response-format guidance appended to instructions. Documented
+    /// best-effort: no constrained decoding exists, so consumers get a
+    /// schema-following instruction, not a validity guarantee.
+    private static func formatGuidance(_ format: ResponseFormat?) -> String? {
+        switch format {
+        case .none: return nil
+        case .jsonObject:
+            return "Respond with a single valid JSON object and no other text."
+        case .jsonSchema(let name, let schema):
+            let rendered = (try? schema.encoded()).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            let label = name.map { " named \"\($0)\"" } ?? ""
+            return "Respond with a single valid JSON object\(label) matching this JSON schema and no other text: \(rendered)"
+        }
     }
 }
 

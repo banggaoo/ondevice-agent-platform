@@ -107,4 +107,98 @@ final class MLXLiveTests: XCTestCase {
         // finish fast.
         XCTAssertLessThan(Date().timeIntervalSince(started), 60)
     }
+
+    /// Vision route: real image input through the OpenAI contract shape into
+    /// a pulled VLM. Uses OAP_LIVE_MLX_STORE to reuse an existing artifact;
+    /// otherwise pulls Qwen3-VL-2B-Instruct-4bit (~1.8 GB).
+    func testLiveVisionCompletion() async throws {
+        try XCTSkipUnless(live(), "set OAP_LIVE_MLX=1 to run the live model test")
+        let stack = try await makeStack()
+        let store: ModelStore
+        if let dir = ProcessInfo.processInfo.environment["OAP_LIVE_MLX_STORE"] {
+            store = ModelStore(modelsDir: URL(fileURLWithPath: dir))
+        } else {
+            store = ModelStore(root: stack.root)
+        }
+        let source = ModelSource(repo: "mlx-community/Qwen3-VL-2B-Instruct-4bit",
+                                 revision: "main")
+        if !store.isReady(source: source) {
+            _ = try await store.pull(source: source)
+        }
+        let provider = MLXProvider(store: store)
+        let profile = ModelProfile(alias: "qwen-vl",
+                                   providerID: MLXProviderContract.id,
+                                   kind: .llm, task: "chat",
+                                   capabilities: ["vision"], source: source)
+        await stack.supervisor.registerModel(profile, provider: provider)
+        await registerStandardPrincipals(stack.supervisor)
+
+        // 64x48 solid red PNG, generated at test time - no bundled artifact.
+        let png = Self.solidRedPNG()
+        let request = ChatRequest(
+            model: "qwen-vl",
+            messages: [ChatMessage(
+                role: .user,
+                parts: ["What single solid color fills this image? One word."],
+                images: [ChatImage(data: png, mediaType: "image/png")])],
+            maxOutputTokens: 16)
+        let result = try await stack.supervisor.submitLLM(
+            principal: modelPrincipal, request: request)
+        XCTAssertFalse(result.content.trimmingCharacters(in: .whitespaces).isEmpty)
+        XCTAssertNotNil(result.usage)
+        // The image is a solid red field; a working VLM says "red".
+        XCTAssertTrue(result.content.lowercased().contains("red"),
+                      "unexpected vision answer: \(result.content)")
+    }
+
+    /// Minimal 64x48 solid-red PNG built inline (zlib stored blocks - no
+    /// compression, so no external codec is needed in the test).
+    static func solidRedPNG() -> Data {
+        func chunk(_ type: String, _ data: Data) -> Data {
+            var out = Data()
+            out.append(contentsOf: UInt32(data.count).bigEndianBytes)
+            out.append(type.data(using: .ascii)!)
+            out.append(data)
+            var crc: UInt32 = 0xFFFF_FFFF
+            for b in type.data(using: .ascii)! + data {
+                crc ^= UInt32(b)
+                for _ in 0..<8 { crc = (crc & 1) == 1 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1 }
+            }
+            out.append(contentsOf: (crc ^ 0xFFFF_FFFF).bigEndianBytes)
+            return out
+        }
+        var raw = Data()
+        for _ in 0..<48 {
+            raw.append(0) // scanline filter: none
+            for _ in 0..<64 { raw.append(contentsOf: [200, 30, 30]) }
+        }
+        // zlib stream: 0x78 0x01 header + one stored block + adler32.
+        var z = Data([0x78, 0x01])
+        z.append(0x01) // final stored block
+        z.append(contentsOf: UInt16(raw.count).littleEndianBytes)
+        z.append(contentsOf: (~UInt16(raw.count)).littleEndianBytes)
+        z.append(raw)
+        var a: UInt32 = 1, b: UInt32 = 0
+        for byte in raw { a = (a + UInt32(byte)) % 65521; b = (b + a) % 65521 }
+        z.append(contentsOf: (b << 16 | a).bigEndianBytes)
+
+        var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        var ihdr = Data()
+        ihdr.append(contentsOf: UInt32(64).bigEndianBytes)
+        ihdr.append(contentsOf: UInt32(48).bigEndianBytes)
+        ihdr.append(contentsOf: [8, 2, 0, 0, 0])
+        png.append(chunk("IHDR", ihdr))
+        png.append(chunk("IDAT", z))
+        png.append(chunk("IEND", Data()))
+        return png
+    }
+}
+
+private extension FixedWidthInteger {
+    var bigEndianBytes: [UInt8] {
+        withUnsafeBytes(of: bigEndian) { Array($0) }
+    }
+    var littleEndianBytes: [UInt8] {
+        withUnsafeBytes(of: littleEndian) { Array($0) }
+    }
 }

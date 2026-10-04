@@ -275,3 +275,40 @@ tests skip unless `OAP_LIVE_MLX=1` and were exercised manually). Known
 boundaries unchanged: no streaming/SSE, no tool dispatch to executors,
 no cloud fallback, and the Operator remains unimplemented pending its
 own scoped request.
+
+## Multimodal + OpenAI-compat tightening increment (2026-10-04)
+
+ARTEMIS contract audit (see `artemis-qualification.md`) showed the core
+transport already matched but three consumer-real gaps existed: image
+parts, honored sampling fields, and a structured-output surface.
+
+- `ChatMessage` carries `images: [ChatImage]` (decoded bytes + media type)
+  on user turns only; `ChatRequest` carries optional `temperature`,
+  `topP`, `seed`, `presencePenalty`, `frequencyPenalty`, and a
+  `ResponseFormat` hint (`jsonObject` / `jsonSchema`). Sampling hints are
+  honored: MLX maps them onto `GenerateParameters`, Apple onto
+  `GenerationOptions.temperature` (the only knob it exposes).
+- `OpenAIAdapter` accepts `image_url` parts **only** as bounded
+  `data:image/{jpeg,png,webp};base64` URIs (4 images / 16 MB decoded per
+  request) - remote URLs are refused, the platform never fetches caller
+  URLs. `response_format` is accepted as documented best-effort guidance
+  (no grammar-constrained decoding exists in mlx-swift-lm). Generative
+  fields no provider can honor - `stop`, `logit_bias`, `logprobs`,
+  `reasoning_effort` - moved from silently-ignored to explicit 400, per
+  the adapter's own contract.
+- Admission gates images on a declared `vision` capability: an image
+  request to a text-only alias is a 400, not a provider failure.
+- `MLXProvider` attaches images to the carrying turn (history and final
+  prompt), imports `MLXVLM` so `VLMModelFactory` registers in the
+  `ModelFactoryRegistry` trampoline and VLM configs load through the same
+  `loadModelContainer` seam.
+
+Verified live: `mlx-community/Qwen3-VL-2B-Instruct-4bit` pulled
+(1.8 GB manifest-verified), `qwen-vl` alias qualified, and the gated
+`testLiveVisionCompletion` produced a correct answer ("red") on a
+generated solid-color PNG with real usage counts (~9 s including load).
+Daemon endpoint rejects image-on-text-alias and unhonored fields with
+400. `requestBodyBytes` raised to 24 MB to admit base64 screenshots.
+
+Suite status: 104 tests pass (61 core + 27 serving + 16 MLX; 3 live
+tests gated on `OAP_LIVE_MLX`).

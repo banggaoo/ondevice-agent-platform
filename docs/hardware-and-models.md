@@ -62,9 +62,12 @@ real artifacts pulled through `model pull` on the M4/16 GB host:
 |---|---|---|---|
 | `qwen-small` | `mlx-community/Qwen3-0.6B-4bit` | 351 MB, 11 files | Live completion through admission verified; quality unmeasured |
 | `qwen3-4b` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | 2.28 GB, 13 files | Pulled + qualified route; generation not yet observed on host (thermal gate) |
+| `qwen-vl` | `mlx-community/Qwen3-VL-2B-Instruct-4bit` | 1.8 GB, 16 files | Vision route; live image completion verified (correct answer, real usage) |
 
 Disk size is not peak memory; MLX allocates KV and activation headroom
-beyond the weight bytes. The route qualification answers "can the
+beyond the weight bytes. The VLM artifact additionally carries `capabilities: ["vision"]` in `registry.json`; image input to text-only aliases is refused at admission.
+
+Route qualification answers "can the
 platform serve this" - it is not evidence for or against the user's
 Qwen-vs-Apple purpose hypothesis, which still needs the paired measured
 comparison in the proposal. The 9B distill above was not pulled: at

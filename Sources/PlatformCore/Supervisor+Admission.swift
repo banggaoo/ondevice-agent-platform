@@ -20,6 +20,10 @@ extension PlatformSupervisor {
         guard let profile = modelProfiles[request.model], profile.kind == .llm else {
             throw PlatformError(.notFound)
         }
+        if request.hasImages, !profile.capabilities.contains("vision") {
+            throw PlatformError(.invalidRequest,
+                                detail: "model does not accept image input")
+        }
         guard let provider = llmProviders[profile.providerID] else {
             throw PlatformError(.providerUnavailable)
         }

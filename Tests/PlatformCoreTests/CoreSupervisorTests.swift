@@ -116,6 +116,34 @@ final class CoreSupervisorTests: XCTestCase {
         await second.shutdown()
     }
 
+    func testImageRequestsRequireVisionCapability() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await stack.supervisor.registerModel(Self.llmProfile(),
+                                             provider: FakeLLMProvider(autoFinish: true))
+        var visionProfile = Self.llmProfile("vision-llm")
+        visionProfile = ModelProfile(alias: "vision-llm", providerID: "fake-llm",
+                                     kind: .llm, task: "chat",
+                                     capabilities: ["vision"], maxOutputTokens: 512)
+        await stack.supervisor.registerModel(visionProfile,
+                                             provider: FakeLLMProvider(autoFinish: true))
+        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        let image = ChatImage(data: Data([1, 2, 3]), mediaType: "image/png")
+        let request = ChatRequest(model: "test-llm",
+                                  messages: [ChatMessage(role: .user, parts: ["x"],
+                                                         images: [image])],
+                                  maxOutputTokens: 8)
+        try await expectPlatformError(.invalidRequest) {
+            _ = try await stack.supervisor.submitLLM(principal: modelPrincipal,
+                                                     request: request)
+        }
+        let ok = try await stack.supervisor.submitLLM(
+            principal: modelPrincipal,
+            request: ChatRequest(model: "vision-llm", messages: request.messages,
+                                 maxOutputTokens: 8))
+        XCTAssertEqual(ok.finishReason, .stop)
+    }
+
     // MARK: admission queue
 
     func testActivePlusFourPendingThen429() async throws {

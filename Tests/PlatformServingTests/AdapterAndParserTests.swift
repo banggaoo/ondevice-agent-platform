@@ -121,6 +121,99 @@ final class AdapterAndParserTests: XCTestCase {
         }
     }
 
+    func testImageDataURIAndSamplingFieldsParse() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47]).base64EncodedString()
+        let request = try OpenAIAdapter.parseChatRequest(chatBody {
+            $0["temperature"] = .double(0.3)
+            $0["top_p"] = .double(0.9)
+            $0["seed"] = .int(42)
+            $0["presence_penalty"] = .double(0.5)
+            $0["frequency_penalty"] = .double(-0.5)
+            $0["response_format"] = .object(["type": .string("json_object")])
+            $0["messages"] = .array([
+                .object(["role": .string("user"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("data:image/png;base64,\(png)")])]),
+                    .object(["type": .string("text"), "text": .string("describe")]),
+                ])]),
+            ])
+        })
+        let user = request.messages[0]
+        XCTAssertEqual(user.images.count, 1)
+        XCTAssertEqual(user.images[0].mediaType, "image/png")
+        XCTAssertEqual(user.images[0].data, Data([0x89, 0x50, 0x4E, 0x47]))
+        XCTAssertEqual(user.parts, ["describe"])
+        XCTAssertTrue(request.hasImages)
+        XCTAssertEqual(request.temperature, 0.3)
+        XCTAssertEqual(request.topP, 0.9)
+        XCTAssertEqual(request.seed, 42)
+        XCTAssertEqual(request.responseFormat, .jsonObject)
+    }
+
+    func testImageRejections() {
+        let png = Data([1, 2, 3]).base64EncodedString()
+        let cases: [(String, (inout [String: JSONValue]) -> Void)] = [
+            ("remote url", { $0["messages"] = .array([
+                .object(["role": .string("user"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("https://x.test/i.png")])])])])]) }),
+            ("image on assistant", { $0["messages"] = .array([
+                .object(["role": .string("assistant"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("data:image/png;base64,\(png)")])])])])]) }),
+            ("non-base64 data uri", { $0["messages"] = .array([
+                .object(["role": .string("user"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("data:image/png,abc")])])])])]) }),
+            ("bad media type", { $0["messages"] = .array([
+                .object(["role": .string("user"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("data:image/tiff;base64,\(png)")])])])])]) }),
+            ("image detail field", { $0["messages"] = .array([
+                .object(["role": .string("user"), "content": .array([
+                    .object(["type": .string("image_url"),
+                             "image_url": .object([
+                                "url": .string("data:image/png;base64,\(png)"),
+                                "detail": .string("high")])])])])]) }),
+        ]
+        for (name, mutate) in cases {
+            XCTAssertThrowsError(try OpenAIAdapter.parseChatRequest(chatBody(mutate)),
+                                 "expected rejection: \(name)") { error in
+                XCTAssertEqual((error as? PlatformError)?.code, .invalidRequest, name)
+            }
+        }
+    }
+
+    func testUnhonoredGenerativeFieldsAreRefused() {
+        for field in ["stop", "logit_bias", "logprobs", "reasoning_effort"] {
+            XCTAssertThrowsError(try OpenAIAdapter.parseChatRequest(chatBody {
+                $0[field] = field == "stop" ? .array([.string("x")]) : .int(1)
+            }), "expected refusal: \(field)")
+        }
+    }
+
+    func testResponseFormatJsonSchemaCapturedAsHint() throws {
+        let request = try OpenAIAdapter.parseChatRequest(chatBody {
+            $0["response_format"] = .object([
+                "type": .string("json_schema"),
+                "json_schema": .object([
+                    "name": .string("out"),
+                    "schema": .object(["type": .string("object")]),
+                ]),
+            ])
+        })
+        guard case .jsonSchema(let name, let schema)? = request.responseFormat else {
+            return XCTFail("expected jsonSchema")
+        }
+        XCTAssertEqual(name, "out")
+        XCTAssertEqual(schema.objectValue?["type"], .string("object"))
+    }
+
     /// A prompt containing "refresh" stays an ordinary message; nothing in
     /// validation maps it to administration.
     func testRefreshPromptIsModelRequest() throws {

@@ -140,6 +140,32 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(mapped?.prompt, "what is 2+2?")
     }
 
+    func testProviderMappingAttachesImagesToCarryingTurn() throws {
+        let png = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            + "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")!
+        let image = ChatImage(data: png, mediaType: "image/png")
+        let request = ChatRequest(model: "q", messages: [
+            ChatMessage(role: .user, parts: ["earlier"], images: [image]),
+            ChatMessage(role: .assistant, parts: ["noted"]),
+            ChatMessage(role: .user, parts: ["describe"], images: [image]),
+        ], maxOutputTokens: 8)
+        let mapped = try MLXProvider.map(request)
+        XCTAssertEqual(mapped.promptImages.count, 1)
+        XCTAssertEqual(mapped.history.count, 2)
+        XCTAssertEqual(mapped.prompt, "describe")
+    }
+
+    func testProviderMappingRejectsUndecodableImage() {
+        let bad = ChatImage(data: Data([1, 2, 3]), mediaType: "image/png")
+        let request = ChatRequest(model: "q", messages: [
+            ChatMessage(role: .user, parts: ["x"], images: [bad]),
+        ], maxOutputTokens: 8)
+        XCTAssertThrowsError(try MLXProvider.map(request)) { error in
+            XCTAssertEqual((error as? PlatformError)?.code, .invalidRequest)
+        }
+    }
+
     func testProviderMappingRejectsAssistantFinal() {
         let request = ChatRequest(model: "q", messages: [
             ChatMessage(role: .user, parts: ["hi"]),

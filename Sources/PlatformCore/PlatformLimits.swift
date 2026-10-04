@@ -4,7 +4,7 @@ import Foundation
 public enum PlatformLimits {
     public static let activeInference = 1
     public static let pendingInference = 4
-    public static let requestBodyBytes = 256 * 1024
+    public static let requestBodyBytes = 24 * 1024 * 1024
     public static let requestHeaderBytes = 16 * 1024
     public static let connections = 32
     public static let connectionReadSeconds: TimeInterval = 5
@@ -16,6 +16,9 @@ public enum PlatformLimits {
     public static let outputTokens = 512
     public static let chatMessages = 64
     public static let chatTextBytes = 64 * 1024
+    public static let chatImagesPerRequest = 4
+    /// Decoded image bytes per request (base64 is undone before this counts).
+    public static let chatImageBytes = 16 * 1024 * 1024
     public static let agentPromptBytes = 16 * 1024
     public static let agentDeadlineSeconds: TimeInterval = 120
     public static let agentGeneratedTokenReservations = 2_048

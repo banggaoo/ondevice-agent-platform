@@ -116,7 +116,8 @@ public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
                 segments: [.text(.init(content: instructions.joined(separator: "\n")))],
                 toolDefinitions: [])), at: 0)
         }
-        let options = GenerationOptions(maximumResponseTokens: request.maxOutputTokens)
+        let options = GenerationOptions(temperature: request.temperature,
+                                        maximumResponseTokens: request.maxOutputTokens)
         return (Transcript(entries: entries), Prompt(promptText), options)
     }
     #endif
