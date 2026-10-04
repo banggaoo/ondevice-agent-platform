@@ -97,6 +97,10 @@ This is one data point, not a benchmark; spread and repeats are pending.
 | code (isPalindrome) | 2.0s, correct, idiomatic | 3.6s, correct, idiomatic | 6.1s, truncated in `<think>` |
 | instruction (3 colors) | 0.67s, exact format | 0.53s, correct | 3.3s, thinking chatter |
 
+A second run the same session reproduced the shape (apple-fm 3.7/2.7/0.9s,
+qwen3-4b 15.2/3.1/0.6s, qwen-small capped on both structured prompts),
+so the ordering is stable across repeats on this host.
+
 Observations consistent with (not proof of) the user's purpose hypothesis:
 the Apple route is materially faster and reliably format-exact on short
 system-style tasks; qwen3-4b matches quality on reasoning/code at higher
