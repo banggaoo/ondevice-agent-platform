@@ -60,7 +60,7 @@ real artifacts pulled through `model pull` on the M4/16 GB host:
 
 | Alias | Repository | Verified size | Notes |
 |---|---|---|---|
-| `qwen-small` | `mlx-community/Qwen3-0.6B-4bit` | 351 MB, 11 files | Live completion through admission verified; quality unmeasured |
+| ~~`qwen-small`~~ | `mlx-community/Qwen3-0.6B-4bit` | removed 2026-10-05 | User-directed removal; remains the gated pull-test artifact only |
 | ~~`qwen3-4b`~~ | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | removed 2026-10-05 | User-directed removal; superseded by `qwen3.8-9b` (D51) |
 | `qwen-vl` | `mlx-community/Qwen3-VL-2B-Instruct-4bit` | 1.8 GB, 16 files | Vision route; live image completion verified (correct answer, real usage) |
 | `qwen3.8-9b` | `nvythong/Qwen3.8-9B-Distill-mlx-4Bit` @ `e827c31f` | ~5.04 GB weights, 8 files | Operator binding (D51); mlx-lm affine 4-bit conversion of `empero-ai/Qwen3.8-9B-Distill`, `qwen3_5` arch, text-only, Apache-2.0; pulled + manifest-verified; generation evidence recorded in development.md |

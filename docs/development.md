@@ -757,9 +757,12 @@ Following the correction the user directed removal of the interim
 artifact: "remove mlx-community--Qwen3-4B-Instruct-2507-4bit__main. make
 sure provide qwen 9b and qwen vl for artemis and opencode". The artifact
 was deleted via governed `model remove --alias qwen3-4b` and the registry
-entry dropped; `/v1/models` now serves `qwen3.8-9b`, `qwen-vl`,
-`qwen-small`, and `apple-foundation-model` - the two routes ARTEMIS and
-OpenCode require (text reasoning + vision). The local OpenCode client
+entry dropped; `/v1/models` serves `qwen3.8-9b`, `qwen-vl`, and
+`apple-foundation-model` - the two routes ARTEMIS and OpenCode require
+(text reasoning + vision), after the user's follow-up removal of
+`qwen-small` (`model remove --alias qwen-small`, registry entry dropped,
+OpenCode client entry removed; it remains only the gated pull-test
+artifact, which pulls to a temp store). The local OpenCode client
 configuration was updated to the `qwen3.8-9b` serving alias. A live
 completion on the restarted daemon was refused with `resource_denied`
 under a real OS `warning` memory-pressure event (`dispatch_event`) on the

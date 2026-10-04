@@ -209,8 +209,6 @@ final class MLXLiveTests: XCTestCase {
         let store = ModelStore(modelsDir: URL(fileURLWithPath: dir))
         let provider = MLXProvider(store: store)
         let routes: [(alias: String, source: ModelSource)] = [
-            ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit",
-                                 revision: "main")),
             ("qwen3.8-9b", .init(repo: "nvythong/Qwen3.8-9B-Distill-mlx-4Bit",
                                  revision: "e827c31fbd588828f43180a87ab34415a6d8a4bf")),
         ]
@@ -253,7 +251,6 @@ final class MLXLiveTests: XCTestCase {
         let mlx = MLXProvider(store: store)
 
         let routes: [(alias: String, source: ModelSource)] = [
-            ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit", revision: "main")),
             ("qwen3.8-9b", .init(repo: "nvythong/Qwen3.8-9B-Distill-mlx-4Bit",
                                  revision: "e827c31fbd588828f43180a87ab34415a6d8a4bf")),
         ]
