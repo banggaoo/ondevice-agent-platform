@@ -19,7 +19,7 @@ enum ModelCommand {
             print("model remove --alias ALIAS [--data-root PATH]")
             return
         }
-        let root = RuntimeRoot(url: CredentialCommand.rootURL(args: args))
+        let root = RuntimeRoot(url: RuntimeArguments.rootURL(args: args))
         try root.prepare()
         let store = ModelStore(root: root)
 

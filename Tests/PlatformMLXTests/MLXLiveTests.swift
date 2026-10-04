@@ -193,6 +193,52 @@ final class MLXLiveTests: XCTestCase {
         return png
     }
 
+    /// Cached-artifact functional check for the model-verification
+    /// request: frozen alias/source pairs, deterministic injected
+    /// resources, shared supervisor admission, real provider. Requires
+    /// OAP_LIVE_MLX=1 and OAP_LIVE_MLX_STORE pointing at an already-pulled
+    /// models dir; it never downloads and skips truthfully on a missing
+    /// artifact. Asserts real generation and usage accounting only - a
+    /// capped thinking response is valid output, not a quality pass.
+    /// Sequential requests respect the single inference slot.
+    func testLiveCachedTextCompletions() async throws {
+        try XCTSkipUnless(live(), "set OAP_LIVE_MLX=1 to run the live model test")
+        guard let dir = ProcessInfo.processInfo.environment["OAP_LIVE_MLX_STORE"] else {
+            throw XCTSkip("set OAP_LIVE_MLX_STORE to a pulled models dir")
+        }
+        let store = ModelStore(modelsDir: URL(fileURLWithPath: dir))
+        let provider = MLXProvider(store: store)
+        let routes: [(alias: String, source: ModelSource)] = [
+            ("qwen-small", .init(repo: "mlx-community/Qwen3-0.6B-4bit",
+                                 revision: "main")),
+            ("qwen3-4b", .init(repo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+                               revision: "main")),
+        ]
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await registerStandardPrincipals(stack.supervisor)
+        for (alias, source) in routes {
+            guard store.isReady(source: source) else {
+                throw XCTSkip("artifact not pulled: \(source.repo)@\(source.revision)")
+            }
+            let profile = ModelProfile(alias: alias, providerID: MLXProviderContract.id,
+                                       kind: .llm, task: "chat", source: source)
+            await stack.supervisor.registerModel(profile, provider: provider)
+            let result = try await stack.supervisor.submitLLM(
+                principal: modelPrincipal,
+                request: ChatRequest(
+                    model: alias,
+                    messages: [ChatMessage(role: .user,
+                                           parts: ["Say hello in a short sentence."])],
+                    maxOutputTokens: 64, temperature: 0))
+            XCTAssertEqual(result.modelIdentity, MLXProviderContract.id)
+            XCTAssertFalse(result.content.trimmingCharacters(in: .whitespaces).isEmpty)
+            XCTAssertNotNil(result.usage)
+            XCTAssertGreaterThan(result.usage?.promptTokens ?? 0, 0)
+            XCTAssertGreaterThan(result.usage?.completionTokens ?? 0, 0)
+        }
+    }
+
     /// D41 first paired measurement: identical fixed prompts across the
     /// Apple provider and pulled MLX routes, direct provider calls (no
     /// admission - measures the model, not the gate). Prints one JSON line

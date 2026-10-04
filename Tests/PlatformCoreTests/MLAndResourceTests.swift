@@ -21,7 +21,7 @@ final class MLAndResourceTests: XCTestCase {
     private func stackWithML(predictor: FakeMLPredictor? = FakeMLPredictor()) async throws -> TestStack {
         let stack = try await makeStack()
         await stack.supervisor.registerModel(mlProfile(), predictor: predictor)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
         return stack
     }
 
@@ -84,7 +84,7 @@ final class MLAndResourceTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let bad = FakeMLPredictor(outputs: ["wrong": .int(1)])
         await stack.supervisor.registerModel(mlProfile(), predictor: bad)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
         let t = Task<Result<PredictionResult, Error>, Never> {
             do {
                 return .success(try await stack.supervisor.submitML(
@@ -165,6 +165,87 @@ final class MLAndResourceTests: XCTestCase {
             snap(lowPower: true), at: now), .deferLoad)
     }
 
+    /// A defer verdict leaves work queued, not failed: the job dispatches
+    /// when a healthy snapshot arrives. Denial still fails immediately.
+    func testDeferralKeepsJobPendingUntilAdmitted() async throws {
+        let clock = ManualClock()
+        let resources = FakeResourceSource(
+            ResourceSnapshot(thermal: .fair, memoryPressure: .normal,
+                             lowPowerMode: false, capturedAt: clock.now))
+        let root = try preparedRoot(tempRootURL())
+        defer { root.releaseLock() }
+        let supervisor = PlatformSupervisor(
+            root: root,
+            resourceSource: resources, clock: clock.clock)
+        try await supervisor.start()
+        let provider = FakeLLMProvider(autoFinish: true)
+        await supervisor.registerModel(
+            ModelProfile(alias: "m", providerID: "fake-llm", kind: .llm, task: "chat"),
+            provider: provider)
+        await supervisor.registerPrincipal(modelPrincipal)
+
+        let task = Task {
+            try await supervisor.submitLLM(
+                principal: modelPrincipal,
+                request: ChatRequest(model: "m",
+                                     messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                     maxOutputTokens: 4))
+        }
+        // Deferred: queued, never dispatched to the provider, never failed.
+        try await expectTrue(await pollUntil {
+            await supervisor.admissionSnapshot().pending == 1
+        }, "job should queue under deferLoad")
+        XCTAssertEqual(provider.invocations.count, 0)
+
+        // A healthy snapshot retries dispatch and the job completes.
+        resources.push(ResourceSnapshot(thermal: .nominal, memoryPressure: .normal,
+                                        lowPowerMode: false, capturedAt: clock.now))
+        let result = try await task.value
+        XCTAssertEqual(result.content, "ok")
+        XCTAssertEqual(provider.invocations.count, 1)
+    }
+
+    /// A job queued under deferral expires at its queue deadline instead of
+    /// waiting forever: sweepExpired is the bounded-wait guarantee.
+    func testDeferralStillExpiresAtQueueDeadline() async throws {
+        let clock = ManualClock()
+        let resources = FakeResourceSource(
+            ResourceSnapshot(thermal: .fair, memoryPressure: .normal,
+                             lowPowerMode: false, capturedAt: clock.now))
+        let root = try preparedRoot(tempRootURL())
+        defer { root.releaseLock() }
+        let supervisor = PlatformSupervisor(
+            root: root,
+            resourceSource: resources, clock: clock.clock)
+        try await supervisor.start()
+        await supervisor.registerModel(
+            ModelProfile(alias: "m", providerID: "fake-llm", kind: .llm, task: "chat"),
+            provider: FakeLLMProvider(autoFinish: true))
+        await supervisor.registerPrincipal(modelPrincipal)
+
+        let task = Task<Result<ChatResult, Error>, Never> {
+            do {
+                return .success(try await supervisor.submitLLM(
+                    principal: modelPrincipal,
+                    request: ChatRequest(model: "m",
+                                         messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                         maxOutputTokens: 4)))
+            } catch { return .failure(error) }
+        }
+        try await expectTrue(await pollUntil {
+            await supervisor.admissionSnapshot().pending == 1
+        }, "job should queue under deferLoad")
+        clock.advance(by: PlatformLimits.queueDeadlineSeconds + 1)
+        // Force a re-dispatch so the sweep observes the expiry.
+        resources.push(ResourceSnapshot(thermal: .fair, memoryPressure: .normal,
+                                        lowPowerMode: false, capturedAt: clock.now))
+        if case .failure(let error) = await task.value {
+            XCTAssertEqual((error as? PlatformError)?.code, .deadlineExceeded)
+        } else {
+            XCTFail("expected deadlineExceeded")
+        }
+    }
+
     func testUnhealthySnapshotDeniesNewInference() async throws {
         let clock = ManualClock()
         let resources = FakeResourceSource(
@@ -173,14 +254,14 @@ final class MLAndResourceTests: XCTestCase {
         let root = try preparedRoot(tempRootURL())
         defer { root.releaseLock() }
         let supervisor = PlatformSupervisor(
-            root: root, credentials: MemoryCredentialStore(),
+            root: root,
             resourceSource: resources, clock: clock.clock)
         try await supervisor.start()
         let provider = FakeLLMProvider(autoFinish: true)
         await supervisor.registerModel(
             ModelProfile(alias: "m", providerID: "fake-llm", kind: .llm, task: "chat"),
             provider: provider)
-        await supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await supervisor.registerPrincipal(modelPrincipal)
         do {
             _ = try await supervisor.submitLLM(
                 principal: modelPrincipal,

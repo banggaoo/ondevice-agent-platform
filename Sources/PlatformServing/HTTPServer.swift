@@ -14,6 +14,9 @@ public final class HTTPServer: @unchecked Sendable {
     private var connections: Set<ObjectIdentifier> = []
     private var connectionMap: [ObjectIdentifier: NWConnection] = [:]
     private var peerCloseCallbacks: [ObjectIdentifier: @Sendable () -> Void] = [:]
+    /// Request-scoped cancellation tokens: stored when a request is handed
+    /// to the router and cancelled when its connection drops.
+    private var requestTokens: [ObjectIdentifier: CancellationToken] = [:]
     /// Read-idle deadline state: `readGeneration` bumps on every receive so a
     /// stale timer can't kill a connection that just got bytes; `responding`
     /// marks connections handed to the router so the timer never murders an
@@ -56,9 +59,12 @@ public final class HTTPServer: @unchecked Sendable {
     public func stop() {
         lock.lock()
         let conns = connectionMap.values
+        let tokens = requestTokens.values
         connectionMap.removeAll()
         connections.removeAll()
+        requestTokens.removeAll()
         lock.unlock()
+        for token in tokens { token.cancel() }
         for c in conns { c.cancel() }
         listener?.cancel()
         listener = nil
@@ -118,9 +124,11 @@ public final class HTTPServer: @unchecked Sendable {
         connections.remove(id)
         let conn = connectionMap.removeValue(forKey: id)
         let onClose = peerCloseCallbacks.removeValue(forKey: id)
+        let token = requestTokens.removeValue(forKey: id)
         readGeneration.removeValue(forKey: id)
         responding.remove(id)
         lock.unlock()
+        token?.cancel()
         onClose?()
         (match ?? conn)?.cancel()
     }
@@ -145,7 +153,16 @@ public final class HTTPServer: @unchecked Sendable {
                 if let (request, _) = try HTTPParser.parse(buffer) {
                     lock.lock()
                     self.responding.insert(id)
+                    self.requestTokens[id] = request.cancellation
                     lock.unlock()
+                    // Watch the peer while the handler runs: one request
+                    // per connection, so a received byte is a pipelining
+                    // violation and EOF or error means the client is gone.
+                    // Either way the request's cancellation token fires.
+                    connection.receive(minimumIncompleteLength: 1,
+                                       maximumLength: 1) { [weak self] _, _, _, _ in
+                        self?.drop(id, matching: connection)
+                    }
                     self.handler(request) { [weak self] response in
                         guard let self else { return }
                         self.queue.async { [self] in

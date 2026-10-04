@@ -1,4 +1,5 @@
 import XCTest
+import MLXLMCommon
 import PlatformTestSupport
 @testable import PlatformMLX
 @testable import PlatformCore
@@ -136,8 +137,55 @@ final class ModelStoreTests: XCTestCase {
         ], maxOutputTokens: 8)
         let mapped = try? MLXProvider.map(request)
         XCTAssertEqual(mapped?.instructions, "be terse")
-        XCTAssertEqual(mapped?.history.count, 2)
-        XCTAssertEqual(mapped?.prompt, "what is 2+2?")
+        XCTAssertEqual(mapped?.messages.count, 3)
+        XCTAssertEqual(mapped?.messages.last?.role, .user)
+        XCTAssertEqual(mapped?.messages.last?.content, "what is 2+2?")
+    }
+
+    /// Assistant tool calls and the tool results answering them map into
+    /// structured MLX messages with the correlation id preserved.
+    func testProviderMappingToolTurns() throws {
+        let request = ChatRequest(model: "q", messages: [
+            ChatMessage(role: .user, parts: ["list files"]),
+            ChatMessage(role: .assistant, parts: [], toolCalls: [
+                ChatToolCall(id: "call_0", name: "bash",
+                             arguments: .object(["command": .string("ls")])),
+            ]),
+            ChatMessage(role: .tool, parts: ["file.txt"], toolCallID: "call_0"),
+        ], maxOutputTokens: 8)
+        let mapped = try MLXProvider.map(request)
+        XCTAssertEqual(mapped.messages.count, 3)
+        XCTAssertEqual(mapped.messages[1].role, .assistant)
+        XCTAssertEqual(mapped.messages[2].role, .tool)
+        XCTAssertEqual(mapped.messages[2].content, "file.txt")
+        // The tool result answers the call - the id is what correlates.
+        // MessageGenerator exposes the wire dict the template will see.
+        let raw = DefaultMessageGenerator().generate(messages: mapped.messages)
+        XCTAssertEqual(raw[2]["tool_call_id"] as? String, "call_0")
+        let calls = raw[1]["tool_calls"] as? [[String: any Sendable]]
+        XCTAssertEqual(calls?.first?["id"] as? String, "call_0")
+        XCTAssertEqual((calls?.first?["function"] as? [String: any Sendable])?["name"]
+                        as? String, "bash")
+    }
+
+    /// Declared tools become template `ToolSpec` dicts; "none" withholds.
+    func testToolSpecRendering() {
+        let spec = ChatToolSpec(name: "bash", description: "run",
+                                parameters: .object(["type": .string("object")]))
+        var request = ChatRequest(model: "q", messages: [], maxOutputTokens: 8,
+                                  tools: [spec])
+        var specs = MLXProvider.toolSpecs(for: request)
+        XCTAssertEqual(specs.count, 1)
+        XCTAssertEqual(specs[0]["type"] as? String, "function")
+        let fn = specs[0]["function"] as? [String: any Sendable]
+        XCTAssertEqual(fn?["name"] as? String, "bash")
+        XCTAssertEqual(fn?["description"] as? String, "run")
+        XCTAssertNotNil(fn?["parameters"])
+
+        request = ChatRequest(model: "q", messages: [], maxOutputTokens: 8,
+                              tools: [spec], toolChoice: .none)
+        specs = MLXProvider.toolSpecs(for: request)
+        XCTAssertTrue(specs.isEmpty)
     }
 
     func testProviderMappingAttachesImagesToCarryingTurn() throws {
@@ -151,9 +199,10 @@ final class ModelStoreTests: XCTestCase {
             ChatMessage(role: .user, parts: ["describe"], images: [image]),
         ], maxOutputTokens: 8)
         let mapped = try MLXProvider.map(request)
-        XCTAssertEqual(mapped.promptImages.count, 1)
-        XCTAssertEqual(mapped.history.count, 2)
-        XCTAssertEqual(mapped.prompt, "describe")
+        XCTAssertEqual(mapped.messages.count, 3)
+        XCTAssertEqual(mapped.messages.first?.images.count, 1)
+        XCTAssertEqual(mapped.messages.last?.images.count, 1)
+        XCTAssertEqual(mapped.messages.last?.content, "describe")
     }
 
     func testProviderMappingRejectsUndecodableImage() {

@@ -1,6 +1,8 @@
 # Proposed resource and scheduling policy
 
-**Status:** unimplemented, uncalibrated design. Preserve interactive responsiveness and bound contention; do not claim hardware-damage prevention or a hard unified-memory reservation.
+**Status:** partially implemented, uncalibrated design. Preserve interactive responsiveness and bound contention; do not claim hardware-damage prevention or a hard unified-memory reservation.
+
+The current development governor shares one inference slot across LLM and ML work, bounds the pending queue, and enforces finite queue, inference, and cancellation deadlines. Fresh nominal thermal, normal memory pressure, and known non-low-power state admit work; fair thermal or low power defers it until the queue deadline. Unknown or stale observations, serious/critical thermal, and warning/critical pressure deny new work and request cancellation. Startup pressure may use a separately labeled kernel percent-gauge estimate until an OS pressure event arrives; that estimate is not calibrated model headroom. The tables below remain proposed escalation/recovery designs: idle model eviction, pressure-driven unloading, isolated-worker termination, and measured device tiers are not implemented by this increment.
 
 ## Signals and authority
 

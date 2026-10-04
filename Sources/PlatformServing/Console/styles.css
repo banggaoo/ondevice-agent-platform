@@ -38,6 +38,7 @@ body {
   font-size: 2rem;
   letter-spacing: 0.02em;
   margin: 0 0 0.25rem;
+  overflow-wrap: anywhere;
 }
 
 .tagline {
@@ -82,33 +83,10 @@ body {
   color: var(--teal);
 }
 
-.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 
 .plain { list-style: none; margin: 0.25rem 0; padding: 0; }
 .plain li { padding: 0.15rem 0; }
-
-form label {
-  display: block;
-  font-size: 0.85rem;
-  color: var(--ink-soft);
-  margin-bottom: 0.35rem;
-}
-
-input[type="password"] {
-  width: 100%;
-  padding: 0.55rem 0.6rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--paper);
-  color: var(--ink);
-  font-size: 1rem;
-  margin-bottom: 0.75rem;
-}
-
-input[type="password"]:focus {
-  outline: 2px solid var(--teal);
-  outline-offset: 1px;
-}
 
 button {
   background: var(--teal);
@@ -124,6 +102,84 @@ button {
 button:hover { background: var(--teal-deep); }
 button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 
+.viewnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.navbtn {
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  text-decoration: none;
+  color: var(--teal-deep);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  background: var(--paper-deep);
+}
+
+.navbtn[aria-current="page"] {
+  background: var(--teal);
+  color: var(--paper);
+  border-color: var(--teal-deep);
+}
+
+.navbtn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+.tablewrap { overflow-x: auto; }
+.tablewrap table { min-width: 620px; }
+.tablewrap th, .tablewrap td { white-space: nowrap; }
+
+.chatlog {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+  min-height: 3rem;
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+.chatmsg { margin-bottom: 0.6rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chatmsg.chat-question { color: var(--teal-deep); font-weight: 500; }
+.chatmsg.chat-answer { color: var(--ink); }
+.chatmsg.chat-note { color: var(--amber); font-size: 0.85rem; }
+
+#chat-input {
+  width: 100%;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  margin-top: 0.25rem;
+  resize: vertical;
+}
+
+#chat-input:disabled { opacity: 0.6; }
+
+.chat-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+button:disabled { opacity: 0.55; cursor: default; }
+button:disabled:hover { background: var(--teal); }
+
+#chat-stop {
+  background: var(--paper-deep);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+#chat-stop:hover { background: var(--line); }
+
 .hint { color: var(--ink-soft); font-size: 0.9rem; }
 .error { color: var(--amber); font-size: 0.9rem; }
 
@@ -137,7 +193,10 @@ code {
   background: rgba(32, 36, 43, 0.06);
   padding: 0.1rem 0.3rem;
   border-radius: 4px;
+  overflow-wrap: anywhere;
 }
+
+.plain li, .chatlog { overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: no-preference) {
   .card { animation: reveal 200ms ease-out; }
@@ -147,4 +206,6 @@ code {
 @media (max-width: 640px) {
   .row { grid-template-columns: repeat(2, 1fr); }
   .panel { padding: 1rem 0.75rem 3rem; }
+  .viewnav { gap: 0.35rem; }
+  .navbtn { padding: 0.35rem 0.65rem; }
 }

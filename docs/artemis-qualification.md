@@ -30,7 +30,7 @@ Audited `artemis/artemis/llm/router.py` and the agent/tool call sites:
 
 | ARTEMIS need | Platform state |
 |---|---|
-| OpenAI-compatible POST chat/completions, Bearer auth | Implemented (M1) |
+| OpenAI-compatible POST chat/completions; optional `Authorization` header ignored | Implemented (M1) - no platform key is required; a client SDK that demands a key can carry any non-secret placeholder |
 | `temperature`, `max_tokens` | Honored end-to-end (MLX + Apple) |
 | `top_p`, `seed`, `presence_penalty`, `frequency_penalty` | Honored by MLX provider; accepted fields |
 | `image_url` data URIs (`data:image/{jpeg,png,webp};base64`) | Parsed, bounded (4 images / 16 MB decoded), gated on a profile's `vision` capability, mapped to VLM input |

@@ -1,26 +1,6 @@
 import Foundation
 import PlatformCore
 
-/// In-memory credential store for tests; never touches Keychain.
-public final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
-    private let lock = NSLock()
-    private var secrets: [String: Data] = [:]
-
-    public init() {}
-
-    public func secret(forKey key: String) throws -> Data? {
-        lock.lock()
-        defer { lock.unlock() }
-        return secrets[key]
-    }
-
-    public func setSecret(_ secret: Data, forKey key: String) throws {
-        lock.lock()
-        secrets[key] = secret
-        lock.unlock()
-    }
-}
-
 /// Deterministic clock: `advance` fires registered sleepers in wake order;
 /// cancellation resumes a sleeper immediately so task-group timers exit.
 public final class ManualClock: @unchecked Sendable {
@@ -177,7 +157,7 @@ public struct TestStack: Sendable {
     public let supervisor: PlatformSupervisor
 }
 
-/// A running supervisor with in-memory credentials and a manual clock.
+/// A running supervisor with a manual clock and injected resources.
 /// Healthy observation is pushed at the manual clock's current time.
 public func makeStack(enableReferenceAgent: Bool = false,
                       healthy: Bool = true) async throws -> TestStack {
@@ -186,8 +166,7 @@ public func makeStack(enableReferenceAgent: Bool = false,
         healthy ? healthySnapshot(at: clock.now) : .unknown)
     let root = try preparedRoot(tempRootURL())
     let supervisor = PlatformSupervisor(
-        root: root, credentials: MemoryCredentialStore(),
-        resourceSource: resources, clock: clock.clock,
+        root: root, resourceSource: resources, clock: clock.clock,
         options: .init(enableReferenceAgent: enableReferenceAgent))
     try await supervisor.start()
     return TestStack(root: root, clock: clock, resources: resources,
@@ -277,6 +256,8 @@ public func expectPlatformError(_ code: PlatformCore.ErrorCode,
     throw ExpectationFailed("\(code), no error thrown", file: file, line: line)
 }
 
+/// Fixed strings usable only to prove an Authorization header is ignored;
+/// nothing authenticates against them anymore.
 public let modelToken = "test-model-token"
 public let consoleToken = "test-console-token"
 public let agentToken = "test-agent-token"
@@ -285,7 +266,7 @@ public let consolePrincipal = Principal(id: "console", scope: .console)
 public let agentPrincipal = Principal(id: "agent-1", scope: .agent)
 
 public func registerStandardPrincipals(_ supervisor: PlatformSupervisor) async {
-    await supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
-    await supervisor.registerPrincipal(token: consoleToken, principal: consolePrincipal)
-    await supervisor.registerPrincipal(token: agentToken, principal: agentPrincipal)
+    await supervisor.registerPrincipal(modelPrincipal)
+    await supervisor.registerPrincipal(consolePrincipal)
+    await supervisor.registerPrincipal(agentPrincipal)
 }

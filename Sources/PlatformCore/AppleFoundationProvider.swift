@@ -14,6 +14,12 @@ import FoundationModels
 /// become `.prompt`/`.response` entries in order; the final message must be a
 /// user turn and becomes the `respond(to:)` argument (the session appends it
 /// itself, so it must not also sit in the transcript).
+///
+/// Tool surface: the Foundation Models transcript types cannot express a
+/// caller-managed tool loop - declared tools, prior assistant tool calls,
+/// and tool-result messages are all refused at validation rather than
+/// dropped or faked. `tool_choice: "none"` is honored by withholding the
+/// schemas, matching the MLX route.
 public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
     public static let id = "apple-foundation-models"
     public let providerID = "apple-foundation-models"
@@ -45,10 +51,42 @@ public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
         return inFlight
     }
 
+    /// FoundationModels honors only temperature and the token cap; the
+    /// remaining sampling fields are refused explicitly rather than
+    /// silently ignored. Tool surface refusal also lives here so a doomed
+    /// request fails before it occupies a queue slot.
+    public func validate(_ request: ChatRequest, profile: ModelProfile) throws {
+        if request.topP != nil || request.seed != nil
+            || request.presencePenalty != nil || request.frequencyPenalty != nil {
+            throw PlatformError(.invalidRequest,
+                                detail: "apple route honors only temperature")
+        }
+        // "none" withholds schemas (matching MLX); any other tool surface
+        // has no truthful transcript representation on this route.
+        if request.toolChoice != .none, !request.tools.isEmpty {
+            throw PlatformError(.invalidRequest,
+                                detail: "apple provider does not accept tools")
+        }
+        if request.messages.contains(where: {
+            $0.role == .tool || !$0.toolCalls.isEmpty
+        }) {
+            throw PlatformError(.invalidRequest,
+                                detail: "tool messages and calls are not expressible")
+        }
+    }
+
     public func complete(_ request: ChatRequest, profile: ModelProfile) async throws -> ChatResult {
         #if canImport(FoundationModels)
+        try Task.checkCancellation()
         guard AppleModelAvailability.status() == .available else {
             throw PlatformError(.providerUnavailable, detail: "apple foundation model unavailable")
+        }
+        // Tool declarations the caller asked to use have no truthful
+        // transcript representation here; refuse rather than silently
+        // generate tool-agnostic text. "none" is honored by withholding.
+        if request.toolChoice != .none, !request.tools.isEmpty {
+            throw PlatformError(.invalidRequest,
+                                detail: "apple provider does not accept tools")
         }
         let mapped = try Self.map(request)
         let task = Task<ChatResult, Error> {
@@ -64,7 +102,11 @@ public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
         }
         track(task)
         defer { untrack(task) }
-        return try await task.value
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
         #else
         throw PlatformError(.providerUnavailable, detail: "FoundationModels framework absent")
         #endif
@@ -102,9 +144,22 @@ public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
                     throw PlatformError(.invalidRequest,
                                         detail: "final message must be a user turn")
                 }
+                guard message.toolCalls.isEmpty else {
+                    throw PlatformError(.invalidRequest,
+                                        detail: "assistant tool calls are not expressible")
+                }
                 entries.append(.response(Transcript.Response(
                     assetIDs: [], segments: [.text(.init(content: text))])))
+            case .tool:
+                throw PlatformError(.invalidRequest,
+                                    detail: "tool messages are not expressible")
             }
+        }
+        // Response-format guidance is appended to the instruction text so
+        // the shared prompt is honored; it is a best-effort hint, never a
+        // schema guarantee.
+        if let format = request.responseFormat {
+            instructions.append(try format.guidance())
         }
         guard let promptText,
               !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

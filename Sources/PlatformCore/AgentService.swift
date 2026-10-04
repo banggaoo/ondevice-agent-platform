@@ -89,15 +89,57 @@ public actor AgentService {
         )
     }
 
+    /// Optional read-only runtime Operator, bound to one qualified model
+    /// alias. The supervisor verifies the alias's kind/provider before this
+    /// is called; registration stays compiled-in code resolved by reference.
+    public func registerRuntimeOperator(modelAlias: String) {
+        register(
+            profile: AgentProfile(
+                id: "operator", version: 1,
+                harnessID: RuntimeOperatorHarness.id,
+                harnessVersion: RuntimeOperatorHarness.version,
+                stateSchemaVersion: 1,
+                toolScope: [], modelProfileAlias: modelAlias,
+                implementationRef: "builtin:operator.runtime"
+            ),
+            harness: HarnessEntry(
+                make: { RuntimeOperatorHarness(modelAlias: modelAlias) },
+                harnessID: RuntimeOperatorHarness.id,
+                harnessVersion: RuntimeOperatorHarness.version
+            )
+        )
+    }
+
     public func profileIDs() -> [String] { profiles.keys.sorted() }
+
+    public func profileSummaries() -> [JSONValue] {
+        profiles.values.sorted { $0.id < $1.id }.map { profile in
+            .object([
+                "id": .string(profile.id),
+                "version": .int(Int64(profile.version)),
+                "harnessId": .string(profile.harnessID),
+                "harnessVersion": .int(Int64(profile.harnessVersion)),
+                "stateSchemaVersion": .int(Int64(profile.stateSchemaVersion)),
+                "toolScope": .array(profile.toolScope.map { .string($0) }),
+                "model": profile.modelProfileAlias.map { .string($0) } ?? .null,
+            ])
+        }
+    }
 
     public func profile(id: String) -> AgentProfile? { profiles[id] }
 
     /// Bind a new session to one connection/consumer and the newest profile.
+    /// Live sessions per connection are bounded.
     public func newSession(agentID: String, consumerID: String,
                            connectionID: String) throws -> AgentSession {
         guard let profile = profiles[agentID], harnesses[profile.implementationRef] != nil else {
             throw PlatformError(.notFound, detail: "agent not registered")
+        }
+        let owned = sessions.values.reduce(0) {
+            $0 + ($1.connectionID == connectionID ? 1 : 0)
+        }
+        guard owned < PlatformLimits.sessionsPerConnection else {
+            throw PlatformError(.capacityLimited, detail: "session limit reached")
         }
         sequence += 1
         let session = AgentSession(
@@ -116,6 +158,25 @@ public actor AgentService {
               s.consumerID == consumerID,
               s.connectionID == connectionID else { return nil }
         return s
+    }
+
+    /// Atomically claim the session's single prompt slot: the binding is
+    /// verified, a concurrent turn is a conflict, and the session is marked
+    /// active before returning so no second turn can interleave. Released
+    /// only by `setPromptActive(false)` from the run's own teardown.
+    public func beginPrompt(sessionID: String, consumerID: String,
+                            connectionID: String) throws -> AgentSession {
+        guard let session = sessions[sessionID],
+              session.consumerID == consumerID,
+              session.connectionID == connectionID else {
+            throw PlatformError(.sessionClosed)
+        }
+        guard !session.promptActive else {
+            throw PlatformError(.conflict,
+                                detail: "session already has an active turn")
+        }
+        sessions[sessionID]?.promptActive = true
+        return sessions[sessionID] ?? session
     }
 
     public func harness(for session: AgentSession) throws -> any AgentHarness {

@@ -137,6 +137,63 @@ final class AgentServiceTests: XCTestCase {
         XCTAssertEqual(withLink, .endTurn)
     }
 
+    /// Live sessions per connection are bounded; other connections are
+    /// unaffected.
+    func testSessionCountBoundPerConnection() async throws {
+        let service = AgentService(clock: Clock())
+        await service.register(profile: profile(id: "test.agent", version: 1,
+                                                harnessVersion: 1),
+                               harness: entry(version: 1))
+        for _ in 0..<PlatformLimits.sessionsPerConnection {
+            _ = try await service.newSession(agentID: "test.agent",
+                                             consumerID: "c", connectionID: "conn-1")
+        }
+        do {
+            _ = try await service.newSession(agentID: "test.agent",
+                                             consumerID: "c", connectionID: "conn-1")
+            XCTFail("expected capacityLimited")
+        } catch let e as PlatformError { XCTAssertEqual(e.code, .capacityLimited) }
+        // A different connection still opens sessions.
+        _ = try await service.newSession(agentID: "test.agent",
+                                         consumerID: "c", connectionID: "conn-2")
+    }
+
+    /// beginPrompt claims the single turn atomically: a second turn on the
+    /// same session is a conflict until the first turn's teardown releases.
+    func testBeginPromptAtomicClaimAndRelease() async throws {
+        let service = AgentService(clock: Clock())
+        await service.register(profile: profile(id: "test.agent", version: 1,
+                                                harnessVersion: 1),
+                               harness: entry(version: 1))
+        let s = try await service.newSession(agentID: "test.agent",
+                                             consumerID: "c", connectionID: "conn-1")
+        // Wrong binding is refused before the claim is even considered.
+        do {
+            _ = try await service.beginPrompt(sessionID: s.id, consumerID: "c",
+                                              connectionID: "conn-2")
+            XCTFail("expected sessionClosed")
+        } catch let e as PlatformError { XCTAssertEqual(e.code, .sessionClosed) }
+        do {
+            _ = try await service.beginPrompt(sessionID: s.id, consumerID: "c2",
+                                              connectionID: "conn-1")
+            XCTFail("expected sessionClosed")
+        } catch let e as PlatformError { XCTAssertEqual(e.code, .sessionClosed) }
+
+        let claimed = try await service.beginPrompt(
+            sessionID: s.id, consumerID: "c", connectionID: "conn-1")
+        XCTAssertTrue(claimed.promptActive)
+        // A racing turn conflicts while the first is claimed.
+        do {
+            _ = try await service.beginPrompt(sessionID: s.id, consumerID: "c",
+                                              connectionID: "conn-1")
+            XCTFail("expected conflict")
+        } catch let e as PlatformError { XCTAssertEqual(e.code, .conflict) }
+        // The first turn's teardown releases the slot.
+        await service.setPromptActive(s.id, false)
+        _ = try await service.beginPrompt(sessionID: s.id, consumerID: "c",
+                                          connectionID: "conn-1")
+    }
+
     /// Reference agent only exists when explicitly enabled.
     func testReferenceAgentGatedOnOption() async throws {
         let off = try await makeStack(enableReferenceAgent: false)

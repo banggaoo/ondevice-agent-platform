@@ -16,7 +16,7 @@ Model interpretation or confidence never grants a capability. Calling a model to
 
 ## Request flow
 
-1. Authenticate the consumer and validate the typed request, scope, and size.
+1. Bind the request to its fixed consumer scope and validate the typed request, scope, and size.
 2. Check the requested effect against deterministic capabilities; unknown or ambiguous requests cannot select a privileged handler.
 3. Run a permitted native handler when it fully satisfies the request; status and stop do not wait for an inference slot.
 4. For a declared model task, validate capability, disclosure policy, resource budget, and deadline, then route to the selected provider.

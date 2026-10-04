@@ -27,12 +27,18 @@ public actor ACPService {
     /// sessionID -> active runID for cancellation routing.
     private var activeRuns: [String: String] = [:]
     private var runFlags: [String: CancelFlag] = [:]
-    /// A cancel can interleave while `session/prompt` is still in setup
-    /// (before the run is registered); it is held here and consumed at
-    /// registration so it can never be dropped. A cancel that arrives with no
-    /// active or starting turn stays a no-op per the notification contract.
-    private var startingSessions: Set<String> = []
+    private var runTokens: [String: CancellationToken] = [:]
+    private var runBudgets: [String: AgentRunBudget] = [:]
+    /// sessionID -> the setup owner currently between claim and run
+    /// registration. A cancel interleaving inside that window is held in
+    /// `pendingCancels` and consumed at registration, never dropped; a
+    /// conflicting second prompt only removes the marker it owns.
+    private var startingClaims: [String: UUID] = [:]
     private var pendingCancels: Set<String> = []
+    /// Live plus quarantined runs, bounded by the connection budget: a
+    /// noncooperative harness that outlives its deadline (or its
+    /// connection) still occupies a slot until it actually returns.
+    private var runSlots = 0
     private let supervisor: PlatformSupervisor
     private let clock: Clock
     private var sequence = 0
@@ -43,26 +49,48 @@ public actor ACPService {
     }
 
     /// Bind a new bridge connection to one agent profile before any session.
-    /// Rebinding a live connection to a different agent is denied.
+    /// Rebinding a live connection to a different agent or principal is
+    /// denied; total live connections are bounded.
     public func bind(connectionID: String, agentID: String,
                      principal: Principal) async throws {
         if let existing = connections[connectionID] {
-            guard existing.agentID == agentID else {
+            guard existing.agentID == agentID,
+                  existing.principal.id == principal.id else {
                 throw PlatformError(.conflict, detail: "connection already bound")
             }
             return
         }
+        guard connections.count < PlatformLimits.agentConnections else {
+            throw PlatformError(.capacityLimited,
+                                detail: "agent connection limit reached")
+        }
         let service = supervisor.agentService
         guard await service.profile(id: agentID) != nil else {
             throw PlatformError(.notFound, detail: "agent not registered")
+        }
+        // The profile lookup suspended: a racing bind may have inserted or
+        // another caller claimed this id. Recheck before inserting.
+        if let existing = connections[connectionID] {
+            guard existing.agentID == agentID,
+                  existing.principal.id == principal.id else {
+                throw PlatformError(.conflict, detail: "connection already bound")
+            }
+            return
+        }
+        guard connections.count < PlatformLimits.agentConnections else {
+            throw PlatformError(.capacityLimited,
+                                detail: "agent connection limit reached")
         }
         connections[connectionID] = Conn(connectionID: connectionID,
                                        agentID: agentID, principal: principal)
     }
 
     /// A decoded JSON-RPC message arrives. `emit` receives response lines and
-    /// streamed session/update notifications in wire order.
+    /// streamed session/update notifications in wire order. `cancellation`,
+    /// when supplied, scopes to the `session/prompt` turn only: it cancels
+    /// that run directly rather than queuing a session-wide callback.
     public func handle(connectionID: String, message: JSONValue,
+                       cancellation: CancellationToken? = nil,
                        emit: @escaping @Sendable (JSONValue) async -> Void) async {
         let parsed: (id: JSONValue?, method: String, params: JSONValue?, isNotification: Bool)
         do { parsed = try JSONRPC.parse(message) }
@@ -86,6 +114,7 @@ public actor ACPService {
         case "session/prompt":
             await respond(conn: conn, id: parsed.id, isNotification: parsed.isNotification,
                           work: { try await self.sessionPrompt(conn: conn, params: parsed.params,
+                                                               cancellation: cancellation,
                                                                emit: emit) },
                           emit: emit)
         case "session/cancel":
@@ -117,7 +146,10 @@ public actor ACPService {
             let value = try await work()
             await emit(JSONRPC.result(id: id, value: value))
         } catch let e as PlatformError {
-            await emit(JSONRPC.error(id: id, code: rpcCode(e.code), message: e.safeMessage))
+            // The platform code rides in error.data so callers can map
+            // truthful statuses; the numeric JSON-RPC code stays coarse.
+            await emit(JSONRPC.error(id: id, code: rpcCode(e.code), message: e.safeMessage,
+                                     data: .object(["platformCode": .string(e.code.rawValue)])))
         } catch {
             await emit(JSONRPC.error(id: id, code: -32603, message: "internal error"))
         }
@@ -183,19 +215,21 @@ public actor ACPService {
     }
 
     private func sessionPrompt(conn: Conn, params: JSONValue?,
+                               cancellation: CancellationToken?,
                                emit: @escaping @Sendable (JSONValue) async -> Void) async throws -> JSONValue {
+        // The turn token is the caller's own cancellation handle when
+        // supplied: request abort reaches this run directly, never through
+        // a deferred session-wide callback that could hit a later turn.
+        let token = cancellation ?? CancellationToken()
+        /// Cancelled before any agent work is still a standard result rail.
+        let cancelledResult: JSONValue = .object([
+            "stopReason": .string(AgentStopReason.cancelled.rawValue)])
         guard let p = params?.objectValue,
               let sessionID = p["sessionId"]?.stringValue else {
             throw PlatformError(.invalidRequest, detail: "sessionId required")
         }
-        // Mark the turn as starting before any suspension point so a racing
-        // session/cancel is recorded instead of dropped.
-        startingSessions.insert(sessionID)
-        defer { startingSessions.remove(sessionID) }
-        guard let session = await supervisor.agentService.session(
-            sessionID, consumerID: conn.principal.id, connectionID: conn.connectionID) else {
-            throw PlatformError(.sessionClosed)
-        }
+        // Every check that can run before the claim does run before it, so
+        // a rejected prompt never touches the session's single-turn slot.
         guard let rawBlocks = p["prompt"]?.arrayValue else {
             throw PlatformError(.invalidRequest, detail: "prompt blocks required")
         }
@@ -224,64 +258,186 @@ public actor ACPService {
         guard totalText <= PlatformLimits.agentPromptBytes else {
             throw PlatformError(.payloadTooLarge)
         }
+        if token.isCancelled { return cancelledResult }
         try await supervisor.require(.agentRun, principal: conn.principal)
+        if token.isCancelled { return cancelledResult }
+        // Live and quarantined harness tasks share the connection budget;
+        // reserve before the claim await and hold until the harness task
+        // really ends.
+        guard runSlots < PlatformLimits.agentConnections else {
+            throw PlatformError(.capacityLimited, detail: "agent run limit reached")
+        }
+        runSlots += 1
+        var slotHeld = true
+        defer { if slotHeld { runSlots -= 1 } }
+        // Mark the turn as starting before the claim await so a racing
+        // session/cancel is recorded instead of dropped. Only this call's
+        // own marker is ever removed.
+        let setupClaim = UUID()
+        if startingClaims[sessionID] == nil { startingClaims[sessionID] = setupClaim }
+        defer {
+            if startingClaims[sessionID] == setupClaim {
+                startingClaims.removeValue(forKey: sessionID)
+            }
+        }
+        // Atomic claim: binding, consumer, and the one-prompt-per-session
+        // rule are checked and the active flag set in a single actor hop,
+        // so a racing prompt can never interleave.
+        let session = try await supervisor.agentService.beginPrompt(
+            sessionID: sessionID, consumerID: conn.principal.id, connectionID: conn.connectionID)
+        // Any failure before the run registers releases the claim here;
+        // once registered, only the run's own teardown clears it.
+        var claimHeld = true
+        defer {
+            if claimHeld {
+                Task { await supervisor.agentService.setPromptActive(sessionID, false) }
+            }
+        }
+        if token.isCancelled { return cancelledResult }
         let harness = try await supervisor.agentService.harness(for: session)
+        if token.isCancelled { return cancelledResult }
         sequence += 1
         let runID = "run-\(sequence)"
         let flag = CancelFlag()
+        let budget = AgentRunBudget()
         runFlags[runID] = flag
+        runTokens[runID] = token
+        runBudgets[runID] = budget
         activeRuns[sessionID] = runID
+        claimHeld = false
         // The setup window ends at registration: later cancels hit the
         // active-runs path and can never poison a future turn.
-        startingSessions.remove(sessionID)
+        if startingClaims[sessionID] == setupClaim {
+            startingClaims.removeValue(forKey: sessionID)
+        }
         // A cancel that raced the setup window applies immediately.
         if pendingCancels.remove(session.id) != nil {
             flag.set()
-        }
-        await supervisor.agentService.setPromptActive(sessionID, true)
-        defer {
-            Task {
-                await self.runEnded(runID: runID, sessionID: sessionID)
-            }
+            token.cancel()
+            await budget.close()
         }
 
         let supervisorRef = supervisor
+        let boundAlias = session.profile.modelProfileAlias
         let context = AgentContext(
             sessionID: sessionID, runID: runID,
             statusSnapshot: { await supervisorRef.statusSnapshot() },
             model: ModelClient { request in
-                try await supervisorRef.submitLLM(principal: conn.principal,
-                                                request: request, parentID: runID)
+                if token.isCancelled { throw PlatformError(.cancelled) }
+                // A bound profile pins the model alias: a harness cannot
+                // reach a different route through its scoped client.
+                if let boundAlias, request.model != boundAlias {
+                    throw PlatformError(.invalidRequest,
+                                        detail: "model not bound to this agent")
+                }
+                // Reserve the effective bound: an omitted limit resolves to
+                // the profile ceiling before the reservation, same rule the
+                // supervisor applies at admission.
+                let profileCap = await supervisorRef.registeredModels(kind: .llm)
+                    .first { $0.alias == request.model }?.maxOutputTokens
+                let bound = request.resolvingDefaultOutputTokens(to: profileCap)
+                    .maxOutputTokens
+                try await budget.reserveModel(bound)
+                if token.isCancelled { throw PlatformError(.cancelled) }
+                return try await supervisorRef.submitLLM(
+                    principal: conn.principal, request: request,
+                    parentID: runID, cancellation: token)
             },
             ml: MLClient { request in
-                try await supervisorRef.submitML(principal: conn.principal,
-                                                 request: request, parentID: runID)
+                if token.isCancelled { throw PlatformError(.cancelled) }
+                return try await supervisorRef.submitML(
+                    principal: conn.principal, request: request,
+                    parentID: runID, cancellation: token)
             },
-            isCancelled: { flag.isSet }
+            isCancelled: { flag.isSet || token.isCancelled }
         )
-        let pending = EmissionTracker()
-        let stop = await runWithDeadline(runID: runID, session: session,
-                                         harness: harness, blocks: blocks,
-                                         context: context, flag: flag, emit: emit,
-                                         pending: pending)
-        // Update notifications are emitted before the prompt result, never
-        // after the response stream closes.
-        await pending.drain()
+        let queue = EmissionQueue()
+        let (stop, orphanedHarness) = await runWithDeadline(
+            runID: runID, session: session, harness: harness, blocks: blocks,
+            context: context, flag: flag, token: token, budget: budget,
+            emit: emit, queue: queue)
+        // No more emissions are accepted; the run is terminal so every
+        // later event and every retained-context call is gated off before
+        // the result goes out. Already-queued chunks still flush.
+        queue.close()
+        flag.set()
+        token.cancel()
+        await budget.close()
+        await supervisor.cancelChildren(parentID: runID)
+        await queue.drain()
+        // Ownership of the slot moves to runEnded from here on: the defer
+        // only covers failures before the run registered.
+        slotHeld = false
+        if let orphanedHarness {
+            // Terminal was reported on timeout while the harness task is
+            // still alive: keep the session claimed, the run's state, and
+            // the slot until real harness completion, then release.
+            Task {
+                _ = await orphanedHarness.value
+                await self.runEnded(runID: runID, sessionID: sessionID)
+            }
+        } else {
+            await runEnded(runID: runID, sessionID: sessionID)
+        }
+        // Turn failures are JSON-RPC errors, never a fabricated stop reason
+        // (`error` is not a valid ACP stopReason): a quarantined deadline is
+        // a deadline error rather than a claimed cancellation, and internal
+        // or overflow outcomes surface as provider failure. Real client
+        // cancellation still answers `cancelled`; end_turn, max_tokens, and
+        // refusal ride the normal result rail.
+        if orphanedHarness != nil {
+            throw PlatformError(.deadlineExceeded, detail: "agent turn deadline")
+        }
+        if queue.overflowed || stop == .error {
+            throw PlatformError(.providerUnavailable, detail: "agent turn failed")
+        }
         return .object(["stopReason": .string(stop.rawValue)])
     }
 
+    /// Run teardown: only the owning run releases the session claim - a
+    /// recycled or quarantined run must never clear another turn, and a
+    /// stale teardown must never free a slot twice. The claim binding and
+    /// the run's own maps are detached and cancelled synchronously before
+    /// any suspension, so no interleaving can make this run clear a newer
+    /// turn or skip the cancellation reap.
     private func runEnded(runID: String, sessionID: String) async {
-        await supervisor.agentService.setPromptActive(sessionID, false)
-        runFlags.removeValue(forKey: runID)
-        activeRuns.removeValue(forKey: sessionID)
+        let flag = runFlags.removeValue(forKey: runID)
+        let token = runTokens.removeValue(forKey: runID)
+        let budget = runBudgets.removeValue(forKey: runID)
+        guard flag != nil || token != nil || budget != nil else {
+            return   // already reaped: no second slot release
+        }
+        let heldClaim = activeRuns[sessionID] == runID
+        if heldClaim { activeRuns.removeValue(forKey: sessionID) }
+        flag?.set()
+        token?.cancel()
+        runSlots -= 1
+        if heldClaim {
+            await supervisor.agentService.setPromptActive(sessionID, false)
+        }
+        await budget?.close()
     }
 
+    /// Live plus quarantined harness runs; test-visible occupancy.
+    public func liveRunCount() -> Int { runSlots }
+
+    /// Race the harness against the run deadline through a one-shot result
+    /// actor. On timeout the caller is answered a deadline error while the
+    /// harness task is cancelled and kept quarantined: the session stays
+    /// busy and no slot is released until the task actually finishes.
+    /// Returns the stop reason plus the live harness task when it outlived
+    /// the response.
     private func runWithDeadline(runID: String, session: AgentSession,
                                  harness: any AgentHarness, blocks: [PromptBlock],
                                  context: AgentContext, flag: CancelFlag,
+                                 token: CancellationToken, budget: AgentRunBudget,
                                  emit: @escaping @Sendable (JSONValue) async -> Void,
-                                 pending: EmissionTracker) async -> AgentStopReason {
-        let emitter: @Sendable (AgentEvent) -> Void = { [pending] event in
+                                 queue: EmissionQueue)
+        async -> (AgentStopReason, Task<AgentStopReason, Never>?) {
+        let emitter: @Sendable (AgentEvent) -> Void = { [queue, flag, token] event in
+            // Terminal intent gates emissions off: a late chunk after cancel
+            // or timeout can never reach the client.
+            guard !flag.isSet, !token.isCancelled else { return }
             switch event {
             case .messageChunk(let text):
                 let note = JSONRPC.notification(
@@ -293,28 +449,37 @@ public actor ACPService {
                             "content": .object(["type": .string("text"), "text": .string(text)]),
                         ]),
                     ]))
-                Task { await pending.begin()
-                    await emit(note)
-                    await pending.end()
-                }
+                queue.enqueue { await emit(note) }
             case .note:
                 break
             }
         }
-        let deadline = PlatformLimits.agentDeadlineSeconds
+        let race = RunRace()
+        let harnessTask = Task {
+            await harness.run(input: blocks, context: context, emit: emitter)
+        }
+        let watcher = Task {
+            let stop = await harnessTask.value
+            await race.fire(.harness(stop))
+        }
         let clockRef = clock
-        return await withTaskGroup(of: AgentStopReason?.self) { group in
-            group.addTask {
-                await harness.run(input: blocks, context: context, emit: emitter)
-            }
-            group.addTask {
-                try? await clockRef.sleep(deadline)
-                if !Task.isCancelled { flag.set() }
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return (first ?? nil) ?? .cancelled
+        let deadlineTask = Task {
+            try? await clockRef.sleep(PlatformLimits.agentDeadlineSeconds)
+            await race.fire(.deadline)
+        }
+        let outcome = await race.wait()
+        deadlineTask.cancel()
+        watcher.cancel()
+        switch outcome {
+        case .harness(let stop):
+            return (stop, nil)
+        case .deadline:
+            flag.set()
+            token.cancel()
+            await budget.close()
+            await supervisor.cancelChildren(parentID: runID)
+            harnessTask.cancel()
+            return (.cancelled, harnessTask)
         }
     }
 
@@ -325,8 +490,10 @@ public actor ACPService {
             sessionID, consumerID: conn.principal.id, connectionID: conn.connectionID) else { return }
         if let runID = activeRuns[session.id] {
             runFlags[runID]?.set()
+            runTokens[runID]?.cancel()
+            await runBudgets[runID]?.close()
             await supervisor.cancelChildren(parentID: runID)
-        } else if startingSessions.contains(session.id) {
+        } else if startingClaims[session.id] != nil {
             pendingCancels.insert(session.id)
         }
     }
@@ -337,8 +504,10 @@ public actor ACPService {
         for s in sessions {
             if let runID = activeRuns[s.id] {
                 runFlags[runID]?.set()
+                runTokens[runID]?.cancel()
+                await runBudgets[runID]?.close()
                 await supervisor.cancelChildren(parentID: runID)
-            } else if startingSessions.contains(s.id) {
+            } else if startingClaims[s.id] != nil {
                 // A prompt still in setup when the connection died must be
                 // cancelled at registration, not orphaned.
                 pendingCancels.insert(s.id)
@@ -351,25 +520,103 @@ public actor ACPService {
     public func connectionCount() -> Int { connections.count }
 }
 
-/// Tracks detached session/update emissions so the prompt result cannot
-/// overtake its own notifications on the wire.
-actor EmissionTracker {
-    private var inFlight = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+/// Deterministic serialized emission queue: a chunk reserves its slot under
+/// the lock before hopping to a task, so wire order is exactly emit order
+/// and the prompt result can never overtake its own notifications. The
+/// bound counts outstanding work - each unit decrements when it finishes -
+/// so a slow sender caps the backlog, while a healthy one drains freely.
+/// A refused enqueue sets `overflowed`: the run must surface that as an
+/// error, never as a silently truncated answer.
+final class EmissionQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tail: Task<Void, Never>?
+    private var closed = false
+    private var outstanding = 0
+    private let bound: Int
+    private var didOverflow = false
 
-    func begin() { inFlight += 1 }
-
-    func end() {
-        inFlight = max(0, inFlight - 1)
-        if inFlight == 0 {
-            let pending = waiters
-            waiters.removeAll()
-            for w in pending { w.resume() }
-        }
+    /// True only when healthy work was refused at the bound; a late enqueue
+    /// after close is a quiet drop, not an overflow.
+    var overflowed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didOverflow
     }
 
+    init(bound: Int = 64) { self.bound = bound }
+
+    /// Reserve a serialized slot and run `work` after everything already
+    /// queued. Returns false when the queue is closed (quietly) or full
+    /// (recorded as overflow).
+    @discardableResult
+    func enqueue(_ work: @escaping @Sendable () async -> Void) -> Bool {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return false
+        }
+        guard outstanding < bound else {
+            didOverflow = true
+            lock.unlock()
+            return false
+        }
+        outstanding += 1
+        let prev = tail
+        let next = Task { [weak self] in
+            await prev?.value
+            await work()
+            self?.finished()
+        }
+        tail = next
+        lock.unlock()
+        return true
+    }
+
+    private func finished() {
+        lock.lock()
+        outstanding -= 1
+        lock.unlock()
+    }
+
+    func close() {
+        lock.lock()
+        closed = true
+        lock.unlock()
+    }
+
+    /// Await every emission already enqueued; nothing enqueues after close.
     func drain() async {
-        if inFlight == 0 { return }
-        await withCheckedContinuation { waiters.append($0) }
+        let last: Task<Void, Never>? = {
+            lock.lock()
+            defer { lock.unlock() }
+            return tail
+        }()
+        await last?.value
+    }
+}
+
+/// One-shot race between the harness task and the run deadline: the first
+/// outcome wins, later results are dropped, and the waiter never blocks on
+/// the loser.
+private actor RunRace {
+    enum Outcome {
+        case harness(AgentStopReason)
+        case deadline
+    }
+
+    private var outcome: Outcome?
+    private var waiters: [CheckedContinuation<Outcome, Never>] = []
+
+    func fire(_ outcome: Outcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        let pending = waiters
+        waiters.removeAll()
+        for w in pending { w.resume(returning: outcome) }
+    }
+
+    func wait() async -> Outcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { waiters.append($0) }
     }
 }

@@ -1,6 +1,6 @@
 # Docs-first roadmap
 
-**Current phase: bounded M1 implementation**, approved by the user on 2026-10-04 ("approve proposal, proceed development"). The approved increment scope is fixed in [development](development.md); later milestones still require their own explicit requests.
+**Current phase: implemented serving foundation plus core/console/consumer hardening.** The bounded M1 serving foundation approved by the user on 2026-10-04 ("approve proposal, proceed development") is implemented, and work now continues on correctness hardening of the core, console, and consumer surfaces. [development](development.md) is the authoritative record of executed status; later milestones and Operator stages still require their own explicit requests.
 
 ## M0 — Agree on strategy
 
@@ -10,7 +10,7 @@ Deliver and revise the platform-first proposal, provider/device matrix, ARTEMIS 
 
 ## M1 - Code-owned serving core
 
-After an explicit implementation request, build the platform lifecycle, authenticated administrative API/console, provider/profile registry, resource observations, bounded scheduler, cancellation, durable core records, and the default OpenAI-compatible and ACP adapters on the accepted macOS 27+ baseline. The adapters are baseline even with an empty agent registry; no Operator or other agent is needed to start, inspect, configure, or stop the platform. Keep runtime data in the chosen dotfolder and session scratch optional. Use controlled adapters/fixtures for fault cases; such fixtures are not advertised as real inference.
+After an explicit implementation request, build the platform lifecycle, capability-scoped local administrative API/console, provider/profile registry, resource observations, bounded scheduler, cancellation, durable core records, and the default OpenAI-compatible and ACP adapters on the accepted macOS 27+ baseline. The adapters are baseline even with an empty agent registry; no Operator or other agent is needed to start, inspect, configure, or stop the platform. Keep runtime data in the chosen dotfolder and session scratch optional. Use controlled adapters/fixtures for fault cases; such fixtures are not advertised as real inference.
 
 **Exit:** the core remains operable with no agents installed and all models unavailable; status, registry, authorized stop, and recovery use no LLM. Unknown/oversized requests, stale pressure, revoked scope, overload, and disconnects produce bounded typed failures. No generated-code execution.
 
@@ -18,13 +18,15 @@ After an explicit implementation request, build the platform lifecycle, authenti
 
 Implement the declared OpenAI-compatible model subset behind shared core admission and provider interfaces. Qualify Apple on-device and one owned open-weight artifact/runtime candidate as complementary LLM routes, and the typed MLService with a qualified runtime and registered input/output schemas as a baseline facility; an Apple trial does not make it the universal default. Select per-purpose model profiles from explicit caller requirements, verified capabilities, and device/resource fit. Verify complete conversations, required tools/schema/images, streaming, deadlines, cancellation, and truthful provider identity. Native tool integration does not grant system privileges.
 
-Partial progress (2026-10-04): the Apple on-device route is implemented behind the explicit `--enable-apple-model` opt-in - `apple-foundation-model` serves only when the device reports availability and returns truthful provider-unavailable otherwise. The owned open-weight route and qualified typed-ML runtime remain open.
+Partial progress (2026-10-05): the opt-in Apple on-device route (`--enable-apple-model`, truthful provider-unavailable when the device reports unavailable), the owned open-weight MLX route with governed pull/manifest artifacts and text plus vision aliases, and the `builtin.linear` typed-ML route are implemented, qualified so far by controlled and software evidence. Native admission behavior, purpose/device/resource calibration, and live client qualification remain open.
 
 **Exit:** declared model-serving routes pass their contract and resource checks without the Operator; purpose claims and unsupported capabilities are explicit. Test with controlled API clients before live consumer work. PCC is a separate conditional provider gate, not a core prerequisite. No requirement to implement every backend at once.
 
 ## M3 - ACP agent serving and versioned harnesses
 
 Implement the baseline [ACP agent-serving module](agent-serving.md) with per-agent profile/harness definitions and explicit run lifecycle. Start with a deterministic reference harness, then bounded model steps using the same OpenAI-compatible interface as external consumers. Validate independent state/tool scopes, version pinning, spec-change compatibility, rollback, child-call budgets, and cancellation. An agent may complete a supported deterministic task with no inference.
+
+Partial progress (2026-10-05): a bounded ACP v1 subset (initialize, session/new, session/prompt, session/update, session/cancel) with the deterministic `reference.status` harness, the bounded model-step `reference.echo`, and the optional read-only runtime Operator are implemented. General agent installation/update/disable lifecycle and full MCP conformance remain open.
 
 **Exit:** installing, updating, or disabling one agent does not replace the core or other harnesses; in-flight runs remain version-pinned subject to current permission revocation. No inference slot is held while a harness waits on tools or review. The Operator is an optional served profile, not a gate for the rest of the platform.
 

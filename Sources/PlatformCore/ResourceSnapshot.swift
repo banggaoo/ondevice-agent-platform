@@ -15,20 +15,29 @@ public enum MemoryPressureLevel: String, Sendable, Codable {
     case critical
 }
 
-/// Point-in-time native observation. Unknown is a real state - never
-/// substituted with an invented "normal" reading.
+public enum MemoryPressureSource: String, Sendable, Codable {
+    case dispatchEvent = "dispatch_event"
+    case availablePercentEstimate = "available_percent_estimate"
+    case unavailable
+    case unspecified
+}
+
+/// Point-in-time resource state with explicit observation provenance.
 public struct ResourceSnapshot: Sendable, Equatable {
     public let thermal: ThermalLevel
     public let memoryPressure: MemoryPressureLevel
     public let lowPowerMode: Bool?
     public let capturedAt: Date
+    public let memoryPressureSource: MemoryPressureSource
 
     public init(thermal: ThermalLevel, memoryPressure: MemoryPressureLevel,
-                lowPowerMode: Bool?, capturedAt: Date) {
+                lowPowerMode: Bool?, capturedAt: Date,
+                memoryPressureSource: MemoryPressureSource = .unspecified) {
         self.thermal = thermal
         self.memoryPressure = memoryPressure
         self.lowPowerMode = lowPowerMode
         self.capturedAt = capturedAt
+        self.memoryPressureSource = memoryPressureSource
     }
 
     public static let unknown = ResourceSnapshot(
@@ -37,10 +46,10 @@ public struct ResourceSnapshot: Sendable, Equatable {
     )
 }
 
-public enum ResourceVerdict: Sendable, Equatable {
-    case admit
-    case deferLoad          // truthful deferral: reduced profile unqualified
-    case denyAndCancel      // block new inference and cancel children
+public enum ResourceVerdict: String, Sendable {
+    case admit = "admit"
+    case deferLoad = "defer_load"        // truthful deferral: reduced profile unqualified
+    case denyAndCancel = "deny_and_cancel"  // block new inference and cancel children
 }
 
 public enum ResourcePolicy {
@@ -49,18 +58,17 @@ public enum ResourcePolicy {
     public static func evaluate(_ snapshot: ResourceSnapshot, at now: Date) -> ResourceVerdict {
         let age = now.timeIntervalSince(snapshot.capturedAt)
         if snapshot.thermal == .unknown || snapshot.memoryPressure == .unknown { return .denyAndCancel }
-        if age > PlatformLimits.resourceMaxAgeSeconds { return .denyAndCancel }
-        switch snapshot.thermal {
-        case .serious, .critical: return .denyAndCancel
-        case .fair:
-            if snapshot.lowPowerMode == true { return .deferLoad }
-            return .deferLoad
-        case .nominal, .unknown: break
+        guard age.isFinite, age >= 0, age <= PlatformLimits.resourceMaxAgeSeconds,
+              let lowPowerMode = snapshot.lowPowerMode else {
+            return .denyAndCancel
         }
-        if snapshot.lowPowerMode == true { return .deferLoad }
-        switch snapshot.memoryPressure {
-        case .warning, .critical: return .denyAndCancel
-        case .normal, .unknown: break
+        // Pressure escalation must win over a reduced-power deferral.
+        if snapshot.thermal == .serious || snapshot.thermal == .critical
+            || snapshot.memoryPressure == .warning || snapshot.memoryPressure == .critical {
+            return .denyAndCancel
+        }
+        if snapshot.thermal == .fair || lowPowerMode {
+            return .deferLoad
         }
         return .admit
     }

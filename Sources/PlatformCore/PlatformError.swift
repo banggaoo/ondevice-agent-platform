@@ -1,7 +1,7 @@
 import Foundation
 
 /// Stable error codes surfaced at every boundary. `safeMessage` is generic on
-/// purpose: never echo user content, paths, SQL text, Keychain items, tokens,
+/// purpose: never echo user content, paths, SQL text, secrets, tokens,
 /// or raw provider errors to callers.
 public enum ErrorCode: String, Sendable, Codable {
     case invalidRequest = "invalid_request"

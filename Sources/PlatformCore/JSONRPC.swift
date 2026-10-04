@@ -32,14 +32,17 @@ public enum JSONRPC {
         ])
     }
 
-    public static func error(id: JSONValue, code: Int, message: String) -> JSONValue {
-        .object([
+    public static func error(id: JSONValue, code: Int, message: String,
+                             data: JSONValue? = nil) -> JSONValue {
+        var error: [String: JSONValue] = [
+            "code": .int(Int64(code)),
+            "message": .string(message),
+        ]
+        if let data { error["data"] = data }
+        return .object([
             "jsonrpc": .string(version),
             "id": id,
-            "error": .object([
-                "code": .int(Int64(code)),
-                "message": .string(message),
-            ]),
+            "error": .object(error),
         ])
     }
 

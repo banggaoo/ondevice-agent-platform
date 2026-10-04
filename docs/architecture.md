@@ -18,7 +18,7 @@ This is not a strict all-down stack: the control plane governs both model and op
 
 ```mermaid
 flowchart TD
-    Console[Local web console] --> Admin[Authenticated admin API]
+    Console[Local web console] --> Admin[Scoped local admin API]
     Admin --> Supervisor[PlatformSupervisor deterministic core]
     AgentClient[Console or other ACP client] --> ACPAdapter[Default ACP adapter]
     ACPAdapter --> AgentRT[AgentService and AgentRuntime]
@@ -88,4 +88,4 @@ The governor uses thermal state, memory pressure, measured headroom, and power c
 
 Embedded SQLite is the selected engine for durable core jobs, registry/config metadata, decisions, and optional agent checkpoints/proposals; schema and record protocol remain proposed. The user has selected `~/.ondevice-agent-platform/` as the runtime-data root, with per-session directories only when needed; see [runtime layout](runtime-layout.md). Raw diagnostics and screenshots are not logged by default.
 
-The console is a code-powered status, registry, job, and control UI over authenticated same-origin loopback HTTP and SSE; it works with no agent installed. An optional chat/Operator feature may be off; chat text is never authorization. The delivery direction remains a GitHub-downloadable per-user executable running this local server and console; see [distribution and responsible use](distribution-and-responsible-use.md). Source-verified ARTEMIS configuration and offline limits are in [ARTEMIS integration](artemis-integration.md).
+The console is a code-powered status, registry, job, and control UI over trusted-local, same-origin guarded loopback HTTP and SSE; it works with no agent installed and issues no app-level credentials. An optional chat/Operator feature may be off; chat text is never authorization. The delivery direction remains a GitHub-downloadable per-user executable running this local server and console; see [distribution and responsible use](distribution-and-responsible-use.md). Source-verified ARTEMIS configuration and offline limits are in [ARTEMIS integration](artemis-integration.md).

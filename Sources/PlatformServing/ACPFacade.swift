@@ -6,15 +6,14 @@ import PlatformCore
 /// bridge POST wraps each message as `{connectionId, agentId?, message}` and
 /// streams that message's NDJSON updates and result back, which are written
 /// to stdout unchanged. Diagnostics go to stderr only; stdout carries only
-/// protocol lines. Used by the production `acp` command (Keychain token) and
-/// by the test fixture (injected token).
+/// protocol lines. The local-trust bridge takes no credential; used by the
+/// production `acp` command and by the test fixture.
 public struct ACPStdioFacade: Sendable {
     public init() {}
 
     /// Runs the facade until stdin reaches EOF, then closes owned sessions on
-    /// the bridge and returns. `token` is an already-resolved credential —
-    /// callers decide how secrets are obtained; this type never stores them.
-    public func run(agentID: String, bridgeURL: URL, token: String) async -> Never {
+    /// the bridge and returns.
+    public func run(agentID: String, bridgeURL: URL) async -> Never {
         let connectionID = "facade-\(UUID().uuidString)"
         let stdout = Stdout()
         let session = URLSession(configuration: .ephemeral)
@@ -28,7 +27,7 @@ public struct ACPStdioFacade: Sendable {
             if chunk.isEmpty {
                 stdin.readabilityHandler = nil
                 Task {
-                    try? await Self.postClose(url: bridgeURL, token: token,
+                    try? await Self.postClose(url: bridgeURL,
                                               connectionID: connectionID, session: session)
                     try? await Task.sleep(for: .milliseconds(100))
                     finished.resume()
@@ -48,7 +47,7 @@ public struct ACPStdioFacade: Sendable {
                         }
                         try await Self.forward(message: message, agentID: agentID,
                                                connectionID: connectionID, url: bridgeURL,
-                                               token: token, session: session, stdout: stdout)
+                                               session: session, stdout: stdout)
                     } catch {
                         let err = JSONRPC.error(id: .null, code: -32603,
                                                 message: "bridge unreachable")
@@ -63,7 +62,7 @@ public struct ACPStdioFacade: Sendable {
     }
 
     static func forward(message: JSONValue, agentID: String,
-                        connectionID: String, url: URL, token: String,
+                        connectionID: String, url: URL,
                         session: URLSession, stdout: Stdout) async throws {
         let wrapper = JSONValue.object([
             "connectionId": .string(connectionID),
@@ -72,7 +71,6 @@ public struct ACPStdioFacade: Sendable {
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try wrapper.encoded()
         request.timeoutInterval = PlatformLimits.agentDeadlineSeconds + 30
@@ -89,7 +87,7 @@ public struct ACPStdioFacade: Sendable {
         }
     }
 
-    static func postClose(url: URL, token: String,
+    static func postClose(url: URL,
                           connectionID: String, session: URLSession) async throws {
         let wrapper = JSONValue.object([
             "connectionId": .string(connectionID),
@@ -97,7 +95,6 @@ public struct ACPStdioFacade: Sendable {
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = try wrapper.encoded()
         let (_, response) = try await session.data(for: request)
         _ = response
@@ -113,18 +110,33 @@ public struct ACPStdioFacade: Sendable {
 }
 
 /// Lock-confined buffer for stdin line assembly on the readability queue.
+/// `scanned` is the first byte not yet checked for a newline, so repeated
+/// appends never rescan earlier data. A partial line already over
+/// `requestBodyBytes` can never satisfy the per-line guard, so the pending
+/// bytes are dropped instead of growing without bound.
 final class PendingLines: @unchecked Sendable {
     private var buffer = Data()
+    private var scanned: Data.Index
     private let lock = NSLock()
+
+    init() {
+        scanned = buffer.startIndex
+    }
 
     func append(_ chunk: Data) -> [Data] {
         lock.lock()
         defer { lock.unlock() }
         buffer.append(chunk)
         var lines: [Data] = []
-        while let index = buffer.firstIndex(of: 0x0A) {
+        while let index = buffer[scanned...].firstIndex(of: 0x0A) {
             lines.append(Data(buffer[..<index]))
-            buffer = buffer[buffer.index(after: index)...]
+            buffer = Data(buffer[buffer.index(after: index)...])
+            scanned = buffer.startIndex
+        }
+        scanned = buffer.endIndex
+        if buffer.count > PlatformLimits.requestBodyBytes {
+            buffer.removeAll(keepingCapacity: false)
+            scanned = buffer.startIndex
         }
         return lines
     }

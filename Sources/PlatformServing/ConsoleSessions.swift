@@ -36,8 +36,8 @@ public actor ConsoleSessions {
         }
         sequence += 1
         let session = Session(
-            id: "csess-\(sequence)-\(try SecretGenerator.token().prefix(16))",
-            csrf: try SecretGenerator.token(),
+            id: "csess-\(sequence)-\(SessionNonce.generate().prefix(16))",
+            csrf: SessionNonce.generate(),
             expiresAt: clock.now.addingTimeInterval(PlatformLimits.consoleSessionSeconds)
         )
         sessions[session.id] = session

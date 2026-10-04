@@ -4,6 +4,11 @@ import Foundation
 /// in test support, never as default serving aliases.
 public protocol LLMProvider: Sendable {
     var providerID: String { get }
+    /// Provider-specific option check, called by the core after shared
+    /// RequestValidation and before admission. A provider that does not
+    /// honor a sampling field must reject it here rather than silently
+    /// ignore it.
+    func validate(_ request: ChatRequest, profile: ModelProfile) throws
     func complete(_ request: ChatRequest, profile: ModelProfile) async throws -> ChatResult
     /// Cooperative cancellation hint; providers that cannot cancel simply
     /// finish and the scheduler keeps the slot until real completion.
@@ -17,6 +22,8 @@ public protocol MLPredictor: Sendable {
 }
 
 public extension LLMProvider {
+    /// Default: the provider accepts every shared-validated request.
+    func validate(_ request: ChatRequest, profile: ModelProfile) throws {}
     func cancel(jobID: String) async {}
 }
 
@@ -39,6 +46,13 @@ public protocol ProviderReadiness: Sendable {
     /// True when at least one declared model artifact is present and valid
     /// under the managed store. Must be cheap (filesystem stat only).
     var hasReadyArtifact: Bool { get }
+    /// Per-profile artifact readiness, independent of category readiness.
+    /// Nil means this provider cannot verify the profile's artifact.
+    func artifactReady(for profile: ModelProfile) -> Bool?
+}
+
+public extension ProviderReadiness {
+    func artifactReady(for profile: ModelProfile) -> Bool? { nil }
 }
 
 /// Injectable clock for deterministic tests. `sleep` is the only timing

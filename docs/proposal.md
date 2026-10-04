@@ -1,5 +1,7 @@
 # Revised project proposal
 
+**Current authority note (2026-10-05):** local authority is decided by D50 - trusted single-user loopback operation with no app-level access tokens, no Keychain or credential storage, and no sign-in prerequisite. Any credential, token, or sign-in language in this proposal is historical proposal text, not current behavior.
+
 **Version:** 0.9, 2026-10-04. **Status:** strategy for discussion; the user approved the bounded M1 implementation increment ("approve proposal, proceed development") - see [development](development.md) for executed status. The user's latest direction makes the deterministic serving core the center of the platform, with ACP agent serving and the OpenAI-compatible LLM interface as baseline facilities; remaining technical designs are proposed. This revision carries forward the 2026-10-03 source audit plus scoped v0.7/v0.9 primary-source checks recorded in [source notes](references/sources.md) (see the [revision input notes](references/revision-v0.4-notes.md)) and aligns with the user's recorded answers in [open questions](open-questions.md). No implementation is authorized by this document.
 
 ## Mission and consumers

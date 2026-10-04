@@ -1,6 +1,6 @@
 # Baseline agent serving
 
-**Status:** v0.9 baseline facility, remaining details proposed, 2026-10-04. Agent serving is a default platform capability exposed through Agent Client Protocol (ACP). No endpoint, harness, or agent runtime exists yet, and nothing here grants the platform or any agent permission to automate ARTEMIS or execute arbitrary code.
+**Status:** v0.9 baseline facility, bounded v1 subset implemented, remaining details proposed, 2026-10-05. Agent serving is a default platform capability exposed through Agent Client Protocol (ACP). Implemented today: initialize, session/new, session/prompt, session/update, and session/cancel with no MCP server execution, plus the deterministic `reference.status` and bounded `reference.echo` harnesses and the optional read-only runtime Operator. General agent lifecycle management, record surfaces, and full conformance remain proposed; nothing here grants the platform or any agent permission to automate ARTEMIS or execute arbitrary code.
 
 ## Agent front door
 
@@ -20,7 +20,7 @@ The earlier /api/agent-runs HTTP trio is superseded as the public agent interfac
 
 The standard v1 session/new payload does not select an agent_id. The proposed facade/bridge binds one registered profile before session creation; it does not add an undocumented field to the standard method. A session keeps that profile and harness-version snapshot across turns; a new approved profile version requires a new session unless an explicit compatible migration is authorized. Cancellation ends the active turn and its child work while retaining the session according to the negotiated lifecycle.
 
-A hosted agent's model steps use `POST /v1/chat/completions` through the scoped `ModelClient`. An ordinary model completion is never silently replaced by an agent run. ModelService returns tool-call data and does not execute consumer tool declarations; during an explicitly requested agent run, that agent's harness may ask the broker to execute a registered tool after argument validation and run-scope checks. This grants no additional permission and does not authorize arbitrary generated code.
+A hosted agent's model steps go through the scoped `ModelClient`, which calls `PlatformSupervisor.submitLLM` in-process under the same contract and shared admission the OpenAI adapter uses; there is no direct provider-SDK shortcut and no requirement that harnesses speak HTTP internally. An ordinary model completion is never silently replaced by an agent run. ModelService returns tool-call data and does not execute consumer tool declarations; during an explicitly requested agent run, that agent's harness may ask the broker to execute a registered tool after argument validation and run-scope checks. This grants no additional permission and does not authorize arbitrary generated code.
 
 ## Versioned records
 
@@ -49,4 +49,4 @@ An agent's tool scope is its own declared, approved scope; it does not gain core
 
 ## Acceptance focus
 
-Run lifecycle, version pinning, spec-change compatibility, rollback, isolated per-agent state and tool scopes, child-call budgets, propagated cancellation, and a deterministic task completing with zero inference. The exact acceptance gates are set by [evaluation](evaluation.md); no benchmark or conformance result exists yet.
+Run lifecycle, version pinning, spec-change compatibility, rollback, isolated per-agent state and tool scopes, child-call budgets, propagated cancellation, and a deterministic task completing with zero inference. The exact acceptance gates are set by [evaluation](evaluation.md). The implemented v1 subset above carries software-contract test evidence; general lifecycle/record surfaces and full ACP conformance remain proposed, and no live consumer benchmark or conformance result exists yet.

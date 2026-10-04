@@ -143,7 +143,6 @@ final class ACPIntegrationTests: XCTestCase {
         process.arguments = ["--agent", agent]
         process.environment = [
             "ACP_FIXTURE_PORT": String(daemon.port),
-            "ACP_FIXTURE_TOKEN": agentToken,
             "PATH": "/usr/bin:/bin",
         ]
         let inPipe = Pipe()

@@ -17,14 +17,13 @@ public actor PlatformSupervisor {
 
     let root: RuntimeRoot
     let store: StateStore
-    let credentials: any CredentialStore
     let resourceSource: any ResourceSource
     let clock: Clock
     let options: Options
 
-    // Authentication: expected tokens per scope plus test-injected principals.
-    var scopeTokens: [CredentialScope: String] = [:]
-    var customPrincipals: [String: Principal] = [:]
+    // Internal grant map keyed by code-owned principal id. The local-trust
+    // design issues no tokens: identities are fixed in code, never minted,
+    // stored, or presented by a caller.
     var grants: [String: Set<Grant>] = [:]
 
     // Registries.
@@ -40,6 +39,12 @@ public actor PlatformSupervisor {
     var runningWork: [String: WorkItem] = [:]
     var runningProviders: [String: Task<Void, Never>] = [:]
     var waiters: [String: CheckedContinuation<WorkResult, Error>] = [:]
+    /// Outstanding storage insertions count against admission capacity so a
+    /// submission burst cannot overrun the queue across suspension.
+    var insertionReservations = 0
+    /// Per-job cancellation token + observer while a job is pending or
+    /// active; dispatch checks the token synchronously before launching.
+    var jobCancellations: [String: (token: CancellationToken, observer: UUID)] = [:]
     var jobSequence = 0
     var nextConsumerIndex = 0
     var inferenceBlocked = false
@@ -47,23 +52,27 @@ public actor PlatformSupervisor {
     var latestSnapshot: ResourceSnapshot = .unknown
 
     public init(root: RuntimeRoot,
-                credentials: any CredentialStore,
                 resourceSource: any ResourceSource,
                 clock: Clock = Clock(),
                 options: Options = Options()) {
         self.root = root
         self.store = StateStore(url: root.databaseURL)
-        self.credentials = credentials
         self.resourceSource = resourceSource
         self.clock = clock
         self.options = options
         self.agentService = AgentService(clock: clock)
     }
 
-    /// Boot the core: prepared root, state store, credential presence, monitor.
+    /// Boot the core: prepared root, state store, local consumers, monitor.
     public func start() async throws {
         try await store.open()
         jobSequence = try await store.maxJobSequence()
+        // Fixed local-trust consumers hold their scope's base grants from
+        // the start so grant checks and revocation are deterministic.
+        for consumer in [LocalConsumers.model, LocalConsumers.agent,
+                         LocalConsumers.administration] {
+            grants[consumer.id] = consumer.scope.baseGrants
+        }
         latestSnapshot = resourceSource.currentSnapshot()
         resourceSource.start { [weak self] snapshot in
             Task { await self?.resourceChanged(snapshot) }
@@ -86,38 +95,24 @@ public actor PlatformSupervisor {
         root.releaseLock()
     }
 
-    // MARK: - Authentication and grants
+    // MARK: - Grants
 
-    public func loadCredentials() async throws {
-        for scope in CredentialScope.allCases {
-            let key = CredentialKey.key(root: root.url, scope: scope)
-            if let data = try credentials.secret(forKey: key),
-               let token = String(data: data, encoding: .utf8) {
-                scopeTokens[scope] = token
-            }
-        }
+    /// Register a code-owned consumer under its scope's base grants.
+    public func registerPrincipal(_ principal: Principal) {
+        grants[principal.id] = principal.scope.baseGrants
     }
 
-    /// Test hook: register a principal directly under a token value.
-    public func registerPrincipal(token: String, principal: Principal) {
-        customPrincipals[token] = principal
-        grants[principal.id] = principal.scope.baseGrants
+    /// Console-only in-process consumer of the enabled read-only Operator.
+    /// No credential is issued and no admin or typed-ML grant is added.
+    public func registerConsoleOperatorConsumer() -> Principal {
+        let principal = Principal(id: "console-operator", scope: .agent)
+        grants[principal.id] = [.agentRun, .agentStatusRead, .llmInfer]
+        return principal
     }
 
     /// Test/admin hook: remove a grant, effective at the next check.
     public func revokeGrant(_ grant: Grant, from principalID: String) {
         grants[principalID]?.remove(grant)
-    }
-
-    public func authenticate(token: String?) -> Principal? {
-        guard let token, !token.isEmpty else { return nil }
-        for (scope, expected) in scopeTokens where expected == token {
-            let principal = Principal(id: scope.rawValue, scope: scope)
-            if grants[principal.id] == nil { grants[principal.id] = scope.baseGrants }
-            return principal
-        }
-        if let p = customPrincipals[token] { return p }
-        return nil
     }
 
     public func has(_ grant: Grant, principal: Principal) -> Bool {
@@ -142,6 +137,25 @@ public actor PlatformSupervisor {
         modelProfiles.values.filter { $0.kind == kind }.sorted { $0.alias < $1.alias }
     }
 
+    /// Opt-in runtime Operator: the named alias must be an actual MLX route
+    /// with a live provider - the Operator is MLX-bound, and the CLI's chosen
+    /// default is the Qwen 4B route - verified here before the agent profile
+    /// registers, never assumed or fabricated.
+    public func registerRuntimeOperator(modelAlias: String) async throws {
+        guard !modelAlias.isEmpty else {
+            throw PlatformError(.invalidRequest, detail: "operator model alias required")
+        }
+        guard let profile = modelProfiles[modelAlias], profile.kind == .llm else {
+            throw PlatformError(.notFound, detail: "operator model alias not registered")
+        }
+        guard profile.providerID == MLXProviderContract.id,
+              llmProviders[profile.providerID] != nil else {
+            throw PlatformError(.providerUnavailable,
+                                detail: "operator requires the MLX route")
+        }
+        await agentService.registerRuntimeOperator(modelAlias: modelAlias)
+    }
+
     // MARK: - Status and administration (never inference)
 
     public func statusSnapshot() -> JSONValue {
@@ -150,8 +164,14 @@ public actor PlatformSupervisor {
             "resource": .object([
                 "thermal": .string(latestSnapshot.thermal.rawValue),
                 "memoryPressure": .string(latestSnapshot.memoryPressure.rawValue),
+                "memoryPressureSource": .string(latestSnapshot.memoryPressureSource.rawValue),
                 "lowPowerMode": latestSnapshot.lowPowerMode.map { .bool($0) } ?? .null,
                 "capturedAt": .double(latestSnapshot.capturedAt.timeIntervalSince1970),
+                /// The evaluated admission verdict is the single truthful
+                /// resource signal for consumers; the console must not
+                /// re-derive policy thresholds from raw fields.
+                "admission": .string(ResourcePolicy.evaluate(
+                    latestSnapshot, at: clock.now).rawValue),
             ]),
             "appleAvailability": .string(AppleModelAvailability.status().rawValue),
             "categories": .object([
@@ -166,7 +186,53 @@ public actor PlatformSupervisor {
                 "pendingInference": .int(Int64(pendingJobs.count)),
                 "inferenceBlocked": .bool(inferenceBlocked),
             ]),
+            "models": .array(modelProfileSummaries()),
+            "jobs": .object([
+                "active": .array(activeJobs.values.sorted { $0.id < $1.id }.map(jobSummary)),
+                "pending": .array(pendingJobs.map(jobSummary)),
+            ]),
         ])
+    }
+
+    private func jobSummary(_ job: JobRecord) -> JSONValue {
+        .object([
+            "id": .string(job.id),
+            "kind": .string(job.kind.rawValue),
+            "state": .string(job.state.rawValue),
+            "parentId": job.parentID.map { .string($0) } ?? .null,
+        ])
+    }
+
+    private func modelProfileSummaries() -> [JSONValue] {
+        modelProfiles.values.sorted { $0.alias < $1.alias }.map { profile in
+            let registered: Bool
+            let artifactReady: Bool?
+            if profile.kind == .ml {
+                registered = mlPredictors[profile.providerID] != nil
+                artifactReady = registered
+            } else if let provider = llmProviders[profile.providerID] {
+                registered = true
+                artifactReady = (provider as? ProviderReadiness)?.artifactReady(for: profile)
+            } else {
+                registered = false
+                artifactReady = false
+            }
+            return .object([
+                "alias": .string(profile.alias),
+                "kind": .string(profile.kind.rawValue),
+                "provider": .string(profile.providerID),
+                "task": .string(profile.task),
+                "purposes": .array(profile.purposes.sorted().map { .string($0) }),
+                "capabilities": .array(profile.capabilities.sorted().map { .string($0) }),
+                "providerRegistered": .bool(registered),
+                "artifactReady": artifactReady.map { .bool($0) } ?? .null,
+                "maxOutputTokens": .int(Int64(min(
+                    PlatformLimits.outputTokens, profile.maxOutputTokens ?? PlatformLimits.outputTokens))),
+                "source": profile.source.map {
+                    .object(["repo": .string($0.repo), "revision": .string($0.revision)])
+                } ?? .null,
+            ])
+        }
     }
 
     /// Truthful category status: qualified only when a real provider instance
@@ -191,10 +257,13 @@ public actor PlatformSupervisor {
     }
 
     public func registrySnapshot() async -> JSONValue {
-        .object([
+        let agents = await agentService.profileSummaries()
+        return .object([
             "models": .array(registeredModels(kind: .llm).map { .string($0.alias) }
                 + registeredModels(kind: .ml).map { .string($0.alias) }),
-            "agents": .array(await agentService.profileIDs().map { .string($0) }),
+            "agents": .array(agents.compactMap { $0.objectValue?["id"] }),
+            "modelProfiles": .array(modelProfileSummaries()),
+            "agentProfiles": .array(agents),
         ])
     }
 
@@ -202,7 +271,12 @@ public actor PlatformSupervisor {
         try await store.jobs()
     }
 
-    private func resourceChanged(_ snapshot: ResourceSnapshot) {
+    /// Source callbacks publish off-lock and may arrive out of order, so a
+    /// strictly older sample must never overwrite a newer observation. An
+    /// equal timestamp still applies - it carries new information.
+    /// Internal for @testable regression coverage.
+    func resourceChanged(_ snapshot: ResourceSnapshot) {
+        guard snapshot.capturedAt >= latestSnapshot.capturedAt else { return }
         latestSnapshot = snapshot
         if ResourcePolicy.evaluate(snapshot, at: clock.now) == .denyAndCancel {
             cancelChildrenForResourceDenial()

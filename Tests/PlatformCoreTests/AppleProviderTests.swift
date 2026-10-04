@@ -61,6 +61,114 @@ final class AppleProviderTests: XCTestCase {
         ], maxOutputTokens: 8)
         XCTAssertThrowsError(try AppleFoundationProvider.map(request))
     }
+
+    /// Tool-bearing history has no truthful transcript form on this
+    /// provider: assistant tool calls and tool results are refused at the
+    /// mapping seam, never silently dropped.
+    func testMapRejectsToolTurns() {
+        var request = ChatRequest(model: "apple-foundation-model", messages: [
+            ChatMessage(role: .user, parts: ["hi"]),
+            ChatMessage(role: .assistant, parts: [], toolCalls: [
+                ChatToolCall(id: "c1", name: "bash", arguments: .object([:])),
+            ]),
+            ChatMessage(role: .user, parts: ["then?"]),
+        ], maxOutputTokens: 8)
+        XCTAssertThrowsError(try AppleFoundationProvider.map(request)) { error in
+            XCTAssertEqual((error as? PlatformError)?.code, .invalidRequest)
+        }
+        request = ChatRequest(model: "apple-foundation-model", messages: [
+            ChatMessage(role: .user, parts: ["hi"]),
+            ChatMessage(role: .tool, parts: ["out"], toolCallID: "c1"),
+            ChatMessage(role: .user, parts: ["then?"]),
+        ], maxOutputTokens: 8)
+        XCTAssertThrowsError(try AppleFoundationProvider.map(request)) { error in
+            XCTAssertEqual((error as? PlatformError)?.code, .invalidRequest)
+        }
+    }
+    #endif
+
+    /// A caller declaring tools gets a platform error either way: refused
+    /// as an unsupported surface when the model is available, or the
+    /// existing providerUnavailable when it is not. Never a fake reply.
+    func testDeclaredToolsErrorTruthfully() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await stack.supervisor.registerModel(
+            ModelProfile(alias: "apple-test", providerID: AppleFoundationProvider.id,
+                         kind: .llm, task: "chat"),
+            provider: AppleFoundationProvider())
+        await registerStandardPrincipals(stack.supervisor)
+        do {
+            _ = try await stack.supervisor.submitLLM(
+                principal: modelPrincipal,
+                request: ChatRequest(model: "apple-test",
+                                     messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                     maxOutputTokens: 4,
+                                     tools: [ChatToolSpec(name: "bash")]))
+            XCTFail("expected a platform error")
+        } catch let e as PlatformError {
+            XCTAssertTrue([.invalidRequest, .providerUnavailable].contains(e.code),
+                          "unexpected \(e.code)")
+        }
+        // tool_choice "none" withholds the declarations: plain chat works
+        // (or reports unavailability) exactly as before.
+        do {
+            _ = try await stack.supervisor.submitLLM(
+                principal: modelPrincipal,
+                request: ChatRequest(model: "apple-test",
+                                     messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                     maxOutputTokens: 4,
+                                     tools: [ChatToolSpec(name: "bash")],
+                                     toolChoice: .none))
+        } catch let e as PlatformError {
+            XCTAssertEqual(e.code, .providerUnavailable)
+        }
+    }
+
+    /// The Apple route honors only temperature: other sampling fields are
+    /// explicit rejections, never silently ignored.
+    func testValidateRejectsUnsupportedSamplers() {
+        let provider = AppleFoundationProvider()
+        let profile = ModelProfile(alias: "apple-test",
+                                   providerID: AppleFoundationProvider.id,
+                                   kind: .llm, task: "chat")
+        func request(topP: Double? = nil, seed: UInt64? = nil,
+                     presencePenalty: Double? = nil,
+                     frequencyPenalty: Double? = nil) -> ChatRequest {
+            ChatRequest(model: "apple-test",
+                        messages: [ChatMessage(role: .user, parts: ["hi"])],
+                        maxOutputTokens: 8, temperature: 0.5, topP: topP,
+                        seed: seed, presencePenalty: presencePenalty,
+                        frequencyPenalty: frequencyPenalty)
+        }
+        XCTAssertNoThrow(try provider.validate(request(), profile: profile))
+        for r in [request(topP: 0.9), request(seed: 7),
+                  request(presencePenalty: 0.5), request(frequencyPenalty: -0.5)] {
+            XCTAssertThrowsError(try provider.validate(r, profile: profile)) {
+                XCTAssertEqual(($0 as? PlatformError)?.code, .invalidRequest)
+            }
+        }
+    }
+
+    #if canImport(FoundationModels)
+    /// Response-format guidance is appended to mapped instructions so the
+    /// shared hint text actually reaches the session.
+    func testMapAppendsSharedResponseFormatGuidance() throws {
+        let request = ChatRequest(model: "apple-foundation-model", messages: [
+            ChatMessage(role: .user, parts: ["hi"]),
+        ], maxOutputTokens: 8, responseFormat: .jsonObject)
+        let mapped = try AppleFoundationProvider.map(request)
+        guard let first = mapped.transcript.first,
+              case .instructions(let instructions) = first else {
+            return XCTFail("expected an instructions entry")
+        }
+        let text = instructions.segments.compactMap { segment -> String? in
+            if case .text(let t) = segment { return t.content }
+            return nil
+        }.joined(separator: "\n")
+        XCTAssertTrue(text.contains(
+            "Respond with a single valid JSON object and no other text."))
+    }
     #endif
 
     /// The provider never fabricates a completion: on this host the model is

@@ -7,12 +7,11 @@ let args = Array(CommandLine.arguments.dropFirst())
 
 func printUsage() {
     print("""
-    ondevice-agent-platform - local model and agent serving platform (M1)
+    ondevice-agent-platform - local model and agent serving platform
 
     Usage:
-      ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]
+      ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]
       ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
-      ondevice-agent-platform credential --scope console|model|agent [--data-root PATH]
       ondevice-agent-platform model pull|list|remove [--alias ALIAS | --repo ORG/NAME --revision REV] [--data-root PATH]
       ondevice-agent-platform --help
     """)
@@ -44,10 +43,6 @@ case "acp":
     do { try await ACPCommand.run(args: Array(args.dropFirst())) }
     catch let e as PlatformError { fatalError("acp failed: \(e.safeMessage)") }
     catch { fatalError("acp failed: internal error") }
-case "credential":
-    do { try CredentialCommand.run(args: Array(args.dropFirst())) }
-    catch let e as PlatformError { fatalError("credential failed: \(e.safeMessage)") }
-    catch { fatalError("credential failed: internal error") }
 case "model":
     do { try await ModelCommand.run(args: Array(args.dropFirst())) }
     catch let e as PlatformError { fatalError("model failed: \(e.safeMessage)") }

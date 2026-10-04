@@ -67,7 +67,8 @@ let package = Package(
         ),
         .testTarget(
             name: "PlatformMLXTests",
-            dependencies: ["PlatformCore", "PlatformMLX", "PlatformTestSupport"],
+            dependencies: ["PlatformCore", "PlatformMLX", "PlatformServing",
+                           "PlatformTestSupport"],
             path: "Tests/PlatformMLXTests"
         ),
     ]

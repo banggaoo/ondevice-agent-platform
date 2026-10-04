@@ -15,28 +15,34 @@ extension PlatformSupervisor {
     /// Consumer-fair admission for LLM work. Grant is checked before queueing
     /// and again at dispatch; prompt text can never select administration.
     public func submitLLM(principal: Principal, request: ChatRequest,
-                          parentID: String? = nil) async throws -> ChatResult {
+                          parentID: String? = nil,
+                          cancellation: CancellationToken? = nil) async throws -> ChatResult {
         try require(.llmInfer, principal: principal)
         guard let profile = modelProfiles[request.model], profile.kind == .llm else {
             throw PlatformError(.notFound)
         }
-        if request.hasImages, !profile.capabilities.contains("vision") {
-            throw PlatformError(.invalidRequest,
-                                detail: "model does not accept image input")
-        }
+        let request = request.resolvingDefaultOutputTokens(to: profile.maxOutputTokens)
+        // Shared bounds run before provider work, admission, or storage: no
+        // entry path can bypass them.
+        try RequestValidation.chat(request, profile: profile)
         guard let provider = llmProviders[profile.providerID] else {
             throw PlatformError(.providerUnavailable)
         }
+        try provider.validate(request, profile: profile)
+        // A declared profile cap lowers the client's bound; it never raises.
         let outcome = try await enqueue(
             kind: .llm, consumerID: principal.id, parentID: parentID,
-            work: .chat(request, profile, provider)
+            cancellation: cancellation,
+            work: .chat(request.limitingOutputTokens(to: profile.maxOutputTokens),
+                        profile, provider)
         )
         guard case .chat(let result) = outcome else { throw PlatformError(.internal) }
         return result
     }
 
     public func submitML(principal: Principal, request: PredictionRequest,
-                         parentID: String? = nil) async throws -> PredictionResult {
+                         parentID: String? = nil,
+                         cancellation: CancellationToken? = nil) async throws -> PredictionResult {
         try require(.mlPredict, principal: principal)
         guard let profile = modelProfiles[request.model], profile.kind == .ml else {
             throw PlatformError(.notFound)
@@ -45,11 +51,13 @@ extension PlatformSupervisor {
         if let schema = profile.inputSchema {
             try FeatureValidation.validate(inputs: request.inputs, schema: schema)
         }
+        try RequestValidation.prediction(request, profile: profile)
         guard let predictor = mlPredictors[profile.providerID] else {
             throw PlatformError(.providerUnavailable)
         }
         let outcome = try await enqueue(
             kind: .ml, consumerID: principal.id, parentID: parentID,
+            cancellation: cancellation,
             work: .predict(request, profile, predictor)
         )
         guard case .prediction(let result) = outcome else { throw PlatformError(.internal) }
@@ -60,17 +68,59 @@ extension PlatformSupervisor {
     }
 
     private func enqueue(kind: JobKind, consumerID: String, parentID: String?,
+                         cancellation: CancellationToken?,
                          work: WorkItem) async throws -> WorkResult {
         if shuttingDown { throw PlatformError(.cancelled) }
+        if cancellation?.isCancelled == true { throw PlatformError(.cancelled) }
         if inferenceBlocked { throw PlatformError(.providerUnavailable, detail: "inference blocked") }
-        if pendingJobs.count >= PlatformLimits.pendingInference {
-            throw PlatformError(.capacityLimited, detail: "queue full")
+        // Reserve capacity before the first suspension point: outstanding
+        // inserts count toward the bound so a submission burst cannot
+        // overrun the queue while storage awaits. With no dispatchable
+        // slot (non-admit verdict or the active slot busy), only the
+        // pending bound applies - deferred work cannot fill active+pending.
+        if dispatchableSlot() {
+            guard activeJobs.count + pendingJobs.count + insertionReservations
+                    < PlatformLimits.activeInference + PlatformLimits.pendingInference else {
+                throw PlatformError(.capacityLimited, detail: "queue full")
+            }
+        } else {
+            guard pendingJobs.count + insertionReservations
+                    < PlatformLimits.pendingInference else {
+                throw PlatformError(.capacityLimited, detail: "queue full")
+            }
         }
         let now = clock.now
         let job = JobRecord(id: newJobID(), kind: kind, consumerID: consumerID,
                             parentID: parentID, createdAt: now, updatedAt: now)
+        if let cancellation {
+            let observer = cancellation.observe { [weak self] in
+                let jobID = job.id
+                Task { [weak self] in
+                    try? await self?.cancelJobRecord(jobID, error: PlatformError(.cancelled))
+                }
+            }
+            jobCancellations[job.id] = (cancellation, observer)
+        }
+        insertionReservations += 1
         do { try await store.insertJob(job) } catch {
+            insertionReservations -= 1
+            releaseJobCancellation(job.id)
             throw PlatformError(.storageFailure)
+        }
+        insertionReservations -= 1
+        // Cancellation or shutdown may have landed while storage suspended:
+        // persist a cancelled row and never queue the work.
+        if shuttingDown || cancellation?.isCancelled == true {
+            var cancelled = job
+            finishTerminal(&cancelled, .cancelled)
+            throw PlatformError(.cancelled)
+        }
+        // Storage may have outlived a verdict change: with no dispatchable
+        // slot the pending bound still applies to the inserted row.
+        if !dispatchableSlot(), pendingJobs.count >= PlatformLimits.pendingInference {
+            var failed = job
+            finishTerminal(&failed, .failed)
+            throw PlatformError(.capacityLimited, detail: "queue full")
         }
         pendingJobs.append(job)
         pendingWork[job.id] = work
@@ -89,12 +139,28 @@ extension PlatformSupervisor {
         return "job-\(jobSequence)"
     }
 
+    /// Whether a newly queued job could consume a slot immediately: an
+    /// admit verdict, a free active slot, and no block. When false only
+    /// the pending bound applies - a deferred or busy queue cannot let
+    /// inserts sit over the pending cap.
+    private func dispatchableSlot() -> Bool {
+        guard !shuttingDown, !inferenceBlocked,
+              activeJobs.count < PlatformLimits.activeInference else { return false }
+        return ResourcePolicy.evaluate(latestSnapshot, at: clock.now) == .admit
+    }
+
     /// Round-robin across consumers with pending work, earliest job first.
+    /// A defer verdict is a real deferral: jobs stay queued and dispatch
+    /// retries on every fresh snapshot (sampling runs each second), up to
+    /// the per-job queue deadline. denyAndCancel still fails immediately.
     func dispatch() {
         sweepExpired()
         guard !shuttingDown, !inferenceBlocked,
               activeJobs.count < PlatformLimits.activeInference,
               !pendingJobs.isEmpty else { return }
+        let now = clock.now
+        let verdict = ResourcePolicy.evaluate(latestSnapshot, at: now)
+        guard verdict != .deferLoad else { return }
         let consumers = Array(Set(pendingJobs.map(\.consumerID))).sorted()
         let chosen = consumers[nextConsumerIndex % consumers.count]
         nextConsumerIndex += 1
@@ -102,15 +168,20 @@ extension PlatformSupervisor {
                 ?? pendingJobs.indices.first else { return }
         var job = pendingJobs.remove(at: index)
         guard let work = pendingWork.removeValue(forKey: job.id) else { return }
+        // A request cancelled while queued never reaches the provider, even
+        // if its async observer task has not run yet.
+        if jobCancellations[job.id]?.token.isCancelled == true {
+            finishTerminal(&job, .cancelled)
+            resume(job.id, .failure(PlatformError(.cancelled)))
+            return dispatch()
+        }
 
-        let now = clock.now
         let needed: Grant = job.kind == .llm ? .llmInfer : .mlPredict
         let currentGrants = grants[job.consumerID] ?? []
         guard currentGrants.contains(needed) else {
             finishTerminal(&job, .failed); resume(job.id, .failure(PlatformError(.forbidden)))
             return dispatch()
         }
-        let verdict = ResourcePolicy.evaluate(latestSnapshot, at: now)
         guard verdict == .admit else {
             finishTerminal(&job, .failed); resume(job.id, .failure(PlatformError(.resourceDenied)))
             return dispatch()
@@ -175,6 +246,7 @@ extension PlatformSupervisor {
     func providerFinished(jobID: String, outcome: WorkResult?, error: Error? = nil) {
         runningProviders.removeValue(forKey: jobID)
         runningWork.removeValue(forKey: jobID)
+        releaseJobCancellation(jobID)
         guard var job = activeJobs[jobID] else { return }   // stale/double ignored
         job.providerFinished = true
         job.updatedAt = clock.now
@@ -264,6 +336,10 @@ extension PlatformSupervisor {
     }
 
     private func askProviderCancel(_ jobID: String) {
+        // Cancel the runner task AND signal the provider: the runner can
+        // still be suspended before provider invocation, and a provider
+        // that ignores task cancellation still gets the cooperative hint.
+        runningProviders[jobID]?.cancel()
         if let work = runningWork[jobID] {
             Task {
                 switch work {
@@ -271,8 +347,6 @@ extension PlatformSupervisor {
                 case .predict(_, _, let predictor): await predictor.cancel(jobID: jobID)
                 }
             }
-        } else {
-            runningProviders[jobID]?.cancel()
         }
     }
 
@@ -341,7 +415,22 @@ extension PlatformSupervisor {
         if state == .failed || state == .cancelled || state == .completed {
             job.providerFinished = true
         }
+        releaseJobCancellation(job.id)
         persist(job)
+    }
+
+    /// Drop the token observer once a job leaves pending/active tracking so
+    /// a late cancel cannot touch recycled state.
+    func releaseJobCancellation(_ jobID: String) {
+        if let entry = jobCancellations.removeValue(forKey: jobID) {
+            entry.token.removeObserver(entry.observer)
+        }
+    }
+
+    /// Test seam: install/remove a storage-insertion gate (the StateStore
+    /// beforeInsert hook) so tests can hold insertion while submissions race.
+    func setInsertGate(_ callback: (@Sendable () async throws -> Void)?) async {
+        await store.setBeforeInsertJob(callback)
     }
 
     func persist(_ job: JobRecord) {

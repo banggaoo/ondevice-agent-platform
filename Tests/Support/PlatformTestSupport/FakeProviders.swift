@@ -44,26 +44,19 @@ public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
         return gates.count
     }
 
-    private func record(_ request: ChatRequest) -> ChatResult? {
-        lock.lock()
-        invocationsStore.append(request)
-        let immediate = autoFinish ? result : nil
-        lock.unlock()
-        return immediate
-    }
-
-    private func appendGate(_ request: ChatRequest,
-                            _ cont: CheckedContinuation<ChatResult, Error>) {
-        lock.lock()
-        gates.append((request.model, cont))
-        lock.unlock()
-    }
+    /// Set by a cooperative cancel only when no call was pending to release:
+    /// under the single inference slot that means the cancelled job's own
+    /// provider call may still be in transit, so the next late arrival
+    /// resolves as cancelled instead of hanging in a gate nobody will
+    /// release. A released gate proves the call already arrived, and a
+    /// later job must not inherit the cancel.
+    private var cancelArmed = false
 
     private func cancelState() -> (pending: [(String, CheckedContinuation<ChatResult, Error>)],
                                    release: Bool) {
         lock.lock()
         let pending = gates
-        if cooperative { gates.removeAll() }
+        if cooperative { gates.removeAll(); cancelArmed = pending.isEmpty }
         let release = cooperative
         lock.unlock()
         return (pending, release)
@@ -92,10 +85,35 @@ public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
         return (pending, value)
     }
 
+    private func recordAndReturn(_ request: ChatRequest) -> ChatResult {
+        lock.lock()
+        invocationsStore.append(request)
+        let value = result
+        lock.unlock()
+        return value
+    }
+
     public func complete(_ request: ChatRequest, profile: ModelProfile) async throws -> ChatResult {
-        if let immediate = record(request) { return immediate }
+        // The invocation record and the gate registration move under one
+        // lock: a finishNext/cancel observing the record can never lose its
+        // wake between the two.
+        if autoFinish {
+            return recordAndReturn(request)
+        }
         return try await withCheckedThrowingContinuation { cont in
-            appendGate(request, cont)
+            lock.lock()
+            invocationsStore.append(request)
+            // A cooperative cancel that already fired still reaches a call
+            // that arrives after it. The arm is one-shot: a job gets at
+            // most one provider call, so consuming it cannot poison the
+            // next job's call.
+            let alreadyCancelled = cooperative && cancelArmed
+            if alreadyCancelled { cancelArmed = false }
+            if !alreadyCancelled { gates.append((request.model, cont)) }
+            lock.unlock()
+            if alreadyCancelled {
+                cont.resume(throwing: PlatformError(.cancelled))
+            }
         }
     }
 
@@ -155,22 +173,14 @@ public final class FakeMLPredictor: MLPredictor, @unchecked Sendable {
         return cancelledStore
     }
 
-    private func record(_ request: PredictionRequest) {
-        lock.lock()
-        invocationsStore.append(request)
-        lock.unlock()
-    }
-
-    private func appendGate(_ cont: CheckedContinuation<PredictionResult, Error>) {
-        lock.lock()
-        gates.append(cont)
-        lock.unlock()
-    }
+    /// Same cancellation semantics as the LLM fake: arm only when no call
+    /// was pending to release (the cancelled call may still be in transit).
+    private var cancelArmed = false
 
     private func cancelState() -> ([CheckedContinuation<PredictionResult, Error>], Bool) {
         lock.lock()
         let pending = gates
-        if cooperative { gates.removeAll() }
+        if cooperative { gates.removeAll(); cancelArmed = pending.isEmpty }
         let release = cooperative
         lock.unlock()
         return (pending, release)
@@ -199,9 +209,17 @@ public final class FakeMLPredictor: MLPredictor, @unchecked Sendable {
     }
 
     public func predict(_ request: PredictionRequest, profile: ModelProfile) async throws -> PredictionResult {
-        record(request)
-        return try await withCheckedThrowingContinuation { cont in
-            appendGate(cont)
+        // Same single-lock record+gate discipline as the LLM fake.
+        try await withCheckedThrowingContinuation { cont in
+            lock.lock()
+            invocationsStore.append(request)
+            let alreadyCancelled = cooperative && cancelArmed
+            if alreadyCancelled { cancelArmed = false }
+            if !alreadyCancelled { gates.append(cont) }
+            lock.unlock()
+            if alreadyCancelled {
+                cont.resume(throwing: PlatformError(.cancelled))
+            }
         }
     }
 
@@ -230,10 +248,10 @@ public struct ClosureHarness: AgentHarness {
     public static let version = 1
 
     private let body: @Sendable ([PromptBlock], AgentContext,
-                                 @Sendable (AgentEvent) -> Void) async -> AgentStopReason
+                                 @escaping @Sendable (AgentEvent) -> Void) async -> AgentStopReason
 
     public init(_ body: @escaping @Sendable ([PromptBlock], AgentContext,
-                                             @Sendable (AgentEvent) -> Void) async -> AgentStopReason) {
+                                             @escaping @Sendable (AgentEvent) -> Void) async -> AgentStopReason) {
         self.body = body
     }
 

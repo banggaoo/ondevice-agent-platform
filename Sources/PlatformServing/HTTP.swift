@@ -10,6 +10,21 @@ public struct HTTPRequest: Sendable {
     public let version: String
     public let headers: [(String, String)]
     public let body: Data
+    /// Client-lifetime token: the server cancels it when the connection
+    /// dies, so queued or in-flight model/ML work stops rather than
+    /// completing for a peer that is gone.
+    public let cancellation: CancellationToken
+
+    public init(method: String, target: String, version: String,
+                headers: [(String, String)], body: Data,
+                cancellation: CancellationToken = CancellationToken()) {
+        self.method = method
+        self.target = target
+        self.version = version
+        self.headers = headers
+        self.body = body
+        self.cancellation = cancellation
+    }
 
     public func header(_ name: String) -> String? {
         let lowered = name.lowercased()

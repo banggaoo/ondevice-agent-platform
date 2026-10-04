@@ -2,9 +2,9 @@
 
 A proposed local-first, resource-aware agent serving platform for Apple Silicon macOS, intended for engineers broadly. Local, free-to-use, and performant operation are product goals, not measured performance, an established license, or authorization to publish or distribute.
 
-**Status: strategy draft v0.9 + bounded implementation, 2026-10-04.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console, opt-in Apple Foundation Models provider, and the owned open-weight MLX route described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
+**Status: strategy draft v0.9 + bounded implementation, 2026-10-05.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console with five views, opt-in Apple Foundation Models provider, owned open-weight MLX route, and optional read-only runtime Operator described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
 
-## Build and run (M1)
+## Build and run
 
 Requires macOS 27+ on Apple Silicon and the installed Xcode 27 / Swift 6.4 toolchain (including the downloadable Metal toolchain component: `xcodebuild -downloadComponent MetalToolchain`). Third-party runtime dependencies are pinned exactly in `Package.resolved`: `mlx-swift-lm` 3.31.4 (MLX Swift LLM runtime), `swift-huggingface` 0.11.0 (hub downloads), and `swift-transformers` 1.3.4 (tokenizer loading). They are confined to the `PlatformMLX` target; `PlatformCore` links only system frameworks and system SQLite.
 
@@ -17,26 +17,26 @@ swift test                                   # run the full software-contract su
 Commands:
 
 ```sh
-ondevice-agent-platform credential --scope console|model|agent [--data-root PATH]
-ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]
+ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]
 ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
 ondevice-agent-platform model pull --alias ALIAS | --repo ORG/NAME --revision REV [--data-root PATH]
 ondevice-agent-platform model list [--data-root PATH]
 ondevice-agent-platform model remove --alias ALIAS [--data-root PATH]
 ```
 
-- `credential` is the only deliberate token display: it prints the secret alone on stdout. `serve` refuses to start while any scope credential is missing.
+- The platform is trusted-local single-user software (D50): it issues no API access tokens and stores no credentials or Keychain items. `serve` starts on a fresh root with no bootstrap step; every loopback route runs under a fixed code-owned consumer principal whose scope stays an internal permission. An incoming `Authorization` header is ignored for SDK compatibility - it selects no principal and bypasses no guard.
 - `serve` binds loopback only (default 127.0.0.1:8080) and writes a nonsecret `daemon.json` marker under the data root (default `~/.ondevice-agent-platform`).
 - `model pull` is the only acquisition path: it downloads a registry-declared (or explicit repo+revision) artifact from Hugging Face into `<data-root>/models/` with staging, per-file size checks, and LFS sha256 verification recorded in a manifest. Inference never downloads; a declared-but-unpulled model serves truthful provider-unavailable.
 - `acp` is a stdio facade that forwards JSON-RPC to the running daemon's private bridge; it never starts a second core.
-- Credentials live in Keychain keyed to the resolved data root. The console is a loopback development surface; `Secure` cookies are not possible on plain HTTP, so this is not hardened for distribution.
+- The console is a loopback development surface: opening the served page in a browser needs no command or token - it bootstraps a local cookie session automatically. It shows five views - Overview (real resource fields with labeled pressure provenance, the evaluated admission verdict, occupied slots, provider categories), Models (declared profiles and readiness; artifacts are governed through `model pull`/`list`/`remove`, never the page), History (jobs with scoped stop controls), Train (explicitly unavailable), and Chat (the opt-in read-only runtime Operator only - one bounded call per question, no conversation memory, no applied actions). Stopping a question cancels only that turn through the request's own cancellation token; console bindings commit only after re-validating the live session, so a logged-out or expired cookie cannot resurrect one. Automatic bootstrap trusts local users and processes: localhost alone is not identity authentication, and exact same-origin plus CSRF checks protect browser mutations rather than isolating the daemon from other local programs. `Secure` cookies are not possible on plain HTTP, so this is not hardened for distribution.
 
 ## Explicit limits of this increment
 
 - The model registry starts empty: OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
 - `serve --enable-apple-model` (or the `enableAppleModel` config key) registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
 - `registry.json` accepts `provider: "mlx"` LLM entries with a pinned `source` (`repo` + `revision`); `serve` registers them behind the shared MLX provider, and a pulled, verified artifact makes them executable. `"capabilities": ["vision"]` marks an alias image-capable; image requests to text-only aliases are refused at admission. Verified live on this host: `mlx-community/Qwen3-0.6B-4bit`, `mlx-community/Qwen3-4B-Instruct-2507-4bit`, and `mlx-community/Qwen3-VL-2B-Instruct-4bit` (live vision completion).
-- `serve --enable-reference-agent` installs the deterministic `reference.status` harness plus the bounded single-call `reference.echo` model-step harness when a declared model alias exists (currently the Apple opt-in). There is no Operator and no general tool execution.
+- `serve --enable-reference-agent` installs the deterministic `reference.status` harness plus the bounded single-call `reference.echo` model-step harness when a declared model alias exists (currently the Apple opt-in). There is no general tool execution.
+- `serve --enable-operator` (or `--operator-model ALIAS`, or the `operatorModel` config key) registers the optional read-only runtime Operator on an explicit opt-in. It binds to a declared, pulled MLX LLM alias (default `qwen3.8-9b` when the flag names none) and fails startup truthfully when the alias is undeclared, non-MLX, capped under 512 output tokens, or unpulled; it never downloads. The Operator answers ACP prompts by explaining the platform status snapshot through one bounded model call (max 512 output tokens, temperature 0); it owns no tools and no administrative authority, and its text is a proposal or explanation, never an applied change.
 - `registry.json` accepts declared `builtin.linear` typed-ML models (features, labels, weights, optional bias); malformed entries fail startup.
 - ACP is the documented v1 subset: initialize/session-new/prompt/cancel with text and resource-link blocks; MCP servers are refused before any process boundary.
 - No arbitrary file serving, code execution, MCP process launch, non-loopback traffic, or public release.

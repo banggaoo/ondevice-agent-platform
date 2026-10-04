@@ -10,7 +10,7 @@ Test core operation and each declared provider independently on representative M
 
 ## Core and harness independence
 
-With no Operator profile installed and an empty agent registry, exercise authenticated startup, registry/status, queue limits, scoped cancellation, and restart. With every inference provider unavailable, these administrative paths must still work without a model call, while inference requests fail explicitly. Text such as "refresh" in a model prompt must not select an administrative capability.
+With no Operator profile installed and an empty agent registry, exercise token-free local startup, registry/status, queue limits, internal scope checks, cancellation, and restart. With every inference provider unavailable, these administrative paths must still work without a model call, while inference requests fail explicitly. Text such as "refresh" in a model prompt must not select an administrative capability.
 
 For hosted agents, verify that model calls use the same OpenAI-compatible contract, admission, and disclosure checks as external consumers. Ordinary model completions must not execute consumer tool declarations. Test two distinct harness versions, one changed specification, rollback, and an in-flight run pinned to the prior version. Permission revocation takes precedence over pinned definitions. Check isolated consumer state, parent/child accounting, propagated cancellation, and that a waiting harness does not occupy the model inference slot.
 

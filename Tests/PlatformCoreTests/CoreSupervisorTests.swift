@@ -56,15 +56,14 @@ final class CoreSupervisorTests: XCTestCase {
 
     // MARK: grants
 
-    func testWrongCredentialAndScopeGrants() async throws {
+    /// Internal scope is deterministic, not caller-authenticated: the model
+    /// consumer cannot administrate, the agent consumer has no admin rights,
+    /// and the console consumer cannot infer directly. Revocation applies
+    /// at the next check; no credential exists to bypass internal scope.
+    func testDeterministicScopeGrantsAndRevocation() async throws {
         let stack = try await makeStack()
         defer { stack.root.releaseLock() }
         await registerStandardPrincipals(stack.supervisor)
-        let bad = await stack.supervisor.authenticate(token: "not-a-token")
-        XCTAssertNil(bad)
-        let good = await stack.supervisor.authenticate(token: modelToken)
-        XCTAssertNotNil(good)
-        // Model token cannot administrate; agent token has no admin rights.
         try await expectPlatformError(.forbidden) {
             try await stack.supervisor.require(.adminRead, principal: modelPrincipal)
         }
@@ -74,6 +73,13 @@ final class CoreSupervisorTests: XCTestCase {
         try await expectPlatformError(.forbidden) {
             try await stack.supervisor.require(.llmInfer, principal: consolePrincipal)
         }
+        // The fixed local consumers are registered at start: model infer
+        // works until its grant is revoked.
+        try await stack.supervisor.require(.llmInfer, principal: LocalConsumers.model)
+        await stack.supervisor.revokeGrant(.llmInfer, from: LocalConsumers.model.id)
+        try await expectPlatformError(.forbidden) {
+            try await stack.supervisor.require(.llmInfer, principal: LocalConsumers.model)
+        }
     }
 
     func testRevokedGrantDeniedAtSubmit() async throws {
@@ -81,7 +87,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider(autoFinish: true)
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
         await stack.supervisor.revokeGrant(.llmInfer, from: modelPrincipal.id)
         do {
             _ = try await stack.supervisor.submitLLM(principal: modelPrincipal,
@@ -97,18 +103,18 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         await stack.supervisor.registerModel(Self.llmProfile(),
                                              provider: FakeLLMProvider(autoFinish: true))
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
         _ = try await stack.supervisor.submitLLM(principal: modelPrincipal,
                                                  request: Self.chatRequest())
         await stack.supervisor.shutdown()
 
         let second = PlatformSupervisor(
-            root: stack.root, credentials: MemoryCredentialStore(),
+            root: stack.root,
             resourceSource: stack.resources, clock: stack.clock.clock)
         try await second.start()
         await second.registerModel(Self.llmProfile(),
                                    provider: FakeLLMProvider(autoFinish: true))
-        await second.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await second.registerPrincipal(modelPrincipal)
         _ = try await second.submitLLM(principal: modelPrincipal,
                                        request: Self.chatRequest())
         let jobs = try await second.listJobs()
@@ -127,8 +133,11 @@ final class CoreSupervisorTests: XCTestCase {
                                      capabilities: ["vision"], maxOutputTokens: 512)
         await stack.supervisor.registerModel(visionProfile,
                                              provider: FakeLLMProvider(autoFinish: true))
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
-        let image = ChatImage(data: Data([1, 2, 3]), mediaType: "image/png")
+        await stack.supervisor.registerPrincipal(modelPrincipal)
+        let image = ChatImage(data: Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            + "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")!,
+                              mediaType: "image/png")
         let request = ChatRequest(model: "test-llm",
                                   messages: [ChatMessage(role: .user, parts: ["x"],
                                                          images: [image])],
@@ -151,7 +160,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider()
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let req = Self.chatRequest()
         var tasks: [Task<Result<ChatResult, Error>, Never>] = []
@@ -190,8 +199,8 @@ final class CoreSupervisorTests: XCTestCase {
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
         let a = Principal(id: "a-consumer", scope: .model)
         let b = Principal(id: "b-consumer", scope: .model)
-        await stack.supervisor.registerPrincipal(token: "ta", principal: a)
-        await stack.supervisor.registerPrincipal(token: "tb", principal: b)
+        await stack.supervisor.registerPrincipal(a)
+        await stack.supervisor.registerPrincipal(b)
 
         let r1 = Self.chatRequest("test-llm", "A1")
         let t1 = Task { try? await stack.supervisor.submitLLM(principal: a, request: r1) }
@@ -220,7 +229,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider()
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let r4 = Self.chatRequest()
         let t1 = Task { try? await stack.supervisor.submitLLM(principal: modelPrincipal, request: r4) }
@@ -263,7 +272,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider(cooperative: true)
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let t1 = Task<Result<ChatResult, Error>, Never> {
             do { return .success(try await stack.supervisor.submitLLM(
@@ -299,7 +308,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider(cooperative: false)
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let t1 = Task<Result<ChatResult, Error>, Never> {
             do { return .success(try await stack.supervisor.submitLLM(
@@ -340,7 +349,7 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider(cooperative: false)
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let t1 = Task<Result<ChatResult, Error>, Never> {
             do { return .success(try await stack.supervisor.submitLLM(
@@ -374,12 +383,13 @@ final class CoreSupervisorTests: XCTestCase {
         defer { stack.root.releaseLock() }
         let provider = FakeLLMProvider(autoFinish: true)
         await stack.supervisor.registerModel(Self.llmProfile(), provider: provider)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
         let req = ChatRequest(model: "test-llm", messages: [
             ChatMessage(role: .system, parts: ["sys"]),
             ChatMessage(role: .developer, parts: ["dev"]),
             ChatMessage(role: .user, parts: ["refresh", "more"]),
             ChatMessage(role: .assistant, parts: ["ack"]),
+            ChatMessage(role: .user, parts: ["go on"]),
         ], maxOutputTokens: 16)
         let result = try await stack.supervisor.submitLLM(principal: modelPrincipal,
                                                         request: req)
@@ -401,7 +411,7 @@ final class CoreSupervisorTests: XCTestCase {
                          task: "classify",
                          inputSchema: ["x": .number], outputSchema: ["label": .string]),
             predictor: ml)
-        await stack.supervisor.registerPrincipal(token: modelToken, principal: modelPrincipal)
+        await stack.supervisor.registerPrincipal(modelPrincipal)
 
         let r5 = Self.chatRequest()
         let t1 = Task { try? await stack.supervisor.submitLLM(principal: modelPrincipal, request: r5) }
@@ -425,6 +435,82 @@ final class CoreSupervisorTests: XCTestCase {
             let c = await stack.supervisor.counters()
             return c.llm == 1 && c.ml == 1
         })
+    }
+
+    // MARK: resource admission
+
+    /// Source callbacks publish off-lock and can arrive out of order: a
+    /// strictly older sample must never overwrite a newer observation,
+    /// while an equal timestamp still applies.
+    func testOutOfOrderResourceSnapshotsNeverRegress() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await stack.supervisor.registerModel(Self.llmProfile(),
+                                             provider: FakeLLMProvider(autoFinish: true))
+        await stack.supervisor.registerPrincipal(modelPrincipal)
+        let base = stack.clock.now
+        let newer = healthySnapshot(at: base.addingTimeInterval(1))
+        // The fixture samples one second ahead; advance the manual clock so
+        // the "newer" snapshot is current rather than a denied future one.
+        stack.clock.advance(by: 1)
+        await stack.supervisor.resourceChanged(newer)
+        let older = ResourceSnapshot(thermal: .critical,
+                                     memoryPressure: .critical,
+                                     lowPowerMode: true, capturedAt: base)
+        await stack.supervisor.resourceChanged(older)
+        var status = await stack.supervisor.statusSnapshot()
+        var resource = status.objectValue?["resource"]?.objectValue
+        XCTAssertEqual(resource?["thermal"], .string("nominal"))
+        XCTAssertEqual(resource?["admission"], .string("admit"))
+
+        // Equal timestamp carries new information and must apply.
+        let equalCritical = ResourceSnapshot(thermal: .critical,
+                                             memoryPressure: .critical,
+                                             lowPowerMode: false,
+                                             capturedAt: newer.capturedAt)
+        await stack.supervisor.resourceChanged(equalCritical)
+        status = await stack.supervisor.statusSnapshot()
+        resource = status.objectValue?["resource"]?.objectValue
+        XCTAssertEqual(resource?["thermal"], .string("critical"))
+        XCTAssertEqual(resource?["admission"], .string("deny_and_cancel"))
+        try await expectPlatformError(.resourceDenied) {
+            _ = try await stack.supervisor.submitLLM(principal: modelPrincipal,
+                                                     request: Self.chatRequest())
+        }
+    }
+
+    /// status.resource.admission mirrors ResourcePolicy.evaluate: healthy,
+    /// fair, unknown, and stale observations each map truthfully.
+    func testStatusAdmissionReflectsPolicyVerdict() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        func admission() async -> String? {
+            let status = await stack.supervisor.statusSnapshot()
+            return status.objectValue?["resource"]?.objectValue?["admission"]?.stringValue
+        }
+        var verdict = await admission()
+        XCTAssertEqual(verdict, "admit")
+
+        await stack.supervisor.resourceChanged(
+            ResourceSnapshot(thermal: .fair, memoryPressure: .normal,
+                             lowPowerMode: false, capturedAt: stack.clock.now))
+        verdict = await admission()
+        XCTAssertEqual(verdict, "defer_load")
+
+        await stack.supervisor.resourceChanged(
+            ResourceSnapshot(thermal: .nominal, memoryPressure: .unknown,
+                             lowPowerMode: false, capturedAt: stack.clock.now))
+        verdict = await admission()
+        XCTAssertEqual(verdict, "deny_and_cancel")
+
+        // Staleness alone denies once the latest sample ages out.
+        stack.clock.advance(by: 1)
+        await stack.supervisor.resourceChanged(healthySnapshot(at: stack.clock.now))
+        verdict = await admission()
+        XCTAssertEqual(verdict, "admit")
+        stack.clock.advance(by: PlatformLimits.resourceMaxAgeSeconds + 1)
+        verdict = await admission()
+        XCTAssertEqual(verdict, "deny_and_cancel")
     }
 }
 

@@ -205,7 +205,17 @@ public actor StateStore {
         return maxN
     }
 
-    public func insertJob(_ job: JobRecord) throws {
+    /// Test seam: an optional hook awaited inside insertJob before the row
+    /// is written, letting tests deterministically hold storage insertion
+    /// while concurrent submissions race. Production leaves it nil.
+    var beforeInsertJob: (@Sendable () async throws -> Void)?
+
+    func setBeforeInsertJob(_ callback: (@Sendable () async throws -> Void)?) {
+        beforeInsertJob = callback
+    }
+
+    public func insertJob(_ job: JobRecord) async throws {
+        if let hook = beforeInsertJob { try await hook() }
         try checkCapacity()
         try runStatement("""
             INSERT INTO jobs(id,kind,consumer_id,parent_id,state,created_at,updated_at,provider_finished)

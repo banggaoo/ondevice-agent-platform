@@ -1,8 +1,10 @@
 import Foundation
 
-/// ACP v1 terminal reasons.
+/// Harness outcomes. `error` is internal and must use JSON-RPC's error rail,
+/// not an unsupported ACP stop reason.
 public enum AgentStopReason: String, Sendable {
     case endTurn = "end_turn"
+    case maxTokens = "max_tokens"
     case refusal
     case cancelled
     case error

@@ -1,25 +1,30 @@
 import Foundation
 import PlatformCore
 
-/// Route dispatch for the loopback boundary. Authentication runs after
-/// framing validation but before any route work; rate limits apply per
-/// credential identity.
+/// Route dispatch for the loopback boundary. Local-trust serving: routes
+/// bind to fixed code-owned consumers rather than authenticating callers;
+/// Origin/fetch guards and rate limits apply before any route work.
 public actor Router {
     private let supervisor: PlatformSupervisor
     private let sessions: ConsoleSessions
     private let acp: ACPService
     private let clock: Clock
+    private let bridge: ConsoleOperatorBridge
     private let expectedHost: String
     private let expectedOrigin: String
     private var consumerWindows: [String: [Date]] = [:]
     private var eventSubscribers = 0
 
     public init(supervisor: PlatformSupervisor, sessions: ConsoleSessions,
-                acp: ACPService, port: UInt16, clock: Clock) {
+                acp: ACPService, port: UInt16, clock: Clock,
+                consoleOperatorPrincipal: Principal? = nil) {
         self.supervisor = supervisor
         self.sessions = sessions
         self.acp = acp
         self.clock = clock
+        self.bridge = ConsoleOperatorBridge(acp: acp, supervisor: supervisor,
+                                            sessions: sessions, clock: clock,
+                                            principal: consoleOperatorPrincipal)
         self.expectedHost = "127.0.0.1:\(port)"
         self.expectedOrigin = "http://127.0.0.1:\(port)"
     }
@@ -56,19 +61,41 @@ public actor Router {
         }
     }
 
+    /// A supplied Origin must be exact - a foreign or "null" value is a
+    /// truthful 403; an absent header is a marker-free native caller.
     private func requireOrigin(_ request: HTTPRequest) throws {
         if let origin = request.header("Origin"), origin != expectedOrigin {
             throw PlatformError(.forbidden)
         }
     }
 
-    private func bearerPrincipal(_ request: HTTPRequest) async throws -> Principal {
-        guard let auth = request.header("Authorization"),
-              auth.hasPrefix("Bearer ") else { throw PlatformError(.unauthorized) }
-        let token = String(auth.dropFirst(7))
-        guard let principal = await supervisor.authenticate(token: token) else {
-            throw PlatformError(.unauthorized)
+    /// Session bootstrap and cookie-guarded mutations require an
+    /// explicit exact Origin; an absent header cannot be distinguished
+    /// from a cross-site form post.
+    private func requireExactOrigin(_ request: HTTPRequest) throws {
+        guard request.header("Origin") == expectedOrigin else {
+            throw PlatformError(.forbidden)
         }
+    }
+
+    /// Fetch-metadata defense in depth: a supplied cross-site marker fails
+    /// closed on cookie-guarded routes. Header-less clients are not
+    /// penalized; Origin and CSRF carry the actual checks.
+    private func requireSameSiteFetch(_ request: HTTPRequest) throws {
+        if request.header("Sec-Fetch-Site") == "cross-site" {
+            throw PlatformError(.forbidden)
+        }
+    }
+
+    /// Fixed local-trust identity for one route family. Any supplied Origin
+    /// must be exact (a foreign or "null" value is refused) and a supplied
+    /// cross-site fetch marker fails closed; the per-consumer rate limit
+    /// then applies. An incoming Authorization header is ignored outright -
+    /// no header or body value can select a different principal.
+    private func localRoute(_ request: HTTPRequest,
+                            as principal: Principal) throws -> Principal {
+        try requireOrigin(request)
+        try requireSameSiteFetch(request)
         try consumerRateLimit(principal.id)
         return principal
     }
@@ -100,12 +127,13 @@ public actor Router {
         case ("GET", "/"): return staticAsset("index.html", contentType: "text/html; charset=utf-8")
         case ("GET", "/styles.css"): return staticAsset("styles.css", contentType: "text/css; charset=utf-8")
         case ("GET", "/app.js"): return staticAsset("app.js", contentType: "text/javascript; charset=utf-8")
-        case ("POST", "/api/session"): return try await login(request)
+        case ("POST", "/api/session"): return try await bootstrap(request)
         case ("GET", "/api/session"): return try await sessionInfo(request)
         case ("POST", "/api/logout"): return try await logout(request)
         case ("GET", "/api/status"): return try await adminJSON(request) { await self.supervisor.statusSnapshot() }
         case ("GET", "/api/registry"): return try await adminJSON(request) { await self.supervisor.registrySnapshot() }
         case ("GET", "/api/jobs"): return try await adminJobs(request)
+        case ("POST", "/api/console/operator/prompt"): return try await operatorPrompt(request)
         case ("POST", "/v1/chat/completions"): return try await chatCompletions(request)
         case ("GET", "/v1/models"): return try await listModels(request)
         case ("POST", "/api/ml/predictions"): return try await mlPredict(request)
@@ -140,20 +168,29 @@ public actor Router {
         ], body: data)
     }
 
-    // MARK: - console auth
+    // MARK: - console browser guards
 
-    private func login(_ request: HTTPRequest) async throws -> HTTPResponse {
-        try requireOrigin(request)
+    /// Local-console session bootstrap: this is a trusted single-user
+    /// development surface, so no credential is exchanged. An exact Origin
+    /// is a browser-origin check, not caller identity: browsers cannot
+    /// forge it cross-origin, while a local native client can set any
+    /// header and is intentionally trusted by this local design. Fetch
+    /// metadata, when supplied, must confirm same-origin. A valid
+    /// presented cookie reuses its session instead of allocating a new one;
+    /// only real creation consumes the bounded attempt/session limits.
+    private func bootstrap(_ request: HTTPRequest) async throws -> HTTPResponse {
+        try requireExactOrigin(request)
+        if let site = request.header("Sec-Fetch-Site"), site != "same-origin" {
+            throw PlatformError(.forbidden)
+        }
+        if let session = await cookieSession(request) {
+            return sessionResponse(session)
+        }
         guard await sessions.loginAllowed() else { throw PlatformError(.rateLimited) }
-        let root = try JSONValue.decode(request.body)
-        guard let credential = root.objectValue?["credential"]?.stringValue else {
-            throw PlatformError(.invalidRequest)
-        }
-        guard let principal = await supervisor.authenticate(token: credential),
-              principal.scope == .console else {
-            throw PlatformError(.unauthorized)
-        }
-        let session = try await sessions.create()
+        return sessionResponse(try await sessions.create())
+    }
+
+    private func sessionResponse(_ session: ConsoleSessions.Session) -> HTTPResponse {
         var response = HTTPResponse.json(.object([
             "session": .string(session.id),
             "csrf": .string(session.csrf),
@@ -167,8 +204,16 @@ public actor Router {
         return response
     }
 
-    private func consoleAuth(_ request: HTTPRequest, mutation: Bool) async throws -> ConsoleSessions.Session {
-        try requireOrigin(request)
+    /// Browser request guard, not authentication: the automatic cookie
+    /// session, exact Origin, and CSRF checks bound mutations to the served
+    /// page. An absent or expired nonce is a 401 the page bootstraps past.
+    private func requireConsoleSession(_ request: HTTPRequest, mutation: Bool) async throws -> ConsoleSessions.Session {
+        if mutation {
+            try requireExactOrigin(request)
+        } else {
+            try requireOrigin(request)
+        }
+        try requireSameSiteFetch(request)
         guard let session = await cookieSession(request) else {
             throw PlatformError(.unauthorized)
         }
@@ -181,7 +226,7 @@ public actor Router {
     }
 
     private func sessionInfo(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let session = try await consoleAuth(request, mutation: false)
+        let session = try await requireConsoleSession(request, mutation: false)
         return .json(.object([
             "session": .string(session.id),
             "csrf": .string(session.csrf),
@@ -190,20 +235,36 @@ public actor Router {
     }
 
     private func logout(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let session = try await consoleAuth(request, mutation: true)
+        let session = try await requireConsoleSession(request, mutation: true)
+        // Invalidate the console session first so a racing bridge lookup
+        // can never validate a logged-out cookie, then drop the binding.
         await sessions.logout(session.id)
+        await bridge.connectionClosed(forSession: session.id)
         return .json(.object(["ok": .bool(true)]))
+    }
+
+    /// Console-only Operator question: cookie session + exact Origin +
+    /// CSRF + fetch checks (inside requireConsoleSession mutation), a shared
+    /// per-consumer rate limit, then the in-process ACP bridge. No API
+    /// credential exists; the fixed console Operator consumer holds only
+    /// its three scoped grants.
+    private func operatorPrompt(_ request: HTTPRequest) async throws -> HTTPResponse {
+        let session = try await requireConsoleSession(request, mutation: true)
+        try consumerRateLimit("console-operator")
+        let reply = try await bridge.prompt(consoleSession: session,
+                                            body: request.body,
+                                            cancellation: request.cancellation)
+        return .json(reply)
     }
 
     // MARK: - admin reads
 
     private func adminJSON(_ request: HTTPRequest,
                            _ produce: () async throws -> JSONValue) async throws -> HTTPResponse {
-        if let session = try? await consoleAuth(request, mutation: false) {
-            _ = session
-            return .json(try await produce())
-        }
-        let principal = try await bearerPrincipal(request)
+        // Administrative reads run under the fixed local administration
+        // consumer: no cookie or credential is required, while supplied
+        // Origin/fetch metadata still fails closed inside localRoute.
+        let principal = try localRoute(request, as: LocalConsumers.administration)
         try await supervisor.require(.adminRead, principal: principal)
         return .json(try await produce())
     }
@@ -217,6 +278,7 @@ public actor Router {
                     "kind": .string(j.kind.rawValue),
                     "consumer": .string(j.consumerID),
                     "state": .string(j.state.rawValue),
+                    "parentId": j.parentID.map { .string($0) } ?? .null,
                     "createdAt": .double(j.createdAt.timeIntervalSince1970),
                     "updatedAt": .double(j.updatedAt.timeIntervalSince1970),
                 ])
@@ -233,16 +295,22 @@ public actor Router {
               jobID.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else {
             throw PlatformError(.invalidRequest)
         }
-        // A presented session cookie takes the console path; auth/CSRF
-        // failures must surface (403 for a missing CSRF token), not silently
-        // fall through to a bearer check that returns 401.
-        if request.header("Cookie")?.contains("platform_session=") == true {
-            _ = try await consoleAuth(request, mutation: true)
-            let console = Principal(id: "console", scope: .console)
-            try await supervisor.cancelJob(principal: console, jobID: jobID)
+        // Any browser marker - the session cookie, an Origin, or fetch
+        // metadata - routes through the console mutation checks with no
+        // fallback: a bad cookie or missing CSRF is a real failure, never a
+        // silent native cancellation, and a supplied Authorization header
+        // cannot bypass CSRF.
+        if request.header("Cookie")?.contains("platform_session=") == true
+            || request.header("Origin") != nil
+            || request.header("Sec-Fetch-Site") != nil {
+            _ = try await requireConsoleSession(request, mutation: true)
+            try await supervisor.cancelJob(
+                principal: LocalConsumers.administration, jobID: jobID)
             return .json(.object(["ok": .bool(true)]))
         }
-        let principal = try await bearerPrincipal(request)
+        // Marker-free native caller: the trusted device owner stops local
+        // jobs under the fixed administration consumer.
+        let principal = try localRoute(request, as: LocalConsumers.administration)
         try await supervisor.cancelJob(principal: principal, jobID: jobID)
         return .json(.object(["ok": .bool(true)]))
     }
@@ -250,7 +318,7 @@ public actor Router {
     // MARK: - events (SSE)
 
     private func events(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let session = try await consoleAuth(request, mutation: false)
+        let session = try await requireConsoleSession(request, mutation: false)
         guard eventSubscribers < PlatformLimits.eventSubscribers else {
             throw PlatformError(.rateLimited)
         }
@@ -289,11 +357,34 @@ public actor Router {
     // MARK: - OpenAI + ML
 
     private func chatCompletions(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let principal = try await bearerPrincipal(request)
+        let principal = try localRoute(request, as: LocalConsumers.model)
         let chat = try OpenAIAdapter.parseChatRequest(request.body)
         do {
-            let result = try await supervisor.submitLLM(principal: principal, request: chat)
-            return .json(OpenAIAdapter.chatResponse(result, requestedModel: chat.model))
+            // The provider boundary is single-shot: the job resolves to one
+            // completed result, so request-level failures (auth, admission,
+            // deadlines) keep truthful HTTP status codes instead of becoming
+            // mid-stream SSE errors.
+            let result = try await supervisor.submitLLM(principal: principal, request: chat.request,
+                                                        cancellation: request.cancellation)
+            guard chat.stream else {
+                return .json(OpenAIAdapter.chatResponse(result, requestedModel: chat.request.model))
+            }
+            var response = HTTPResponse(status: 200, reason: "OK", headers: [
+                ("Content-Type", "text/event-stream"),
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+            ])
+            let frames = OpenAIAdapter.streamFrames(result, requestedModel: chat.request.model,
+                                                    includeUsage: chat.includeUsage)
+            response.stream = { sender in
+                Task {
+                    defer { sender.close() }
+                    for frame in frames {
+                        await sender.send(frame)
+                    }
+                }
+            }
+            return response
         } catch let e as PlatformError {
             return .json(OpenAIAdapter.errorBody(e), status: statusCode(e),
                          reason: HTTPResponse.reason(for: statusCode(e)))
@@ -301,17 +392,18 @@ public actor Router {
     }
 
     private func listModels(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let principal = try await bearerPrincipal(request)
+        let principal = try localRoute(request, as: LocalConsumers.model)
         try await supervisor.require(.llmInfer, principal: principal)
         let models = await supervisor.registeredModels(kind: .llm)
         return .json(OpenAIAdapter.modelsResponse(models))
     }
 
     private func mlPredict(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let principal = try await bearerPrincipal(request)
+        let principal = try localRoute(request, as: LocalConsumers.model)
         try await supervisor.require(.mlPredict, principal: principal)
         let prediction = try MLAdapter.parseRequest(request.body)
-        let result = try await supervisor.submitML(principal: principal, request: prediction)
+        let result = try await supervisor.submitML(principal: principal, request: prediction,
+                                                   cancellation: request.cancellation)
         return .json(MLAdapter.response(result))
     }
 
@@ -324,7 +416,7 @@ public actor Router {
     /// message binds it to one agent profile. This is a platform transport,
     /// not a standardized ACP HTTP transport.
     private func bridgeACP(_ request: HTTPRequest) async throws -> HTTPResponse {
-        let principal = try await bearerPrincipal(request)
+        let principal = try localRoute(request, as: LocalConsumers.agent)
         try await supervisor.require(.agentRun, principal: principal)
         let wrapper = try JSONValue.decode(request.body)
         guard let w = wrapper.objectValue,
@@ -351,7 +443,8 @@ public actor Router {
         response.stream = { sender in
             Task {
                 defer { sender.close() }
-                await acpRef.handle(connectionID: connID, message: message) { out in
+                await acpRef.handle(connectionID: connID, message: message,
+                                    cancellation: request.cancellation) { out in
                     guard let data = try? JSONRPC.line(for: out) else { return }
                     await sender.send(data)
                 }

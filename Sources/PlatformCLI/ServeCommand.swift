@@ -3,23 +3,27 @@ import PlatformCore
 import PlatformMLX
 import PlatformServing
 
-/// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]`
+/// `serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]`
 /// Starts the one shared core and the loopback boundary. Prints the readiness
 /// URL and nonsecret diagnostics only - never credentials.
 enum ServeCommand {
     /// Serving alias for the opt-in Apple provider route.
     static let appleModelAlias = "apple-foundation-model"
+    /// Default model for the opt-in Operator when none is named; always an
+    /// explicit Operator default, never a universal model default.
+    static let operatorDefaultModelAlias = "qwen3.8-9b"
 
     struct Config {
         var schemaVersion = 1
         var port: UInt16?
         var enableReferenceAgent = false
         var enableAppleModel = false
+        var operatorModel: String?
     }
 
     static func run(args: [String]) async throws {
         if args.contains("--help") {
-            print("serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model]")
+            print("serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]")
             return
         }
         guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 else {
@@ -34,7 +38,7 @@ enum ServeCommand {
         // default mode rather than an explicit one.
         _ = umask(0o077)
 
-        let root = RuntimeRoot(url: CredentialCommand.rootURL(args: args))
+        let root = RuntimeRoot(url: RuntimeArguments.rootURL(args: args))
         try root.prepare()
         try root.acquireLock()
         try root.checkStateFiles()
@@ -43,7 +47,8 @@ enum ServeCommand {
         if let raw = try root.readOwnedJSON(root.configURL) {
             guard let object = raw.objectValue else { throw PlatformError(.invalidRequest, detail: "config malformed") }
             for key in object.keys {
-                guard ["schemaVersion", "port", "enableReferenceAgent", "enableAppleModel"].contains(key) else {
+                guard ["schemaVersion", "port", "enableReferenceAgent", "enableAppleModel",
+                       "operatorModel"].contains(key) else {
                     throw PlatformError(.invalidRequest, detail: "unknown config key")
                 }
             }
@@ -56,12 +61,37 @@ enum ServeCommand {
             }
             config.enableReferenceAgent = object["enableReferenceAgent"] == .bool(true)
             config.enableAppleModel = object["enableAppleModel"] == .bool(true)
+            // A present operatorModel must be a nonempty string: a null,
+            // wrong-type, or blank value is a config error, never a silent
+            // disable.
+            if let rawAlias = object["operatorModel"] {
+                guard let alias = rawAlias.stringValue,
+                      !alias.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw PlatformError(.invalidRequest,
+                                        detail: "operatorModel must be a nonempty string")
+                }
+                config.operatorModel = alias
+            }
         } else {
             try root.writeOwnedJSON(.object(["schemaVersion": .int(1)]), to: root.configURL)
         }
         if args.contains("--enable-reference-agent") { config.enableReferenceAgent = true }
         if args.contains("--enable-apple-model") { config.enableAppleModel = true }
         if let p = value(forFlag: "--port", in: args), let n = UInt16(p) { config.port = n }
+        // Explicit opt-in only: the flag, a named model, or a configured
+        // operatorModel each enable the Operator independently.
+        var operatorModelAlias = config.operatorModel
+        if args.contains("--operator-model") {
+            guard let flag = value(forFlag: "--operator-model", in: args),
+                  !flag.hasPrefix("-"),
+                  !flag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw PlatformError(.invalidRequest,
+                                    detail: "--operator-model requires a model alias")
+            }
+            operatorModelAlias = flag
+        }
+        let operatorEnabled = args.contains("--enable-operator")
+            || operatorModelAlias != nil
 
         // Declared model registry: builtin.linear typed-ML entries are
         // validated and loaded; LLM routes stay code-registered behind their
@@ -78,31 +108,15 @@ enum ServeCommand {
         }
         let registryEntries = try ModelRegistry.parse(registryJSON)
 
-        let credentials = KeychainCredentialStore()
+        // Local-trust core: no credential store, no secret preflight - a
+        // fresh root serves directly under fixed code-owned consumers.
         let monitor = NativeResourceMonitor()
         let supervisor = PlatformSupervisor(
-            root: root, credentials: credentials, resourceSource: monitor,
+            root: root, resourceSource: monitor,
             options: .init(
                 enableReferenceAgent: config.enableReferenceAgent,
                 referenceEchoModelAlias: config.enableAppleModel ? appleModelAlias : nil))
         try await supervisor.start()
-        // Every scope must already have a credential; missing scopes fail
-        // truthfully rather than minting silently at runtime. The only
-        // deliberate mint-and-display path is `credential --scope`.
-        var missing: [String] = []
-        for scope in CredentialScope.allCases {
-            let key = CredentialKey.key(root: root.url, scope: scope)
-            if try credentials.secret(forKey: key) == nil {
-                missing.append(scope.rawValue)
-            }
-        }
-        guard missing.isEmpty else {
-            let hint = "missing credentials for \(missing.joined(separator: ", ")); " +
-                "run: ondevice-agent-platform credential --scope <scope>\n"
-            FileHandle.standardError.write(Data(hint.utf8))
-            throw PlatformError(.unauthorized)
-        }
-        try await supervisor.loadCredentials()
 
         // Explicit opt-in only: registers the Apple model profile with a real
         // provider when the device reports availability; otherwise the alias
@@ -137,6 +151,39 @@ enum ServeCommand {
             }
         }
 
+        // Optional read-only Operator: explicit opt-in bound to a declared,
+        // pulled MLX route. An enabled-but-absent or under-capacity alias
+        // fails startup truthfully rather than registering a phantom agent.
+        if operatorEnabled {
+            let alias = operatorModelAlias ?? operatorDefaultModelAlias
+            guard !alias.isEmpty else {
+                throw PlatformError(.invalidRequest, detail: "operator model alias required")
+            }
+            guard let entry = registryEntries.first(where: { $0.profile.alias == alias }) else {
+                throw PlatformError(.notFound,
+                                    detail: "operator model '\(alias)' not declared in registry")
+            }
+            let profile = entry.profile
+            guard profile.kind == .llm, profile.providerID == MLXProviderContract.id else {
+                throw PlatformError(.providerUnavailable,
+                                    detail: "operator requires an MLX model alias")
+            }
+            guard min(profile.maxOutputTokens ?? .max, PlatformLimits.outputTokens) >= 512 else {
+                throw PlatformError(.invalidRequest,
+                                    detail: "operator model output cap below 512")
+            }
+            if let source = profile.source, !mlx.store.isReady(source: source) {
+                throw PlatformError(.providerUnavailable,
+                                    detail: "operator model declared but not pulled")
+            }
+            try await supervisor.registerRuntimeOperator(modelAlias: alias)
+        }
+
+        // The console's in-process Operator consumer exists only behind the
+        // explicit opt-in: a fixed scoped principal, never a bearer token.
+        let consoleOperatorPrincipal: Principal? = operatorEnabled
+            ? await supervisor.registerConsoleOperatorConsumer() : nil
+
         let sessions = ConsoleSessions(clock: Clock())
         let acp = ACPService(supervisor: supervisor, clock: Clock())
         let port = config.port ?? 8080
@@ -151,7 +198,8 @@ enum ServeCommand {
         try server.start(port: port)
         let boundPort = try server.waitForPort()
         routerBox.assign(Router(supervisor: supervisor, sessions: sessions, acp: acp,
-                                port: boundPort, clock: Clock()))
+                                port: boundPort, clock: Clock(),
+                                consoleOperatorPrincipal: consoleOperatorPrincipal))
         try root.writeDaemonMarker(port: boundPort)
 
         var qualifiedNames = registryEntries.compactMap { entry -> String? in
