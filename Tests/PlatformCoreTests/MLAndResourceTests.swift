@@ -246,6 +246,62 @@ final class MLAndResourceTests: XCTestCase {
         }
     }
 
+    /// deferLoad defers weight loads only: a call whose provider reports no
+    /// pending load (resident container or system-managed route) dispatches
+    /// under fair thermal, while a load-bearing job for another consumer
+    /// stays queued until a healthy snapshot arrives.
+    func testDeferralDefersLoadsNotResidentCalls() async throws {
+        let clock = ManualClock()
+        let resources = FakeResourceSource(
+            ResourceSnapshot(thermal: .fair, memoryPressure: .normal,
+                             lowPowerMode: false, capturedAt: clock.now))
+        let root = try preparedRoot(tempRootURL())
+        defer { root.releaseLock() }
+        let supervisor = PlatformSupervisor(
+            root: root,
+            resourceSource: resources, clock: clock.clock)
+        try await supervisor.start()
+        let resident = FakeLLMProvider(providerID: "resident-llm", autoFinish: true)
+        resident.requiresLoadResult = false
+        let loading = FakeLLMProvider(providerID: "loading-llm", autoFinish: true)
+        await supervisor.registerModel(
+            ModelProfile(alias: "resident", providerID: "resident-llm", kind: .llm, task: "chat"),
+            provider: resident)
+        await supervisor.registerModel(
+            ModelProfile(alias: "loading", providerID: "loading-llm", kind: .llm, task: "chat"),
+            provider: loading)
+        await supervisor.registerPrincipal(modelPrincipal)
+        await supervisor.registerPrincipal(agentPrincipal)
+
+        // No-load call runs under the defer verdict.
+        let result = try await supervisor.submitLLM(
+            principal: modelPrincipal,
+            request: ChatRequest(model: "resident",
+                                 messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                 maxOutputTokens: 4))
+        XCTAssertEqual(result.content, "ok")
+        XCTAssertEqual(resident.invocations.count, 1)
+
+        // Load-bearing call for another consumer queues behind it.
+        let task = Task {
+            try await supervisor.submitLLM(
+                principal: agentPrincipal,
+                request: ChatRequest(model: "loading",
+                                     messages: [ChatMessage(role: .user, parts: ["hi"])],
+                                     maxOutputTokens: 4))
+        }
+        try await expectTrue(await pollUntil {
+            await supervisor.admissionSnapshot().pending == 1
+        }, "load-bearing job should queue under deferLoad")
+        XCTAssertEqual(loading.invocations.count, 0)
+
+        // A healthy snapshot dispatches the deferred load.
+        resources.push(ResourceSnapshot(thermal: .nominal, memoryPressure: .normal,
+                                        lowPowerMode: false, capturedAt: clock.now))
+        _ = try await task.value
+        XCTAssertEqual(loading.invocations.count, 1)
+    }
+
     func testUnhealthySnapshotDeniesNewInference() async throws {
         let clock = ManualClock()
         let resources = FakeResourceSource(

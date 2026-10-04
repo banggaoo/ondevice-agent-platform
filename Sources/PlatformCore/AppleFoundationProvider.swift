@@ -116,6 +116,10 @@ public final class AppleFoundationProvider: LLMProvider, @unchecked Sendable {
         tracked()?.cancel()
     }
 
+    /// The system route holds no platform-resident weights: a call never
+    /// triggers a platform model load, so `defer_load` does not apply.
+    public func requiresLoad(for profile: ModelProfile) -> Bool { false }
+
     #if canImport(FoundationModels)
     /// Maps a validated request to transcript + final prompt + options.
     /// Refuses assistant-final transcripts and empty final user turns rather

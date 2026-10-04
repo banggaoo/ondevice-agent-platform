@@ -10,8 +10,10 @@ enum ServeCommand {
     /// Serving alias for the opt-in Apple provider route.
     static let appleModelAlias = "apple-foundation-model"
     /// Default model for the opt-in Operator when none is named; always an
-    /// explicit Operator default, never a universal model default.
-    static let operatorDefaultModelAlias = "qwen3.8-9b"
+    /// explicit Operator default, never a universal model default. The Apple
+    /// system route is the default so the Operator does not hold open-weight
+    /// weights resident; `--operator-model` may still name a pulled MLX alias.
+    static let operatorDefaultModelAlias = appleModelAlias
 
     struct Config {
         var schemaVersion = 1
@@ -152,29 +154,37 @@ enum ServeCommand {
         }
 
         // Optional read-only Operator: explicit opt-in bound to a declared,
-        // pulled MLX route. An enabled-but-absent or under-capacity alias
-        // fails startup truthfully rather than registering a phantom agent.
+        // executable LLM route - the built-in Apple system route or a pulled
+        // MLX alias. An enabled-but-absent or under-capacity alias fails
+        // startup truthfully rather than registering a phantom agent.
         if operatorEnabled {
             let alias = operatorModelAlias ?? operatorDefaultModelAlias
             guard !alias.isEmpty else {
                 throw PlatformError(.invalidRequest, detail: "operator model alias required")
             }
-            guard let entry = registryEntries.first(where: { $0.profile.alias == alias }) else {
-                throw PlatformError(.notFound,
-                                    detail: "operator model '\(alias)' not declared in registry")
-            }
-            let profile = entry.profile
-            guard profile.kind == .llm, profile.providerID == MLXProviderContract.id else {
-                throw PlatformError(.providerUnavailable,
-                                    detail: "operator requires an MLX model alias")
-            }
-            guard min(profile.maxOutputTokens ?? .max, PlatformLimits.outputTokens) >= 512 else {
-                throw PlatformError(.invalidRequest,
-                                    detail: "operator model output cap below 512")
-            }
-            if let source = profile.source, !mlx.store.isReady(source: source) {
-                throw PlatformError(.providerUnavailable,
-                                    detail: "operator model declared but not pulled")
+            if alias == appleModelAlias {
+                guard config.enableAppleModel else {
+                    throw PlatformError(.providerUnavailable,
+                                        detail: "operator bound to '\(alias)' requires --enable-apple-model")
+                }
+            } else {
+                guard let entry = registryEntries.first(where: { $0.profile.alias == alias }) else {
+                    throw PlatformError(.notFound,
+                                        detail: "operator model '\(alias)' not declared in registry")
+                }
+                let profile = entry.profile
+                guard profile.kind == .llm, profile.providerID == MLXProviderContract.id else {
+                    throw PlatformError(.providerUnavailable,
+                                        detail: "operator requires an MLX model alias")
+                }
+                guard min(profile.maxOutputTokens ?? .max, PlatformLimits.outputTokens) >= 512 else {
+                    throw PlatformError(.invalidRequest,
+                                        detail: "operator model output cap below 512")
+                }
+                if let source = profile.source, !mlx.store.isReady(source: source) {
+                    throw PlatformError(.providerUnavailable,
+                                        detail: "operator model declared but not pulled")
+                }
             }
             try await supervisor.registerRuntimeOperator(modelAlias: alias)
         }

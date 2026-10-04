@@ -15,6 +15,10 @@ public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
     public var cooperative: Bool
     /// Result used for every released/immediate call.
     public var result: ChatResult
+    /// Test knob for defer_load semantics: a fake defaults to the
+    /// conservative "would load weights" answer; tests modelling a
+    /// resident or system-managed route set it false.
+    public var requiresLoadResult = true
     private let autoFinish: Bool
 
     public init(providerID: String = "fake-llm", cooperative: Bool = true,
@@ -125,6 +129,8 @@ public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
             cont.resume(throwing: PlatformError(.cancelled))
         }
     }
+
+    public func requiresLoad(for profile: ModelProfile) -> Bool { requiresLoadResult }
 
     /// Release the first suspended call with a result.
     public func finishNext(result: ChatResult? = nil) {

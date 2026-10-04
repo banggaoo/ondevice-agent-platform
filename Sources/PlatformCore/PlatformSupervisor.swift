@@ -137,10 +137,10 @@ public actor PlatformSupervisor {
         modelProfiles.values.filter { $0.kind == kind }.sorted { $0.alias < $1.alias }
     }
 
-    /// Opt-in runtime Operator: the named alias must be an actual MLX route
-    /// with a live provider - the Operator is MLX-bound, and the CLI's chosen
-    /// default is the Qwen 4B route - verified here before the agent profile
-    /// registers, never assumed or fabricated.
+    /// Opt-in runtime Operator: the named alias must be an actual LLM route
+    /// on a locally served provider (owned open-weight MLX or the system
+    /// Apple Foundation Models route) with a live provider - verified here
+    /// before the agent profile registers, never assumed or fabricated.
     public func registerRuntimeOperator(modelAlias: String) async throws {
         guard !modelAlias.isEmpty else {
             throw PlatformError(.invalidRequest, detail: "operator model alias required")
@@ -148,10 +148,11 @@ public actor PlatformSupervisor {
         guard let profile = modelProfiles[modelAlias], profile.kind == .llm else {
             throw PlatformError(.notFound, detail: "operator model alias not registered")
         }
-        guard profile.providerID == MLXProviderContract.id,
+        guard profile.providerID == MLXProviderContract.id
+              || profile.providerID == AppleFoundationProvider.id,
               llmProviders[profile.providerID] != nil else {
             throw PlatformError(.providerUnavailable,
-                                detail: "operator requires the MLX route")
+                                detail: "operator requires the MLX or Apple route")
         }
         await agentService.registerRuntimeOperator(modelAlias: modelAlias)
     }

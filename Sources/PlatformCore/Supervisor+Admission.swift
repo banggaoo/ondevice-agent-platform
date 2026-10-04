@@ -78,7 +78,7 @@ extension PlatformSupervisor {
         // overrun the queue while storage awaits. With no dispatchable
         // slot (non-admit verdict or the active slot busy), only the
         // pending bound applies - deferred work cannot fill active+pending.
-        if dispatchableSlot() {
+        if dispatchableSlot(requiresLoad: workRequiresLoad(work)) {
             guard activeJobs.count + pendingJobs.count + insertionReservations
                     < PlatformLimits.activeInference + PlatformLimits.pendingInference else {
                 throw PlatformError(.capacityLimited, detail: "queue full")
@@ -117,7 +117,8 @@ extension PlatformSupervisor {
         }
         // Storage may have outlived a verdict change: with no dispatchable
         // slot the pending bound still applies to the inserted row.
-        if !dispatchableSlot(), pendingJobs.count >= PlatformLimits.pendingInference {
+        if !dispatchableSlot(requiresLoad: workRequiresLoad(work)),
+           pendingJobs.count >= PlatformLimits.pendingInference {
             var failed = job
             finishTerminal(&failed, .failed)
             throw PlatformError(.capacityLimited, detail: "queue full")
@@ -139,14 +140,29 @@ extension PlatformSupervisor {
         return "job-\(jobSequence)"
     }
 
-    /// Whether a newly queued job could consume a slot immediately: an
-    /// admit verdict, a free active slot, and no block. When false only
-    /// the pending bound applies - a deferred or busy queue cannot let
-    /// inserts sit over the pending cap.
-    private func dispatchableSlot() -> Bool {
+    /// Whether a newly queued job could consume a slot immediately: a
+    /// verdict that admits this work (admit always; defer_load only when
+    /// dispatching loads no weights), a free active slot, and no block.
+    /// When false only the pending bound applies - a deferred or busy
+    /// queue cannot let inserts sit over the pending cap.
+    private func dispatchableSlot(requiresLoad: Bool) -> Bool {
         guard !shuttingDown, !inferenceBlocked,
               activeJobs.count < PlatformLimits.activeInference else { return false }
-        return ResourcePolicy.evaluate(latestSnapshot, at: clock.now) == .admit
+        let verdict = ResourcePolicy.evaluate(latestSnapshot, at: clock.now)
+        return verdict == .admit || (verdict == .deferLoad && !requiresLoad)
+    }
+
+    /// Whether dispatching this work now would load model weights into
+    /// memory. `defer_load` defers exactly that cost; calls on an
+    /// already-resident container or a system-managed route hold none, so
+    /// they may run. Typed-ML jobs keep the conservative deferral.
+    private func workRequiresLoad(_ work: WorkItem) -> Bool {
+        switch work {
+        case .chat(_, let profile, let provider):
+            return provider.requiresLoad(for: profile)
+        case .predict:
+            return true
+        }
     }
 
     /// Round-robin across consumers with pending work, earliest job first.
@@ -160,12 +176,23 @@ extension PlatformSupervisor {
               !pendingJobs.isEmpty else { return }
         let now = clock.now
         let verdict = ResourcePolicy.evaluate(latestSnapshot, at: now)
-        guard verdict != .deferLoad else { return }
         let consumers = Array(Set(pendingJobs.map(\.consumerID))).sorted()
-        let chosen = consumers[nextConsumerIndex % consumers.count]
+        // Round-robin across consumers from the saved index. deferLoad
+        // defers weight loads only: a job that would load stays queued and
+        // dispatch moves on to the next consumer's candidate; jobs whose
+        // model is already resident or holds no platform weights dispatch.
+        var pickedIndex: Int?
+        for step in 0..<consumers.count {
+            let chosen = consumers[(nextConsumerIndex + step) % consumers.count]
+            guard let candidate = pendingJobs.firstIndex(where: { $0.consumerID == chosen }) else { continue }
+            let work = pendingWork[pendingJobs[candidate].id]
+            let loads = work.map(workRequiresLoad) ?? true
+            if verdict == .deferLoad, loads { continue }
+            pickedIndex = candidate
+            break
+        }
+        guard let index = pickedIndex else { return }
         nextConsumerIndex += 1
-        guard let index = pendingJobs.firstIndex(where: { $0.consumerID == chosen })
-                ?? pendingJobs.indices.first else { return }
         var job = pendingJobs.remove(at: index)
         guard let work = pendingWork.removeValue(forKey: job.id) else { return }
         // A request cancelled while queued never reaches the provider, even
@@ -182,7 +209,10 @@ extension PlatformSupervisor {
             finishTerminal(&job, .failed); resume(job.id, .failure(PlatformError(.forbidden)))
             return dispatch()
         }
-        guard verdict == .admit else {
+        // admit dispatches anything; deferLoad reaches here only for a
+        // no-load job (load-bearing candidates were filtered above);
+        // denyAndCancel fails the picked job truthfully.
+        guard verdict == .admit || (verdict == .deferLoad && !workRequiresLoad(work)) else {
             finishTerminal(&job, .failed); resume(job.id, .failure(PlatformError(.resourceDenied)))
             return dispatch()
         }

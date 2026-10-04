@@ -13,6 +13,12 @@ public protocol LLMProvider: Sendable {
     /// Cooperative cancellation hint; providers that cannot cancel simply
     /// finish and the scheduler keeps the slot until real completion.
     func cancel(jobID: String) async
+    /// Whether dispatching a call for this profile now would load model
+    /// weights into memory. The admission scheduler applies `defer_load`
+    /// truthfully: it queues load-bearing work under reduced conditions but
+    /// still dispatches calls whose model is already resident or holds no
+    /// platform-managed weights (e.g. the system Apple route).
+    func requiresLoad(for profile: ModelProfile) -> Bool
 }
 
 public protocol MLPredictor: Sendable {
@@ -25,6 +31,9 @@ public extension LLMProvider {
     /// Default: the provider accepts every shared-validated request.
     func validate(_ request: ChatRequest, profile: ModelProfile) throws {}
     func cancel(jobID: String) async {}
+    /// Conservative default: assume a call would load weights, so
+    /// `defer_load` keeps deferring providers that do not declare otherwise.
+    func requiresLoad(for profile: ModelProfile) -> Bool { true }
 }
 
 public extension MLPredictor {

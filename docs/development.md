@@ -438,9 +438,10 @@ not a claim that the native governor has admitted inference.
 The selected first Operator implementation is optional and runtime-only:
 
 - Public ACP profile `operator`, agent version 1, harness
-  `operator.runtime` version 1, bound model alias `qwen3.8-9b` (D51;
-  initially `qwen3-4b` before the user's 2026-10-05 correction), no tool
-  scope.
+  `operator.runtime` version 1; bound model alias defaults to
+  `apple-foundation-model` (D52) - the earlier `qwen3.8-9b` default (D51;
+  initially `qwen3-4b` before the user's 2026-10-05 correction) remains
+  selectable through `--operator-model`. No tool scope.
 - Code gathers one read-only platform snapshot and sends it with the user's
   question to the scoped shared model interface. One model call per turn,
   at most 512 requested output tokens, temperature zero.
@@ -769,3 +770,45 @@ under a real OS `warning` memory-pressure event (`dispatch_event`) on the
 unloaded fresh process - the host itself was under pressure; this is the
 governor, not a serving defect, and the earlier same-session 9B evidence
 stands.
+
+## Apple-bound Operator binding (2026-10-05)
+
+User instruction: "develop artemis operator agent, use apple foundation
+model as llm" (D52). `ServeCommand.operatorDefaultModelAlias` is now
+`apple-foundation-model`, and `PlatformSupervisor.registerRuntimeOperator`
+accepts either local route family - `AppleFoundationProvider.id` or
+`MLXProviderContract.id` - always verified against a live provider at
+registration. The CLI gate splits by route: the Apple alias requires
+`--enable-apple-model`; a registry alias still requires declared + LLM +
+MLX + >=512 output cap + pulled. `--operator-model qwen3.8-9b` keeps the
+explicit MLX binding. Harness, ACP profile, authority boundaries, and the
+512-token bounded call are unchanged - only the provider family widened
+and the default moved to the system route, which holds no
+platform-resident weights and so does not re-create the measured ~5 GB
+9B residency pressure problem on this 16 GB host.
+
+Tests: `RuntimeOperatorTests` gains `testAppleAliasRegistersPinnedOperator`
+(live fake apple-foundation-models provider -> pinned profile -> bounded
+call targets `apple-foundation-model`); the third-party-provider and
+no-provider rejections are unchanged. All 10 tests pass.
+
+Verification (native daemon, 2026-10-05): ACP stdio Operator turn
+produced real Apple Foundation Model text with `end_turn` (job-42,
+`local-agent`, parent `run-1`); console Operator prompt returned HTTP 200
+with `model: "apple-foundation-model"` and `end_turn`. Both turns ran
+while the governor held `defer_load` under fair thermal - made possible
+by the companion dispatch refinement below.
+
+deferLoad semantics refinement (same change): `defer_load` now defers
+exactly its namesake - model weight loads - instead of all queued work.
+`LLMProvider.requiresLoad(for:)` reports whether dispatching would load
+weights (Apple system route: never; MLX: only when no cached container
+and no load already in flight; default: true). Under fair thermal/low
+power, no-load jobs still dispatch while load-bearing jobs stay queued;
+`deny_and_cancel` is unchanged - it still fails everything. Verified
+live: with the daemon at `defer_load`, the Apple Operator turn completed
+while a queued `qwen3.8-9b` request (job-43, `local-model`) correctly
+remained deferred. Tests: `testDeferralDefersLoadsNotResidentCalls`
+(no-load dispatches under defer; load-bearing queues; admit releases it);
+the pre-existing defer/expiry tests hold because the default provider
+answer stays conservative.

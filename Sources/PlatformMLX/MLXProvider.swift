@@ -44,6 +44,18 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
 
     public var hasReadyArtifact: Bool { store.hasReadyArtifact }
 
+    /// A call loads weights only when no container is cached and no load is
+    /// already in flight; attaching to a pending load adds no second load.
+    /// An unresolvable artifact cannot load at all - the job dispatches and
+    /// fails truthfully rather than queuing under `defer_load` until expiry.
+    public func requiresLoad(for profile: ModelProfile) -> Bool {
+        guard let source = profile.source,
+              let dir = try? store.validatedDirectory(for: source) else { return false }
+        let key = dir.lastPathComponent
+        lock.lock(); defer { lock.unlock() }
+        return containers[key] == nil && pendingLoads[key] == nil
+    }
+
     public func artifactReady(for profile: ModelProfile) -> Bool? {
         guard profile.providerID == Self.id, let source = profile.source else { return false }
         return store.isReady(source: source)

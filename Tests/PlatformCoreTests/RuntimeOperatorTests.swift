@@ -90,6 +90,46 @@ final class RuntimeOperatorTests: XCTestCase {
         XCTAssertTrue(ids.contains("operator"))
     }
 
+    /// The Apple system route is a valid Operator binding: a live
+    /// `apple-foundation-models` provider registers the pinned profile, and
+    /// its harness sends the same bounded request to that alias.
+    func testAppleAliasRegistersPinnedOperator() async throws {
+        let stack = try await makeStack()
+        defer { stack.root.releaseLock() }
+        await registerStandardPrincipals(stack.supervisor)
+        let provider = FakeLLMProvider(providerID: AppleFoundationProvider.id,
+                                       content: "Runtime explanation.",
+                                       autoFinish: true)
+        await stack.supervisor.registerModel(
+            ModelProfile(alias: "apple-foundation-model",
+                         providerID: AppleFoundationProvider.id,
+                         kind: .llm, task: "chat", capabilities: ["text"]),
+            provider: provider)
+        try await stack.supervisor.registerRuntimeOperator(modelAlias: "apple-foundation-model")
+        let profile = await stack.supervisor.agentService.profile(id: "operator")
+        XCTAssertEqual(profile?.modelProfileAlias, "apple-foundation-model")
+
+        let session = try await stack.supervisor.agentService.newSession(
+            agentID: "operator", consumerID: agentPrincipal.id, connectionID: "k")
+        let harness = try await stack.supervisor.agentService.harness(for: session)
+        let token = CancellationToken()
+        let supervisor = stack.supervisor
+        let ctx = AgentContext(
+            sessionID: session.id, runID: "run-1",
+            statusSnapshot: { await supervisor.statusSnapshot() },
+            model: ModelClient { request in
+                try await supervisor.submitLLM(principal: agentPrincipal,
+                                               request: request, parentID: "run-1",
+                                               cancellation: token)
+            },
+            ml: MLClient { _ in throw PlatformError(.internal) },
+            isCancelled: { token.isCancelled })
+        let stop = await harness.run(
+            input: [.text("Explain runtime status.")], context: ctx, emit: { _ in })
+        XCTAssertEqual(stop, .endTurn)
+        XCTAssertEqual(provider.invocations.first?.model, "apple-foundation-model")
+    }
+
     func testNonMLXOrUnavailableAliasRejected() async throws {
         let (stack, _) = try await mlxStack()
         defer { stack.root.releaseLock() }
@@ -102,7 +142,8 @@ final class RuntimeOperatorTests: XCTestCase {
         try await expectPlatformError(.notFound) {
             try await stack.supervisor.registerRuntimeOperator(modelAlias: "test-ml")
         }
-        // LLM route on a non-MLX provider: the Operator is Qwen-backed only.
+        // LLM route on a third-party provider: the Operator binds only the
+        // local MLX or Apple system routes.
         let apple = FakeLLMProvider(providerID: "other-provider", autoFinish: true)
         await stack.supervisor.registerModel(
             ModelProfile(alias: "other-llm", providerID: "other-provider",
