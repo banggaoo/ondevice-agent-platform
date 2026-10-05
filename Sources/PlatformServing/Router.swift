@@ -10,8 +10,7 @@ public actor Router {
     private let acp: ACPService
     private let clock: Clock
     private let bridge: ConsoleOperatorBridge
-    private let expectedHost: String
-    private let expectedOrigin: String
+    private let port: UInt16
     private var consumerWindows: [String: [Date]] = [:]
     private var eventSubscribers = 0
 
@@ -25,13 +24,25 @@ public actor Router {
         self.bridge = ConsoleOperatorBridge(acp: acp, supervisor: supervisor,
                                             sessions: sessions, clock: clock,
                                             principal: consoleOperatorPrincipal)
-        self.expectedHost = "127.0.0.1:\(port)"
-        self.expectedOrigin = "http://127.0.0.1:\(port)"
+        self.port = port
+    }
+
+    /// The listener binds IPv4 loopback only, so the two reachable
+    /// spellings are `127.0.0.1` and `localhost` - both accepted; a
+    /// rebound DNS name still fails here before routing.
+    private func isValidHost(_ host: String?) -> Bool {
+        host == "127.0.0.1:\(port)" || host == "localhost:\(port)"
+    }
+
+    /// The page's expected Origin is whichever loopback name served it;
+    /// Host is already validated by handle() before this runs.
+    private func expectedOrigin(_ request: HTTPRequest) -> String {
+        "http://\(request.header("Host") ?? "")"
     }
 
     public func handle(_ request: HTTPRequest,
                        respond: @escaping @Sendable (HTTPResponse) -> Void) async {
-        guard request.header("Host") == expectedHost else {
+        guard isValidHost(request.header("Host")) else {
             respond(.error(PlatformError(.invalidRequest), status: 400))
             return
         }
@@ -64,7 +75,7 @@ public actor Router {
     /// A supplied Origin must be exact - a foreign or "null" value is a
     /// truthful 403; an absent header is a marker-free native caller.
     private func requireOrigin(_ request: HTTPRequest) throws {
-        if let origin = request.header("Origin"), origin != expectedOrigin {
+        if let origin = request.header("Origin"), origin != expectedOrigin(request) {
             throw PlatformError(.forbidden)
         }
     }
@@ -73,7 +84,7 @@ public actor Router {
     /// explicit exact Origin; an absent header cannot be distinguished
     /// from a cross-site form post.
     private func requireExactOrigin(_ request: HTTPRequest) throws {
-        guard request.header("Origin") == expectedOrigin else {
+        guard request.header("Origin") == expectedOrigin(request) else {
             throw PlatformError(.forbidden)
         }
     }

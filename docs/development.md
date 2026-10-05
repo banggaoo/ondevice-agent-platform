@@ -812,3 +812,14 @@ remained deferred. Tests: `testDeferralDefersLoadsNotResidentCalls`
 (no-load dispatches under defer; load-bearing queues; admit releases it);
 the pre-existing defer/expiry tests hold because the default provider
 answer stays conservative.
+
+Console loopback hostnames (2026-10-05): the router's Host gate and
+expected-Origin check were hardcoded to `127.0.0.1:PORT`, so the console
+served only under that spelling - `http://localhost:PORT` returned 400 on
+every request including the page itself ("console not working, no
+information"). The listener binds IPv4 loopback only, so the reachable
+spellings are exactly `127.0.0.1:PORT` and `localhost:PORT`; the Host
+gate now accepts both and the expected Origin is derived from the served
+Host, so a rebound DNS name still fails before routing.
+`testLoopbackHostSpellingsAcceptedForeignRefused` covers both spellings
+plus a foreign-host refusal.

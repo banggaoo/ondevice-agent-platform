@@ -59,12 +59,13 @@ final class HTTPIntegrationTests: XCTestCase {
     private static func request(_ s: Server, _ path: String, method: String = "GET",
                          token: String? = nil, cookie: String? = nil,
                          origin: String? = nil, csrf: String? = nil,
-                         fetchSite: String? = nil,
+                         fetchSite: String? = nil, host: String? = nil,
                          json: JSONValue? = nil) -> URLRequest {
         let url = path.isEmpty ? s.base
             : URL(string: s.base.absoluteString + "/" + path)!
         var r = URLRequest(url: url)
         r.httpMethod = method
+        if let host { r.setValue(host, forHTTPHeaderField: "Host") }
         if let token { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let cookie { r.setValue(cookie, forHTTPHeaderField: "Cookie") }
         if let origin { r.setValue(origin, forHTTPHeaderField: "Origin") }
@@ -123,6 +124,29 @@ final class HTTPIntegrationTests: XCTestCase {
         try await expectEqual(try await Self.status(s, Self.request(s, "app.js")).0, 200)
         try await expectEqual(try await Self.status(s, Self.request(s, "..%2Fetc%2Fpasswd")).0, 404)
         try await expectEqual(try await Self.status(s, Self.request(s, "etc/passwd")).0, 404)
+    }
+
+    /// The console serves under either loopback spelling: `localhost`
+    /// works end-to-end (page, bootstrap Origin, admin reads) while a
+    /// rebound foreign hostname is refused at the Host gate.
+    func testLoopbackHostSpellingsAcceptedForeignRefused() async throws {
+        let s = try await startServer()
+        defer { s.stop() }
+        let localHost = "localhost:\(s.port)"
+        try await expectEqual(
+            try await Self.status(s, Self.request(s, "", host: localHost)).0, 200)
+        let (code, body, _) = try await Self.status(s, Self.request(
+            s, "api/session", method: "POST",
+            origin: "http://\(localHost)", host: localHost, json: .object([:])))
+        XCTAssertEqual(code, 200)
+        XCTAssertNotNil(body?.objectValue?["csrf"])
+        try await expectEqual(
+            try await Self.status(s, Self.request(s, "api/status", host: localHost)).0, 200)
+        // A rebound DNS name never reaches routing.
+        try await expectEqual(try await Self.status(
+            s, Self.request(s, "", host: "evil.local:\(s.port)")).0, 400)
+        try await expectEqual(try await Self.status(
+            s, Self.request(s, "api/status", host: "evil.local:\(s.port)")).0, 400)
     }
 
     // MARK: automatic session bootstrap
