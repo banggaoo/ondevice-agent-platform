@@ -1,9 +1,10 @@
 # OpenCode consumer qualification
 
-Status: request surface and a bounded native text turn verified,
-2026-10-05. Tool execution, multiturn coding, and broader client qualification
-remain open gates. OpenCode is an external model consumer alongside ARTEMIS,
-not an automation backend invoked by this platform.
+Status: request surface, a bounded native text turn, and a real
+tool-call agent loop verified, 2026-10-05. Multiturn coding quality and
+broader client qualification remain open gates. OpenCode is an external
+model consumer alongside ARTEMIS, not an automation backend invoked by
+this platform.
 
 ## Observed installation
 
@@ -78,10 +79,19 @@ excluded from that receipt.
 3. Verify function-tool declarations, assistant call identifiers and JSON
    arguments, and matching tool-result history on a declared tool-capable
    model. Refuse unsupported choices or constraints rather than ignoring
-   them. **Software contract covered, live model/consumer gate open** -
-   adapter/parser and MLX mapping tests cover
+   them. **Done 2026-10-05** - adapter/parser and MLX mapping tests cover
    declaration, emission, correlation, and refusal (undeclared names,
-   duplicate calls, strict schemas, Apple provider tool surface).
+   duplicate calls, strict schemas, Apple provider tool surface). Live
+   consumer evidence: `opencode run -m ondevice/qwen-vl` on the native
+   daemon produced a real assistant `tool_call` (glob), which OpenCode
+   executed itself, returned as a `tool` message, and the model answered
+   with a final natural-language response (exit 0). A second run emitted
+   a `read` tool call that dispatched immediately under `defer_load`
+   because the resident container reports `requiresLoad: false`; the call
+   was refused only by OpenCode's own external-directory permission.
+   Tool-call quality on the 2B route is a model-capability limit (it
+   sometimes selects `glob` where `read` is correct), not a serving
+   defect.
 4. Run bounded real local inference through the native governor once native
    admission is healthy. **Partially done 2026-10-04** - the gated
    `testLiveCachedTextCompletions` ran real generation through `submitLLM`
@@ -114,7 +124,16 @@ excluded from that receipt.
    completion as LLM job 6 under consumer `local-model`. This proves one
    bounded text turn only - tool execution and multiturn/coding-task
    qualification remain open, and this is not blanket OpenCode
-   compatibility.
+   compatibility. **Extended 2026-10-05 (same day, later session)** -
+   `qwen-vl` completed a real multi-call tool turn (see gate 3), the
+   client surfaced truthful `invalid_request` (a `max_tokens` 4096
+   request against the 1024-cap VL profile - client config corrected to
+   1024) and `resource_denied` errors, and `activeInference: 1` was
+   observed serving a `qwen3.8-9b` turn from the user's interactive
+   OpenCode session. Coding-task quality and long-session stability are
+   still unmeasured; per-profile `limit.output` must match the declared
+   registry caps (the platform refuses over-cap requests rather than
+   truncating them).
 
 ## Normal Runtime
 
@@ -147,3 +166,81 @@ relying on the earlier controlled-resource Operator tests.
 
 Strict JSON output, arbitrary tool execution, OpenCode's external providers,
 and full coding-task success are not established by this contract record.
+
+## Integration guide (reconnecting any OpenCode install)
+
+OpenCode is never patched or vendored; the platform speaks its stock
+OpenAI-compatible surface. To integrate a fresh OpenCode install, only
+the client configuration is needed - the daemon keeps its own state.
+
+1. Run the platform (it is a long-lived process; nothing auto-starts it):
+
+   ```bash
+   swift build
+   .build/debug/ondevice-agent-platform serve \
+     --data-root ~/.ondevice-agent-platform --port 8080 \
+     --enable-apple-model --enable-reference-agent --enable-operator
+   ```
+
+   The data root already holds `registry.json` and the pulled artifacts.
+   Verify readiness: `GET /v1/models` lists `qwen3.8-9b`, `qwen-vl`, and
+   `apple-foundation-model`, and `GET /api/status` reports `admission:
+   admit` (a `deny_and_cancel`/`defer_load` verdict is the host's real
+   resource state, not a config problem - see the resource notes below).
+
+2. Create `~/.config/opencode/opencode.json`:
+
+   ```json
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "provider": {
+       "ondevice": {
+         "npm": "@ai-sdk/openai-compatible",
+         "name": "OnDevice Agent Platform",
+         "options": {
+           "baseURL": "http://127.0.0.1:8080/v1",
+           "apiKey": "{file:~/.config/opencode/ondevice.token}"
+         },
+         "models": {
+           "qwen3.8-9b": { "name": "Qwen3.8 9B Distill 4bit (MLX)",
+             "limit": { "context": 32768, "output": 4096 } },
+           "qwen-vl": { "name": "Qwen3 VL 2B (MLX)",
+             "limit": { "context": 32768, "output": 1024 } },
+           "apple-foundation-model": { "name": "Apple Foundation Models",
+             "limit": { "context": 4096, "output": 512 } }
+         }
+       }
+     },
+     "model": "ondevice/qwen3.8-9b"
+   }
+   ```
+
+   `limit.output` must not exceed the registry's `maxOutputTokens` per
+   alias (qwen3.8-9b 4096, qwen-vl 1024, apple-foundation-model 512) -
+   the platform refuses over-cap requests as `invalid_request` rather
+   than truncating. Under D50 the daemon ignores `Authorization`; the
+   referenced token file only needs to exist for `{file:...}`
+   interpolation (e.g. `printf 'local' > ~/.config/opencode/ondevice.token`,
+   mode 600). Do not store real credentials there.
+
+3. Use it: `opencode` (TUI), `opencode run "..."`, `opencode run -m
+   ondevice/qwen-vl "..."` to select a lighter route.
+
+Notes and limits:
+
+- `apple-foundation-model` truthfully refuses `tools`; it can serve
+  plain text turns but cannot drive OpenCode's tool agent loop. Use the
+  MLX routes for agent work.
+- `resource_denied` means the host is under real memory pressure or
+  serious thermal (check `/api/status`); `deadline_exceeded` after ~60 s
+  means a queued request never reached an `admit` window under
+  `defer_load`. Both are the governor telling the truth, not client or
+  serving defects - free memory or wait for the OS to emit a `normal`
+  pressure event.
+- The ~5 GB `qwen3.8-9b` weights contend with other apps on a 16 GB
+  host; the daemon sheds caches on pressure escalation (verified live:
+  RSS returned to ~0.1 GB) so pressure can recover, then reloads on the
+  next admitted request.
+- OpenCode owns tool execution and permissions; an `external_directory`
+  rejection on absolute paths outside the workspace is client-side and
+  expected in non-interactive runs.

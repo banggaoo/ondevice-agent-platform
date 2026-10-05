@@ -6,7 +6,7 @@ Status: v0.3 discussion draft, verified 2026-10-03. This is documentation only. 
 
 ## Source identity
 
-The existing checkout at `artemis/` reports clean working-tree status and commit `351ca8422f7b5b54e80a9c1ce03a222e02415b6b` (2026-09-29 UTC). Its origin is [banggaoo/artemis](https://github.com/banggaoo/artemis), the user's fork. The same SHA was independently returned by Google's public main-branch metadata during this review. Evidence links below pin [google/artemis at that commit](https://github.com/google/artemis/tree/351ca8422f7b5b54e80a9c1ce03a222e02415b6b); future source changes require a fresh audit.
+The audited checkout reported clean working-tree status at commit `351ca8422f7b5b54e80a9c1ce03a222e02415b6b` (2026-09-29 UTC). The in-repo copy at `artemis/` was removed 2026-10-05 - ARTEMIS is not part of this project. The canonical checkout is the standalone repository at `~/Development/artemis/artemis`, whose HEAD is 16 commits ahead of and a descendant of the pinned commit. Its origin is [banggaoo/artemis](https://github.com/banggaoo/artemis), the user's fork. The same SHA was independently returned by Google's public main-branch metadata during this review. Evidence links below pin [google/artemis at that commit](https://github.com/google/artemis/tree/351ca8422f7b5b54e80a9c1ce03a222e02415b6b); future source changes require a fresh audit.
 
 The locked dependencies include `langchain-openai` 1.5.2 and `openai` 3.3.0. Their presence does not establish installed versions or wire behavior. [Dependency lock](https://github.com/google/artemis/blob/351ca8422f7b5b54e80a9c1ce03a222e02415b6b/uv.lock).
 

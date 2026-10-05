@@ -593,8 +593,9 @@ refusal for Apple-provider tools. A real `stream: true` inference
 request was admitted to the queue and, under sustained `thermal: fair`
 on a heavily loaded host, deferred for the full 60 s queue deadline and
 expired as `deadline_exceeded` - the deferral working as designed, not
-an adapter failure. Live MLX generation under `admit` and the OpenCode
-client run remain open gates (opencode-qualification.md gates 4-5).
+an adapter failure. (Subsequently closed: gated live MLX generation
+under `admit` and real OpenCode tool-call turns on `qwen-vl` verified
+2026-10-05 - opencode-qualification.md gates 3-5.)
 
 ## Final software gate and deployment state (2026-10-05, credential-era record)
 

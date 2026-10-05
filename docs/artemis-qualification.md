@@ -1,13 +1,17 @@
 # ARTEMIS contract qualification
 
-**Status:** source audit against the pinned local checkout (`artemis/`),
-plus live endpoint verification on this platform, 2026-10-04. ARTEMIS is a
-consumer only - no ARTEMIS code is modified, vendored, or invoked by the
-platform.
+**Status:** source audit against pinned commit `351ca84` (see
+artemis-integration.md Source identity), plus live endpoint verification
+on this platform, 2026-10-04. ARTEMIS is an external consumer only - no
+ARTEMIS code is modified, vendored, or invoked by the platform. The
+temporary in-repo checkout at `artemis/` was removed 2026-10-05; the
+canonical working tree is the standalone repository under
+`~/Development/artemis`.
 
 ## What ARTEMIS actually sends
 
-Audited `artemis/artemis/llm/router.py` and the agent/tool call sites:
+Audited `artemis/artemis/llm/router.py` at the pinned commit and the
+agent/tool call sites:
 
 - **Transport:** LangChain `ChatOpenAI` → `POST {base_url}/chat/completions`
   with `Authorization: Bearer <key>`, `model`, `temperature`, `max_tokens`,
