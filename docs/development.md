@@ -254,6 +254,18 @@ arbitrary paths, and a directory without a complete verified manifest is
 never treated as ready. `RuntimeRoot` now owns `models/` in its
 allowed-names set.
 
+First-run bootstrap is a `setup` CLI command, not an installer script.
+It prepares the data root and offers a code-owned curated catalog
+(`ModelCatalog` in PlatformCore) - currently `qwen3.8-9b` and `qwen-vl`,
+the two routes verified live on this host. Interactive terminals get a
+numbered menu; `--models`/`--all`/`--none` cover scripts. Selection
+writes declarations through `ModelCatalog.mergedRegistry`, which
+replaces same-alias entries, preserves unrelated declarations, and
+re-validates the merged result through `ModelRegistry.parse` before
+writing - a malformed existing registry fails loudly rather than being
+repaired. `--pull` (or the interactive prompt) runs the same governed
+`model pull` path; declaration alone never downloads.
+
 `MLXProvider` implements `LLMProvider` behind the same seam as the Apple
 route: identical message mapping (system/developer -> instructions,
 ordered history, final nonempty user turn), `GenerateParameters.maxTokens`

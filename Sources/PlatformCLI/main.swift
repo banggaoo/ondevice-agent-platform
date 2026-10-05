@@ -10,6 +10,7 @@ func printUsage() {
     ondevice-agent-platform - local model and agent serving platform
 
     Usage:
+      ondevice-agent-platform setup [--data-root PATH] [--models ALIAS[,...] | --all | --none] [--pull]
       ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]
       ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
       ondevice-agent-platform model pull|list|remove [--alias ALIAS | --repo ORG/NAME --revision REV] [--data-root PATH]
@@ -35,6 +36,10 @@ guard let command = args.first, !command.hasPrefix("-") || command == "--help" e
 switch command {
 case "--help", "help":
     printUsage()
+case "setup":
+    do { try await SetupCommand.run(args: Array(args.dropFirst())) }
+    catch let e as PlatformError { fatalError("setup failed: \(e.safeMessage)") }
+    catch { fatalError("setup failed: internal error") }
 case "serve":
     do { try await ServeCommand.run(args: Array(args.dropFirst())) }
     catch let e as PlatformError { fatalError("serve failed: \(e.safeMessage)") }

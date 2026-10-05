@@ -17,6 +17,7 @@ swift test                                   # run the full software-contract su
 Commands:
 
 ```sh
+ondevice-agent-platform setup [--data-root PATH] [--models ALIAS[,...] | --all | --none] [--pull]
 ondevice-agent-platform serve [--data-root PATH] [--port PORT] [--enable-reference-agent] [--enable-apple-model] [--enable-operator [--operator-model ALIAS]]
 ondevice-agent-platform acp --agent AGENT_ID [--data-root PATH]
 ondevice-agent-platform model pull --alias ALIAS | --repo ORG/NAME --revision REV [--data-root PATH]
@@ -26,13 +27,14 @@ ondevice-agent-platform model remove --alias ALIAS [--data-root PATH]
 
 - The platform is trusted-local single-user software (D50): it issues no API access tokens and stores no credentials or Keychain items. `serve` starts on a fresh root with no bootstrap step; every loopback route runs under a fixed code-owned consumer principal whose scope stays an internal permission. An incoming `Authorization` header is ignored for SDK compatibility - it selects no principal and bypasses no guard.
 - `serve` binds loopback only (default 127.0.0.1:8080) and writes a nonsecret `daemon.json` marker under the data root (default `~/.ondevice-agent-platform`).
+- `setup` is the optional first-run bootstrap: it prepares the data root and declares chosen models in `registry.json` from a curated code-owned catalog (`ModelCatalog`). On an interactive terminal it prints a numbered menu; `--models a,b` / `--all` / `--none` serve scripts, and `--pull` runs the governed download immediately. Declaring and pulling stay separate acts - setup never downloads without `--pull` or an explicit prompt answer.
 - `model pull` is the only acquisition path: it downloads a registry-declared (or explicit repo+revision) artifact from Hugging Face into `<data-root>/models/` with staging, per-file size checks, and LFS sha256 verification recorded in a manifest. Inference never downloads; a declared-but-unpulled model serves truthful provider-unavailable.
 - `acp` is a stdio facade that forwards JSON-RPC to the running daemon's private bridge; it never starts a second core.
 - The console is a loopback development surface: opening the served page in a browser needs no command or token - it bootstraps a local cookie session automatically. It shows five views - Overview (real resource fields with labeled pressure provenance, the evaluated admission verdict, occupied slots, provider categories), Models (declared profiles and readiness; artifacts are governed through `model pull`/`list`/`remove`, never the page), History (jobs with scoped stop controls), Train (explicitly unavailable), and Chat (the opt-in read-only runtime Operator only - one bounded call per question, no conversation memory, no applied actions). Stopping a question cancels only that turn through the request's own cancellation token; console bindings commit only after re-validating the live session, so a logged-out or expired cookie cannot resurrect one. Automatic bootstrap trusts local users and processes: localhost alone is not identity authentication, and exact same-origin plus CSRF checks protect browser mutations rather than isolating the daemon from other local programs. `Secure` cookies are not possible on plain HTTP, so this is not hardened for distribution.
 
 ## Explicit limits of this increment
 
-- The model registry starts empty: OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
+- The model registry starts empty unless the owner runs `setup` (or writes `registry.json` directly): OpenAI and typed-ML endpoints return truthful 404/503, and administration works with zero providers.
 - `serve --enable-apple-model` (or the `enableAppleModel` config key) registers the `apple-foundation-model` alias with the real provider only when `SystemLanguageModel.default.availability` reports available; otherwise the alias serves truthful provider-unavailable rather than fabricating a route.
 - `registry.json` accepts `provider: "mlx"` LLM entries with a pinned `source` (`repo` + `revision`); `serve` registers them behind the shared MLX provider, and a pulled, verified artifact makes them executable. `"capabilities": ["vision"]` marks an alias image-capable; image requests to text-only aliases are refused at admission. Verified live on this host: `nvythong/Qwen3.8-9B-Distill-mlx-4Bit` (Operator binding; native completions + ACP/console turns) and `mlx-community/Qwen3-VL-2B-Instruct-4bit` (live vision completion).
 - `serve --enable-reference-agent` installs the deterministic `reference.status` harness plus the bounded single-call `reference.echo` model-step harness when a declared model alias exists (currently the Apple opt-in). There is no general tool execution.

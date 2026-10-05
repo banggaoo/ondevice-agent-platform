@@ -123,7 +123,7 @@ enum ModelCommand {
 
 /// Lock-confined percent reporter for pull progress on stderr; the hub calls
 /// back on a @Sendable path so plain captured state is not allowed.
-private final class ProgressReporter: @unchecked Sendable {
+final class ProgressReporter: @unchecked Sendable {
     private var last = -1
     private let lock = NSLock()
 
