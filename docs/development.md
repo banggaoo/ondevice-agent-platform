@@ -823,3 +823,24 @@ gate now accepts both and the expected Origin is derived from the served
 Host, so a rebound DNS name still fails before routing.
 `testLoopbackHostSpellingsAcceptedForeignRefused` covers both spellings
 plus a foreign-host refusal.
+
+Model cache lifecycle (2026-10-05): resident weight containers were
+previously pinned for the daemon's life - on this 16 GB host a loaded
+9B kept the OS at `warning` pressure and the governor at
+`deny_and_cancel` until a restart (measured above). Two truthful
+shedding paths now bound residency, via the `ModelCacheEvicting`
+provider seam: (1) on a `deny_and_cancel` verdict the supervisor drops
+every resident container alongside child cancellation, so pressure can
+recover; (2) every snapshot also trims containers idle past
+`PlatformLimits.modelIdleSeconds` (600 s - a conservative bound, not a
+latency claim). A load completing after an eviction does not re-cache
+(epoch guard); an in-flight generation keeps its own container
+reference and finishes or surfaces cancellation. Verified live: a
+cancelled mid-load 9B left the daemon at 0.01 GB resident (previously
+~7.3 GB) with instant admission recovery. `requiresLoad` reverts to
+true after eviction, so `defer_load` again defers that model's next
+call until thermal allows a reload. Tests:
+`testPressureEscalationShedsModelCaches` (shed on deny, trim on
+healthy push). An idle-TTL bound rather than LRU/eviction-on-write is
+deliberate: the single inference slot makes ordering trivial and keeps
+warm reload behavior predictable for interactive use.

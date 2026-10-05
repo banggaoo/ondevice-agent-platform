@@ -22,7 +22,8 @@ import Tokenizers
 /// `.toolCall` events are returned to the caller verbatim - the provider
 /// executes nothing. `maxTokens` is the request's output bound; unset
 /// sampling hints mean the platform default, greedy.
-public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Sendable {
+public final class MLXProvider: LLMProvider, ProviderReadiness, ModelCacheEvicting,
+                                @unchecked Sendable {
     public static let id = MLXProviderContract.id
     public let providerID = MLXProviderContract.id
 
@@ -31,9 +32,15 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
     public let store: ModelStore
     private let lock = NSLock()
     /// Loaded containers keyed by store directory name; models load lazily on
-    /// first use (inside admission) and stay resident for the daemon's life.
+    /// first use (inside admission) and are released on pressure escalation
+    /// or idle expiry via `ModelCacheEvicting`.
     private var containers: [String: ModelContainer] = [:]
     private var pendingLoads: [String: Task<ModelContainer, Error>] = [:]
+    /// Last-dispatch stamp per container key, for idle eviction.
+    private var lastUsedAt: [String: Date] = [:]
+    /// Bumped by evictions: a load that completes after an eviction does
+    /// not re-cache the container it fetched for already-shed work.
+    private var evictionEpoch = 0
     /// Single in-flight generation (admission is single-slot); cancel() hints
     /// it via task cancellation which terminates the stream cooperatively.
     private var inFlight: Task<ChatResult, Error>?
@@ -56,6 +63,34 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
         return containers[key] == nil && pendingLoads[key] == nil
     }
 
+    /// Pressure response: drop every cached container. A load completing
+    /// after this call sees a bumped epoch and is not re-cached; an
+    /// in-flight generation keeps its own reference and finishes.
+    @discardableResult
+    public func evictResident() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        evictionEpoch += 1
+        let count = containers.count
+        containers.removeAll()
+        lastUsedAt.removeAll()
+        return count
+    }
+
+    /// Idle trim: release containers unused since `cutoff`. Keys with a
+    /// load still in flight are untouched - their finishing request is a
+    /// live use, not idleness.
+    @discardableResult
+    public func evictIdle(olderThan cutoff: Date) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var released = 0
+        for (key, used) in lastUsedAt where used < cutoff {
+            guard pendingLoads[key] == nil else { continue }
+            if containers.removeValue(forKey: key) != nil { released += 1 }
+            lastUsedAt.removeValue(forKey: key)
+        }
+        return released
+    }
+
     public func artifactReady(for profile: ModelProfile) -> Bool? {
         guard profile.providerID == Self.id, let source = profile.source else { return false }
         return store.isReady(source: source)
@@ -65,6 +100,15 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
     private func cached(_ key: String) -> ModelContainer? {
         lock.lock(); defer { lock.unlock() }
         return containers[key]
+    }
+
+    private func touchUsed(_ key: String) {
+        lock.lock(); lastUsedAt[key] = Date(); lock.unlock()
+    }
+
+    private func currentEpoch() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return evictionEpoch
     }
 
     private func pending(_ key: String) -> Task<ModelContainer, Error>? {
@@ -77,10 +121,13 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
     }
 
     private func untrackLoad(_ key: String, _ task: Task<ModelContainer, Error>,
-                             result: ModelContainer?) {
+                             result: ModelContainer?, epoch: Int) {
         lock.lock()
         if pendingLoads[key] == task { pendingLoads[key] = nil }
-        if let result { containers[key] = result }
+        if let result, epoch == evictionEpoch {
+            containers[key] = result
+            lastUsedAt[key] = Date()
+        }
         lock.unlock()
     }
 
@@ -100,18 +147,22 @@ public final class MLXProvider: LLMProvider, ProviderReadiness, @unchecked Senda
     private func container(for source: ModelSource) async throws -> ModelContainer {
         let dir = try store.validatedDirectory(for: source)
         let key = dir.lastPathComponent
-        if let cached = cached(key) { return cached }
+        if let cached = cached(key) {
+            touchUsed(key)
+            return cached
+        }
         if let pending = pending(key) { return try await pending.value }
         let task = Task<ModelContainer, Error> {
             try await loadModelContainer(from: dir, using: AutoTokenizerLoader())
         }
+        let epoch = currentEpoch()
         trackLoad(key, task)
         do {
             let container = try await task.value
-            untrackLoad(key, task, result: container)
+            untrackLoad(key, task, result: container, epoch: epoch)
             return container
         } catch {
-            untrackLoad(key, task, result: nil)
+            untrackLoad(key, task, result: nil, epoch: epoch)
             throw error
         }
     }

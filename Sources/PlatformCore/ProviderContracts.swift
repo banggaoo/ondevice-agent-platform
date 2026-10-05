@@ -47,6 +47,21 @@ public enum MLXProviderContract {
     public static let id = "mlx"
 }
 
+/// Optional weight-cache shedding for providers that hold resident
+/// artifacts. The supervisor sheds caches when the resource verdict
+/// escalates to `deny_and_cancel` (a warning-pressure or serious-thermal
+/// snapshot means the host needs memory back) and trims containers idle
+/// past `PlatformLimits.modelIdleSeconds` on every snapshot, so a loaded
+/// model cannot pin the host indefinitely. In-flight calls keep their own
+/// container references and finish or surface cancellation - eviction is
+/// cache release, never job termination.
+public protocol ModelCacheEvicting: Sendable {
+    /// Drop every resident container. Returns the count released.
+    @discardableResult func evictResident() -> Int
+    /// Drop containers unused since `cutoff`. Returns the count released.
+    @discardableResult func evictIdle(olderThan cutoff: Date) -> Int
+}
+
 /// Optional readiness reporting for providers whose weights are external
 /// artifacts. The supervisor uses it to report truthful category status:
 /// a registered provider with no usable artifact is `observing`, not

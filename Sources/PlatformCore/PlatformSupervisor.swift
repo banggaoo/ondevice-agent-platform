@@ -281,6 +281,18 @@ public actor PlatformSupervisor {
         latestSnapshot = snapshot
         if ResourcePolicy.evaluate(snapshot, at: clock.now) == .denyAndCancel {
             cancelChildrenForResourceDenial()
+            // The host needs memory back: shed resident weight caches so
+            // pressure can actually recover instead of staying denied.
+            for provider in llmProviders.values {
+                (provider as? ModelCacheEvicting)?.evictResident()
+            }
+        } else {
+            // Idle trim on every snapshot: a model unused past the bound
+            // releases its memory; the next request reloads on demand.
+            let cutoff = clock.now.addingTimeInterval(-PlatformLimits.modelIdleSeconds)
+            for provider in llmProviders.values {
+                (provider as? ModelCacheEvicting)?.evictIdle(olderThan: cutoff)
+            }
         }
         dispatch()
     }

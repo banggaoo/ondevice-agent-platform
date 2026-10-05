@@ -17,6 +17,10 @@ public enum PlatformLimits {
     public static let cancellationGraceSeconds: TimeInterval = 5
     public static let resourceSampleSeconds: TimeInterval = 1
     public static let resourceMaxAgeSeconds: TimeInterval = 5
+    /// A loaded model container unused for this long is released so its
+    /// memory returns to the host; the next request reloads on demand.
+    /// Conservative residency bound, not a latency claim.
+    public static let modelIdleSeconds: TimeInterval = 600
     /// Global ceiling and default for one completion; per-profile
     /// `maxOutputTokens` caps lower. Agentic clients need multi-KB edits.
     public static let outputTokens = 8_192

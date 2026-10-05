@@ -5,12 +5,17 @@ import PlatformCore
 /// releases it; cancellation semantics are switchable to model cooperative
 /// and noncooperative providers. Never advertised as a runtime provider.
 /// Locking happens only inside synchronous helpers.
-public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
+public final class FakeLLMProvider: LLMProvider, ModelCacheEvicting, @unchecked Sendable {
     public let providerID: String
     private let lock = NSLock()
     private var invocationsStore: [ChatRequest] = []
     private var gates: [(String, CheckedContinuation<ChatResult, Error>)] = []
     private var cancelledStore: [String] = []
+    /// ModelCacheEvicting counters: the fake holds no real caches but
+    /// records supervisor eviction calls so tests can observe escalation.
+    public private(set) var evictResidentCalls = 0
+    public private(set) var evictIdleCalls = 0
+    public private(set) var lastEvictIdleCutoff: Date?
     /// When true, `cancel` releases suspended calls as cancelled.
     public var cooperative: Bool
     /// Result used for every released/immediate call.
@@ -131,6 +136,21 @@ public final class FakeLLMProvider: LLMProvider, @unchecked Sendable {
     }
 
     public func requiresLoad(for profile: ModelProfile) -> Bool { requiresLoadResult }
+
+    @discardableResult
+    public func evictResident() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        evictResidentCalls += 1
+        return 0
+    }
+
+    @discardableResult
+    public func evictIdle(olderThan cutoff: Date) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        evictIdleCalls += 1
+        lastEvictIdleCutoff = cutoff
+        return 0
+    }
 
     /// Release the first suspended call with a result.
     public func finishNext(result: ChatResult? = nil) {

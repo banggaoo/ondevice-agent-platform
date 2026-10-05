@@ -302,6 +302,40 @@ final class MLAndResourceTests: XCTestCase {
         XCTAssertEqual(loading.invocations.count, 1)
     }
 
+    /// A deny verdict sheds resident model caches so the host can recover,
+    /// while ordinary snapshots run the idle trim instead - the provider's
+    /// cache policy is never the caller's concern.
+    func testPressureEscalationShedsModelCaches() async throws {
+        let clock = ManualClock()
+        let resources = FakeResourceSource(
+            ResourceSnapshot(thermal: .nominal, memoryPressure: .normal,
+                             lowPowerMode: false, capturedAt: clock.now))
+        let root = try preparedRoot(tempRootURL())
+        defer { root.releaseLock() }
+        let supervisor = PlatformSupervisor(
+            root: root,
+            resourceSource: resources, clock: clock.clock)
+        try await supervisor.start()
+        let provider = FakeLLMProvider(autoFinish: true)
+        await supervisor.registerModel(
+            ModelProfile(alias: "m", providerID: "fake-llm", kind: .llm, task: "chat"),
+            provider: provider)
+        await supervisor.registerPrincipal(modelPrincipal)
+
+        // A healthy push runs the idle trim, never the shed.
+        resources.push(ResourceSnapshot(thermal: .nominal, memoryPressure: .normal,
+                                        lowPowerMode: false, capturedAt: clock.now))
+        try await expectTrue(await pollUntil { provider.evictIdleCalls >= 1 },
+                             "snapshot should run idle trim")
+        XCTAssertEqual(provider.evictResidentCalls, 0)
+
+        // Warning pressure escalates: children cancel AND caches shed.
+        resources.push(ResourceSnapshot(thermal: .nominal, memoryPressure: .warning,
+                                        lowPowerMode: false, capturedAt: clock.now))
+        try await expectTrue(await pollUntil { provider.evictResidentCalls == 1 },
+                             "deny verdict should shed resident caches")
+    }
+
     func testUnhealthySnapshotDeniesNewInference() async throws {
         let clock = ManualClock()
         let resources = FakeResourceSource(
