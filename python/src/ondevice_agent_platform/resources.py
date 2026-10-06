@@ -133,7 +133,8 @@ def _sample_linux() -> tuple:
             available = int(line.split()[1]) * 1024
     pressure = (_pressure_from_ratio(available, total)
                 if total else MemoryPressureLevel.UNKNOWN)
-    source = MemoryPressureSource.ESTIMATE
+    source = (MemoryPressureSource.ESTIMATE if total
+              else MemoryPressureSource.UNAVAILABLE)
     # cgroup v2: when the container limit is the real constraint.
     cg_max = _read_file("/sys/fs/cgroup/memory.max")
     cg_cur = _read_file("/sys/fs/cgroup/memory.current")
