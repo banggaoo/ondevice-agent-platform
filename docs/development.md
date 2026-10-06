@@ -900,7 +900,15 @@ OAP_VLLM_MLX) or the pulled artifact is absent. Deliberately not
 curated into the setup catalog: per the measured-evidence rule it
 needs an on-host benchmark vs the direct mlx route (prefix-cache TTFT
 on repeated agent-loop contexts vs ~25 extra runtime dependencies)
-before a recommendation. Claims check vs the circulating proposal:
+before a recommendation. Measured 2026-10-06 (Qwen3.8-9B, 16GB host):
+decode ~17-19 tok/s on all three routes, but a ~5.8K-token agent-loop
+prefix costs 40-80s on EVERY turn for both mlx routes - vllm-mlx routes
+this artifact through its uncached MLLM text path and mlx-lm has no
+prefix cache - while llama.cpp's slot context-reuse drops repeat turns
+to ~7s (12x). For repeated-context agent workloads on this model the
+GGUF route is currently the fastest on macOS too; vllm-mlx's batching
+(~2x on 2 concurrent) and prefix cache may pay off on a text-only
+artifact. Claims check vs the circulating proposal:
 prefix caching/continuous batching/OpenAI+Anthropic APIs are real;
 "SHA-256 image hashing 28x", `vllm.entrypoints` serving, and
 `sudo sysctl wired_mem_alloc_limit` requirements are not - the real
