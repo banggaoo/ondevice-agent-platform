@@ -975,10 +975,17 @@ invoke + bind_tools results with correctly parsed tool_calls;
 OpenCode `run --model ondevice/qwen3.8-9b-vllm` completed its
 title+build agent calls through governed streaming (cold-context
 turn 106s, same-session follow-up 6.1s - real-consumer prefix
-cache reuse ~17x). Selection: qwen3.8-9b-vllm is the verified agent default
-(structured tool calls + prefix cache, confirmed through both real
-consumers); qwen2.5-coder-7b-vllm stays as a lighter codegen route
-pending a tool-parser fix for its text-envelope call format.
-llama.cpp
+cache reuse ~17x). Selection (user-decided 2026-10-06): 3.8-only lineup.
+qwen3.8-9b-vllm is the agent/coding default (structured tool calls +
+prefix cache, confirmed through both real consumers);
+qwen2.5-coder-7b-vllm was removed from the registry and its artifact
+deleted - its chat template emits tool calls inside a text
+`<response>{{...}}</response>` envelope that no consumer can dispatch,
+so it fails the agent contract regardless of speed. A utility route
+qwen3-1.7b-vllm (mlx-community/Qwen3-1.7B-4bit, 0.98 GB, true
+Qwen3ForCausalLM - native cache) covers small calls (titles,
+summarization, classification); first load deferred ~90s behind the
+resident 9B at warn-level (correct: loads freeze at warning, in-flight
+finishes), warm turns ~1.2s. llama.cpp
 remains the cross-platform route; this policy change is macOS-
 observed but the warn/defer semantics apply on every OS.
