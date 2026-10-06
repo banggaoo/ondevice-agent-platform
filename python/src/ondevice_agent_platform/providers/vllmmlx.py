@@ -49,12 +49,13 @@ class _Server:
     def __init__(self, binary: str, model_path: str, alias: str) -> None:
         self.alias = alias
         self.port = _free_port()
-        # --local-files-only: the artifact path is already on disk via the
-        # governed store; the server must never reach for the network.
+        # model_path is an absolute on-disk directory from the governed
+        # store; vllm-mlx loads it directly with no hub resolution.
+        # --served-model-name lets wire "model" be the registry alias.
         self.proc = subprocess.Popen(
             [binary, "serve", model_path,
-             "--host", "127.0.0.1", "--port", str(self.port),
-             "--local-files-only"],
+             "--served-model-name", alias,
+             "--host", "127.0.0.1", "--port", str(self.port)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.last_used = time.time()
 

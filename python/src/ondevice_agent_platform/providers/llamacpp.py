@@ -138,8 +138,8 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                           self._files.get(profile.alias))
         manifest = self._store.manifest_of(profile.source,
                                            self._files.get(profile.alias))
-        gguf = next((f["name"] for f in manifest["files"]
-                     if f["name"].endswith(".gguf")), None)
+        gguf = next((f["path"] for f in manifest["files"]
+                     if f["path"].endswith(".gguf")), None)
         if gguf is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "no gguf artifact")
