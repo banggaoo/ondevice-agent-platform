@@ -112,6 +112,8 @@ def cmd_serve(args) -> int:
     root = _root_for(args)
     root.prepare()
     root.check_state_files()
+    _apply_serve_config(args, _read_config(root))
+    _first_run_setup(root)
     root.acquire_lock()
     try:
         supervisor, _store, _providers = _build_supervisor(root, args)
@@ -156,7 +158,8 @@ def cmd_serve(args) -> int:
             root.remove_daemon_marker()
         return 0
     except PlatformError as e:
-        _eprint(f"error: {e.safe_message}")
+        _eprint(f"error: {e.safe_message}"
+                + (f" ({e.detail})" if e.detail else ""))
         try:
             root.release_lock()
         except Exception:
@@ -268,6 +271,116 @@ def cmd_model_remove(args) -> int:
 # -- setup ----------------------------------------------------------------------
 
 
+def _read_config(root: RuntimeRoot) -> dict:
+    config = root.read_json(root.config_path)
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise PlatformError(ErrorCode.INVALID_REQUEST, "config malformed")
+    return config
+
+
+def _apply_serve_config(args, config: dict) -> None:
+    """config.json supplies serve defaults; explicit flags always win."""
+    if not getattr(args, "enable_apple_model", False):
+        args.enable_apple_model = bool(config.get("enableAppleModel"))
+    if not getattr(args, "enable_operator", False):
+        args.enable_operator = bool(config.get("enableOperator"))
+    if getattr(args, "operator_model", None) is None:
+        args.operator_model = config.get("operatorModel")
+
+
+def _select_models_interactive(available, input_fn=input) -> list:
+    """Guided menu over host-eligible catalog entries."""
+    eligible = [(e, reason) for e, ok, reason in available if ok]
+    print("available models:")
+    for i, (e, _) in enumerate(eligible, 1):
+        print(f"  {i}) {e.alias:18} ~{e.approx_bytes / 1e9:.1f} GB   "
+              f"{e.summary}")
+    for e, r in ((e, r) for e, ok, r in available if not ok):
+        print(f"  -  {e.alias:18} unavailable: {r}")
+    print("  note: apple-foundation-model needs no download")
+    choice = input_fn("select numbers (e.g. 1,2), 'all', or 'none': "
+                      ).strip().lower()
+    if choice == "all":
+        return [e for e, _ in eligible]
+    if choice in ("none", ""):
+        return []
+    try:
+        idx = [int(x) for x in choice.split(",")]
+        return [eligible[i - 1][0] for i in idx
+                if 1 <= i <= len(eligible)]
+    except (ValueError, IndexError):
+        raise PlatformError(ErrorCode.INVALID_REQUEST, "bad selection")
+
+
+def _prompt_operator_agent(root: RuntimeRoot, selection,
+                           input_fn=input) -> None:
+    """Offer the optional read-only Operator during guided setup and
+    persist the choice to config.json. The binding needs a model: the
+    Apple system route on macOS, else the first selected LLM."""
+    config = _read_config(root)
+    if "enableOperator" in config:
+        return
+    from .requirements import host_info
+    if host_info().os == "macos":
+        bound = catalog.APPLE_MODEL_ALIAS
+    elif selection:
+        bound = selection[0].alias
+    else:
+        return
+    config["enableOperator"] = (
+        input_fn("enable the optional read-only Operator agent "
+                 f"(binds {bound})? [y/N] ").strip().lower() == "y")
+    if config["enableOperator"]:
+        if bound == catalog.APPLE_MODEL_ALIAS:
+            config["enableAppleModel"] = True
+            config.pop("operatorModel", None)
+        else:
+            config["operatorModel"] = bound
+    root.write_json(config, root.config_path)
+
+
+def _finish_setup(root: RuntimeRoot, selection, *, pull: bool,
+                  interactive: bool, input_fn=input) -> None:
+    existing = root.read_json(root.registry_path) \
+        if os.path.isfile(root.registry_path) else None
+    merged = catalog.merged_registry(existing, selection)
+    root.write_json(merged, root.registry_path)
+    print(f"registry: {len(selection)} catalog model(s) declared, "
+          f"{len(merged['models'])} total")
+    if interactive:
+        _prompt_operator_agent(root, selection, input_fn)
+    if not pull and interactive and selection:
+        pull = input_fn("pull selected models now? [y/N] "
+                        ).strip().lower() == "y"
+    if pull:
+        store = ModelStore(root)
+        for e in selection:
+            print(f"pulling {e.alias} ({e.source.repo})")
+            store.pull(e.source, artifact_file=e.artifact_file,
+                       progress=_progress(e.alias))
+            print(f"  {e.alias} ready")
+    elif selection:
+        print("run `model pull --alias ALIAS` to fetch artifacts")
+
+
+def _first_run_setup(root: RuntimeRoot) -> None:
+    """A root with no declared models: interactive runs get guided setup
+    inline; non-interactive runs get a one-line hint, then boot empty."""
+    payload = root.read_json(root.registry_path) \
+        if os.path.isfile(root.registry_path) else None
+    if isinstance(payload, dict) and payload.get("models"):
+        return
+    if not sys.stdin.isatty():
+        _eprint("no models declared - run "
+                "`ondevice-agent-platform setup` for guided install")
+        return
+    print("first run - choose models to serve (or 'none' to skip):")
+    selection = _select_models_interactive(catalog.available_entries())
+    _finish_setup(root, selection, pull=False, interactive=True)
+
+
 def cmd_setup(args) -> int:
     root = _root_for(args)
     root.prepare()
@@ -296,51 +409,12 @@ def cmd_setup(args) -> int:
                                     f"unknown catalog alias: {alias}")
             selection.append(found)
     elif sys.stdin.isatty():
-        print("available models:")
-        for i, (e, _) in enumerate(eligible, 1):
-            print(f"  {i}) {e.alias:18} ~{e.approx_bytes / 1e9:.1f} GB   "
-                  f"{e.summary}")
-        ineligible = [(e, r) for e, ok, r in available if not ok]
-        for e, r in ineligible:
-            print(f"  -  {e.alias:18} unavailable: {r}")
-        print("  note: apple-foundation-model needs no download - "
-              "--enable-apple-model at serve")
-        choice = input("select numbers (e.g. 1,2), 'all', or 'none': "
-                       ).strip().lower()
-        if choice == "all":
-            selection = [e for e, _ in eligible]
-        elif choice in ("none", ""):
-            selection = []
-        else:
-            try:
-                idx = [int(x) for x in choice.split(",")]
-                selection = [eligible[i - 1][0] for i in idx
-                             if 1 <= i <= len(eligible)]
-            except (ValueError, IndexError):
-                raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                    "bad selection")
+        selection = _select_models_interactive(available)
     else:
         raise PlatformError(ErrorCode.INVALID_REQUEST,
                             "no selection (use --models/--all/--none)")
-    existing = root.read_json(root.registry_path) \
-        if os.path.isfile(root.registry_path) else None
-    merged = catalog.merged_registry(existing, selection)
-    root.write_json(merged, root.registry_path)
-    print(f"registry: {len(selection)} catalog model(s) declared, "
-          f"{len(merged['models'])} total")
-    pull = args.pull
-    if not pull and sys.stdin.isatty() and selection:
-        pull = input("pull selected models now? [y/N] "
-                     ).strip().lower() == "y"
-    if pull:
-        store = ModelStore(root)
-        for e in selection:
-            print(f"pulling {e.alias} ({e.source.repo})")
-            store.pull(e.source, artifact_file=e.artifact_file,
-                       progress=_progress(e.alias))
-            print(f"  {e.alias} ready")
-    elif selection:
-        print("run `model pull --alias ALIAS` to fetch artifacts")
+    _finish_setup(root, selection, pull=args.pull,
+                  interactive=sys.stdin.isatty())
     return 0
 
 
@@ -419,7 +493,8 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except PlatformError as e:
-        print(f"error: {e.safe_message}", file=sys.stderr)
+        print(f"error: {e.safe_message}"
+              + (f" ({e.detail})" if e.detail else ""), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

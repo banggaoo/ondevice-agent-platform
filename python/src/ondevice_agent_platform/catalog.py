@@ -92,7 +92,8 @@ ENTRIES: tuple[CatalogModel, ...] = (
                                    min_free_bytes=2_500_000_000)),
     CatalogModel(
         alias="qwen3.8-9b-gguf",
-        summary="text reasoning, coding (Qwen3.8-9B-Distill Q4_K_M GGUF)",
+        summary="text reasoning, coding - Windows/Linux route "
+                "(Qwen3.8-9B-Distill Q4_K_M GGUF)",
         provider=LLAMACPP_PROVIDER_ID,
         purposes=("reasoning", "coding"),
         capabilities=("text",),
@@ -102,7 +103,8 @@ ENTRIES: tuple[CatalogModel, ...] = (
             repo="empero-ai/Qwen3.8-9B-Distill-GGUF",
             revision="main"),
         artifact_file="Qwen3.8-9B-Q4_K_M.gguf",
-        requires=RouteRequirements(os=("any",), accelerator="any",
+        requires=RouteRequirements(os=("windows", "linux"),
+                                   accelerator="any",
                                    fmt="gguf",
                                    min_free_bytes=6_000_000_000)),
 )

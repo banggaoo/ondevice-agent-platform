@@ -983,9 +983,22 @@ deleted - its chat template emits tool calls inside a text
 `<response>{{...}}</response>` envelope that no consumer can dispatch,
 so it fails the agent contract regardless of speed. A
 qwen3-1.7b-vllm utility route was trialled (0.98 GB, warm turns ~1.2s)
-then removed at user direction - "we only use 3.8". The three 9B
-routes cover distinct runtimes: vllm-mlx (primary, cached+tools),
-mlx (same artifact, zero marginal disk, fallback when vllm-mlx is
-absent), llamacpp/GGUF (mandatory Windows/Linux route). llama.cpp
-remains the cross-platform route; this policy change is macOS-
-observed but the warn/defer semantics apply on every OS.
+then removed at user direction - "we only use 3.8". The 9B routes
+cover distinct runtimes: vllm-mlx (primary, cached+tools), mlx (same
+artifact, zero marginal disk, fallback when vllm-mlx is absent),
+llamacpp/GGUF (Windows/Linux route). User direction 2026-10-06:
+"Needed for Windows/Linux is not needed in current macos" - the
+catalog gguf entry is now scoped `os=("windows","linux")`, so macOS
+`setup` shows it "unavailable" and cannot install it; the route and
+artifact were removed from this host. Guided install (user direction:
+"run executable initially, should ask which model or agent
+installed"): `serve` on a root with no declared models runs the
+interactive catalog menu inline on a TTY (or prints a `setup` hint
+when non-interactive), and both paths offer the optional read-only
+Operator agent - the choice persists in config.json
+(`enableOperator`/`enableAppleModel`/`operatorModel`), which `serve`
+reads as defaults below explicit flags. CLI errors now append the
+owner-visible `detail` to the safe message (the API still receives
+safe_message only). llama.cpp remains the cross-platform route; this
+policy change is macOS-observed but the warn/defer semantics apply on
+every OS.

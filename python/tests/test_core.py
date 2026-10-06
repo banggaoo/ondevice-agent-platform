@@ -151,6 +151,74 @@ class TestCatalog(unittest.TestCase):
         raises(ErrorCode.INVALID_REQUEST, catalog.merged_registry,
                {"schemaVersion": 1, "models": "nope"}, [])
 
+    def test_gguf_offered_only_where_needed(self):
+        from ondevice_agent_platform.requirements import HostInfo
+        mac = HostInfo(os="macos", arch="arm64", has_metal=True,
+                       total_memory=16_000_000_000)
+        eligible = {e.alias: ok for e, ok, _
+                    in catalog.available_entries(mac)}
+        self.assertTrue(eligible["qwen3.8-9b"])
+        self.assertTrue(eligible["qwen3.8-9b-vllm"])
+        self.assertFalse(eligible["qwen3.8-9b-gguf"])
+        for osname in ("windows", "linux"):
+            host = HostInfo(os=osname, arch="x86_64", has_metal=False,
+                            total_memory=32_000_000_000)
+            eligible = {e.alias: ok for e, ok, _
+                        in catalog.available_entries(host)}
+            self.assertTrue(eligible["qwen3.8-9b-gguf"], osname)
+            self.assertFalse(eligible["qwen3.8-9b"], osname)
+
+
+class TestServeConfig(unittest.TestCase):
+    def _ns(self, **kw):
+        import argparse
+        defaults = dict(enable_apple_model=False, enable_operator=False,
+                        operator_model=None)
+        defaults.update(kw)
+        return argparse.Namespace(**defaults)
+
+    def test_config_supplies_defaults(self):
+        from ondevice_agent_platform import cli
+        args = self._ns()
+        cli._apply_serve_config(args, {"enableOperator": True,
+                                       "operatorModel": "m1",
+                                       "enableAppleModel": True})
+        self.assertTrue(args.enable_operator)
+        self.assertTrue(args.enable_apple_model)
+        self.assertEqual(args.operator_model, "m1")
+
+    def test_flags_beat_config(self):
+        from ondevice_agent_platform import cli
+        args = self._ns(enable_operator=True, operator_model="flag")
+        cli._apply_serve_config(args, {"enableOperator": False,
+                                       "operatorModel": "cfg"})
+        self.assertTrue(args.enable_operator)
+        self.assertEqual(args.operator_model, "flag")
+
+    def test_operator_prompt_persists_choice(self):
+        from ondevice_agent_platform import cli
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(os.path.join(d, "rt"))
+            root.prepare()
+            cli._prompt_operator_agent(
+                root, [catalog.ENTRIES[0]], input_fn=lambda _p: "y")
+            config = root.read_json(root.config_path)
+            self.assertTrue(config.get("enableOperator"))
+            # macOS binds the Apple route; other OSes bind the first
+            # selected LLM - either way the choice must be explicit.
+            self.assertTrue(config.get("enableAppleModel") or
+                            config.get("operatorModel"))
+
+    def test_operator_prompt_decline_persists_false(self):
+        from ondevice_agent_platform import cli
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(os.path.join(d, "rt"))
+            root.prepare()
+            cli._prompt_operator_agent(
+                root, [catalog.ENTRIES[0]], input_fn=lambda _p: "n")
+            config = root.read_json(root.config_path)
+            self.assertFalse(config.get("enableOperator"))
+
 
 class TestChatParse(unittest.TestCase):
     def test_minimal(self):
