@@ -20,3 +20,4 @@ dist/
 
 # Separate user-provided consumer reference checkout
 /artemis/
+*.egg-info/

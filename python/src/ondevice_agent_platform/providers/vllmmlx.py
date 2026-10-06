@@ -15,6 +15,7 @@ Artifact residency/epoch semantics mirror the llamacpp provider.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import shutil
@@ -216,17 +217,45 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             body = self._wire_request(request)
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{server.port}/v1/chat/completions",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"})
-            inflight = []
-            observer = (token.observe(lambda: [r.close() for r in inflight])
+            # The token observer must abort a call still waiting on
+            # response headers, not only a streaming response: urlopen
+            # hides the socket until headers arrive, so use http.client
+            # and let the observer close conn.sock through that window.
+            conn = http.client.HTTPConnection("127.0.0.1", server.port,
+                                              timeout=300)
+            inflight: list = []
+            sock = None
+
+            def _abort() -> None:
+                s = sock if sock is not None else conn.sock
+                if s is not None:
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                for r in list(inflight):
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+
+            observer = (token.observe(_abort)
                         if token is not None else None)
             try:
-                with urllib.request.urlopen(req, timeout=300) as r:
-                    inflight.append(r)
-                    payload = self._read_stream(r, token)
+                conn.request("POST", "/v1/chat/completions",
+                             body=json.dumps(body),
+                             headers={"Content-Type": "application/json"})
+                sock = conn.sock
+                resp = conn.getresponse()
+                inflight.append(resp)
+                try:
+                    payload = self._read_stream(resp, token)
+                finally:
+                    resp.close()
             except Exception as e:
                 if token is not None and token.is_cancelled:
                     raise PlatformError(ErrorCode.CANCELLED)
@@ -235,6 +264,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             finally:
                 if token is not None and observer is not None:
                     token.remove_observer(observer)
+                conn.close()
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             server.last_used = time.time()

@@ -9,6 +9,7 @@ discovered on PATH or OAP_LLAMA_SERVER; absent -> truthful unavailable.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -221,20 +222,44 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             body = self._wire_request(request, profile)
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{server.port}/v1/chat/completions",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"})
-            # Cancellation can abort the in-flight read: the token's
-            # observer closes the response so a cancel never waits out
-            # the socket.
-            inflight = []
-            observer = (token.observe(lambda: [r.close() for r in inflight])
+            # The token observer must abort a call still waiting on
+            # response headers too: urlopen hides the socket until they
+            # arrive, so use http.client and close conn.sock as well.
+            conn = http.client.HTTPConnection("127.0.0.1", server.port,
+                                              timeout=300)
+            inflight: list = []
+            sock = None
+
+            def _abort() -> None:
+                s = sock if sock is not None else conn.sock
+                if s is not None:
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                for r in list(inflight):
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+
+            observer = (token.observe(_abort)
                         if token is not None else None)
             try:
-                with urllib.request.urlopen(req, timeout=300) as r:
-                    inflight.append(r)
-                    payload = json.loads(r.read())
+                conn.request("POST", "/v1/chat/completions",
+                             body=json.dumps(body),
+                             headers={"Content-Type": "application/json"})
+                sock = conn.sock
+                resp = conn.getresponse()
+                inflight.append(resp)
+                try:
+                    payload = json.loads(resp.read())
+                finally:
+                    resp.close()
             except Exception as e:
                 if token is not None and token.is_cancelled:
                     raise PlatformError(ErrorCode.CANCELLED)
@@ -243,6 +268,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             finally:
                 if token is not None and observer is not None:
                     token.remove_observer(observer)
+                conn.close()
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             server.last_used = time.time()

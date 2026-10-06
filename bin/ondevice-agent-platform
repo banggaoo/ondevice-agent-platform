@@ -1,0 +1,6 @@
+#!/bin/sh
+# Repo-local launcher: runs the Python platform from a source checkout
+# without any install. `bin/ondevice-agent-platform install` installs
+# the managed provider env and links a PATH-level executable.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$ROOT/python/src" exec python3 -m ondevice_agent_platform "$@"

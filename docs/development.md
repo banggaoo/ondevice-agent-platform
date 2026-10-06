@@ -1018,3 +1018,27 @@ top_p kwargs. Supervisor now carries the underlying exception as
 error detail instead of bare provider_unavailable. llama.cpp remains
 the cross-platform route; this policy change is macOS-observed but
 the warn/defer semantics apply on every OS.
+Executable + install (user direction: "implement ondevice agent
+platform executable and installation"): `bin/ondevice-agent-platform`
+(+ .cmd) runs the CLI from a fresh clone without install;
+`ondevice-agent-platform install` (new subcommand) creates/uses the
+managed provider env, installs the package there as a real console
+script (pip -e via existing pyproject entry point), and links it onto
+~/.local/bin so `ondevice-agent-platform` is on PATH. Verified on this
+host: reinstall via the executable itself, `command -v` resolves,
+provider list ok (vllm-mlx/mlx/apple; llamacpp intentionally absent
+on macOS), daemon runs under oap-env/bin/python3.12 with no env vars.
+Cancellation fix: API/job cancel previously only called
+provider.cancel() - a no-op for the server providers - and never
+cancelled the token, so jobs blocked in the HTTP call always ended
+cancellation_unconfirmed and latched inference_blocked. Each job now
+gets its own CancellationToken bridged from the request token (per-job
+so cancelling one agent child cannot kill siblings sharing the parent
+token); _cancel_job_record and the inference deadline cancel it, and
+_launch passes it to the provider. Providers moved from urllib.urlopen
+to http.client so the token observer can shutdown()+close() conn.sock
+- close() alone does not interrupt a recv blocked in another thread on
+macOS - aborting the pre-headers wait that hid the socket inside
+urlopen. Verified live: cancel during model load confirms cancelled in
+~1s and mid-generation in ~0s on the resident server; inference stays
+unblocked.

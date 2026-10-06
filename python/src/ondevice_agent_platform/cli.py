@@ -570,6 +570,69 @@ def cmd_provider_install(args) -> int:
     return 0
 
 
+# -- install --------------------------------------------------------------------
+
+
+def _repo_python_dir() -> str | None:
+    """<repo>/python when running from a source checkout, else None."""
+    here = os.path.abspath(__file__)
+    candidate = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    return candidate if os.path.isfile(
+        os.path.join(candidate, "pyproject.toml")) else None
+
+
+def _link_executable(root: RuntimeRoot, bin_name: str) -> str:
+    """Put the console script on PATH: symlink into ~/.local/bin when that
+    dir is on PATH, else the first writable PATH dir; returns the link
+    path. POSIX only - Windows callers get the env Scripts dir printed."""
+    script = os.path.join(root.providers_path, _PROVIDER_ENV,
+                          "bin", bin_name)
+    if not os.path.isfile(script):
+        raise PlatformError(ErrorCode.INTERNAL,
+                            "installed console script missing")
+    home = os.path.expanduser("~")
+    candidates = [os.path.join(home, ".local", "bin")] + \
+        os.environ.get("PATH", "").split(os.pathsep)
+    for d in candidates:
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            link = os.path.join(d, bin_name)
+            if os.path.islink(link) or os.path.isfile(link):
+                os.remove(link)
+            os.symlink(script, link)
+            return link
+    raise PlatformError(ErrorCode.INVALID_REQUEST,
+                        f"no writable PATH dir; add "
+                        f"{os.path.dirname(script)} to PATH")
+
+
+def cmd_install(args) -> int:
+    """Install the platform: managed provider env, editable package into
+    it, and an ondevice-agent-platform executable linked onto PATH."""
+    root = _root_for(args)
+    root.prepare()
+    env_py = _provider_env_python(root)
+    if env_py is None:
+        print(f"installing provider env ({', '.join(_PROVIDER_PINS)})")
+        _install_provider_env(root)
+        env_py = _provider_env_python(root)
+    repo_python = _repo_python_dir()
+    if repo_python is not None:
+        pip = os.path.join(root.providers_path, _PROVIDER_ENV,
+                           "Scripts" if os.name == "nt" else "bin", "pip")
+        subprocess.run([pip, "install", "-e", repo_python], check=True)
+    if os.name == "nt":
+        scripts = os.path.join(root.providers_path, _PROVIDER_ENV,
+                               "Scripts")
+        print(f"installed; add {scripts} to PATH")
+    else:
+        link = _link_executable(root, "ondevice-agent-platform")
+        print(f"executable linked: {link}")
+    if os.path.isfile(root.daemon_path):
+        print("note: a daemon is running - restart `serve` to pick up "
+              "the new install")
+    return 0
+
+
 # -- acp ------------------------------------------------------------------------
 
 
@@ -642,6 +705,12 @@ def build_parser() -> argparse.ArgumentParser:
         "install", help="install the managed provider environment")
     data_root(pinst)
     pinst.set_defaults(func=cmd_provider_install)
+
+    inst = sub.add_parser(
+        "install", help="install provider env + ondevice-agent-platform "
+        "executable onto PATH")
+    data_root(inst)
+    inst.set_defaults(func=cmd_install)
 
     acp = sub.add_parser("acp", help="ACP stdio facade")
     acp.add_argument("--agent", required=True)

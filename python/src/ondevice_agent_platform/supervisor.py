@@ -86,6 +86,7 @@ class PlatformSupervisor:
         self._waiters: dict[str, _Waiter] = {}
         self._insertion_reservations = 0
         self._job_cancellations: dict[str, tuple] = {}
+        self._job_tokens: dict[str, CancellationToken] = {}
         self._job_sequence = 0
         self._next_consumer_index = 0
         self._inference_blocked = False
@@ -402,12 +403,16 @@ class PlatformSupervisor:
                             consumer_id=consumer_id, parent_id=parent_id,
                             state=JobState.QUEUED, created_at=now,
                             updated_at=now)
+            job_token = CancellationToken()
+            self._job_tokens[job.id] = job_token
             if cancellation is not None:
                 observer = cancellation.observe(
-                    lambda j=job.id: threading.Thread(
-                        target=self._cancel_job_record_safely,
-                        args=(j, PlatformError(ErrorCode.CANCELLED)),
-                        daemon=True).start())
+                    lambda jt=job_token, j=job.id: (
+                        jt.cancel(),
+                        threading.Thread(
+                            target=self._cancel_job_record_safely,
+                            args=(j, PlatformError(ErrorCode.CANCELLED)),
+                            daemon=True).start()))
                 self._job_cancellations[job.id] = (cancellation, observer)
             self._insertion_reservations += 1
         try:
@@ -516,8 +521,7 @@ class PlatformSupervisor:
 
     def _launch(self, job: JobRecord, work: _WorkItem) -> None:
         job_id = job.id
-        token_pair = self._job_cancellations.get(job_id)
-        token = token_pair[0] if token_pair else None
+        token = self._job_tokens.get(job_id)
 
         def run() -> None:
             try:
@@ -555,6 +559,9 @@ class PlatformSupervisor:
             self._persist(job)
             self._resume(job_id, None,
                          PlatformError(ErrorCode.DEADLINE_EXCEEDED))
+            job_token = self._job_tokens.get(job_id)
+            if job_token is not None:
+                job_token.cancel()
             self._ask_provider_cancel_locked(job_id)
 
     def _provider_finished(self, job_id: str, result=None,
@@ -609,6 +616,9 @@ class PlatformSupervisor:
             job.state = JobState.CANCEL_REQUESTED
             job.updated_at = time.time()
             self._persist(job)
+            job_token = self._job_tokens.get(job_id)
+            if job_token is not None:
+                job_token.cancel()
             self._ask_provider_cancel_locked(job_id)
             timer = threading.Timer(
                 PlatformLimits.CANCELLATION_GRACE_SECONDS,
@@ -713,6 +723,7 @@ class PlatformSupervisor:
             waiter.event.set()
 
     def _release_job_cancellation(self, job_id: str) -> None:
+        self._job_tokens.pop(job_id, None)
         pair = self._job_cancellations.pop(job_id, None)
         if pair is not None:
             pair[0].remove_observer(pair[1])
