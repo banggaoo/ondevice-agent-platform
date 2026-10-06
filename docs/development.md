@@ -963,8 +963,10 @@ Measured coding-agent comparison through governed /v1 (same bench:
 prefix turn, 350-token codegen): qwen2.5-coder-7b-vllm (official
 mlx-community conversion, Qwen2ForCausalLM - no overlay needed)
 cold 8.0s, big-prefix turn 90.9s, same-prefix repeat 3.4s (~27x),
-codegen 4/4 signals, ~12 tok/s - but answered in text instead of
-emitting the read_file tool call on the agent prompt.
+codegen 4/4 signals, ~12 tok/s - but it does NOT deliver structured
+tool calls through this route: even with tool_choice=required the
+call arrives as text (`<response>{{...}}</response>` in content),
+which consumers cannot dispatch.
 qwen3.8-9b-vllm (overlay-routed) cold 16.2s, big-prefix turn 92.9s,
 same-prefix repeat 6.7s (~14x), codegen 3/4, ~12 tok/s - emitted a
 correct read_file(src/mod_7.py) tool call. Consumer validation:
@@ -973,9 +975,10 @@ invoke + bind_tools results with correctly parsed tool_calls;
 OpenCode `run --model ondevice/qwen3.8-9b-vllm` completed its
 title+build agent calls through governed streaming (cold-context
 turn 106s, same-session follow-up 6.1s - real-consumer prefix
-cache reuse ~17x). Selection: keep both routes; qwen3.8-9b-vllm
-is the verified tool-calling agent default on this host,
-qwen2.5-coder-7b-vllm the lighter/faster alternative (noting it
-skipped the tool call in this single-sample probe). llama.cpp
+cache reuse ~17x). Selection: qwen3.8-9b-vllm is the verified agent default
+(structured tool calls + prefix cache, confirmed through both real
+consumers); qwen2.5-coder-7b-vllm stays as a lighter codegen route
+pending a tool-parser fix for its text-envelope call format.
+llama.cpp
 remains the cross-platform route; this policy change is macOS-
 observed but the warn/defer semantics apply on every OS.
