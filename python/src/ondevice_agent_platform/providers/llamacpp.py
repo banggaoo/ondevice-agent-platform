@@ -25,10 +25,15 @@ from ..registry import LLAMACPP_PROVIDER_ID
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
 
 
-def _server_binary() -> str | None:
+def _server_binary(providers_dir: str | None = None) -> str | None:
     override = os.environ.get("OAP_LLAMA_SERVER")
     if override and os.path.isfile(override):
         return override
+    if providers_dir:
+        for name in ("llama-server", "llama-server.exe"):
+            managed = os.path.join(providers_dir, "llama.cpp", name)
+            if os.path.isfile(managed):
+                return managed
     for name in ("llama-server", "llama-server.exe"):
         found = shutil.which(name)
         if found:
@@ -75,8 +80,10 @@ class _Server:
 class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     provider_id = LLAMACPP_PROVIDER_ID
 
-    def __init__(self, store, artifact_files: dict[str, str] | None = None):
+    def __init__(self, store, artifact_files: dict[str, str] | None = None,
+                 providers_dir: str | None = None):
         self._store = store
+        self._providers_dir = providers_dir
         self._files = artifact_files or {}   # alias -> source file name
         self._servers: dict[str, _Server] = {}
         self._lock = threading.Lock()
@@ -87,7 +94,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     # -- readiness ---------------------------------------------------------
     @property
     def has_ready_artifact(self) -> bool:
-        binary = _server_binary()
+        binary = _server_binary(self._providers_dir)
         if binary is None:
             return False
         return any(
@@ -147,7 +154,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
 
     # -- inference -----------------------------------------------------------
     def _server_for(self, profile, token=None):
-        binary = _server_binary()
+        binary = _server_binary(self._providers_dir)
         if binary is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "llama-server binary not found")

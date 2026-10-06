@@ -27,20 +27,19 @@ import urllib.request
 from ..chat import ChatResult, ChatToolCall, ChatUsage, FinishReason
 from ..errors import ErrorCode, PlatformError
 from ..registry import VLLMMLX_PROVIDER_ID
+from . import overlay
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
 
-# vllm-mlx's _config_indicates_vlm markers (vllm_mlx/api/utils.py) plus
-# the vision-token keys this family of artifacts carries.
-_VLM_MARKER_KEYS = {
-    "vision_config", "audio_config", "vision_tower", "mm_vision_tower",
-    "vision_start_token_id", "vision_end_token_id",
-}
 
-
-def _server_binary() -> str | None:
+def _server_binary(providers_dir: str | None = None) -> str | None:
     override = os.environ.get("OAP_VLLM_MLX")
     if override and os.path.isfile(override):
         return override
+    if providers_dir:
+        managed = os.path.join(providers_dir, "oap-env",
+                               "bin", "vllm-mlx")
+        if os.path.isfile(managed):
+            return managed
     return shutil.which("vllm-mlx")
 
 
@@ -85,8 +84,9 @@ class _Server:
 class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     provider_id = VLLMMLX_PROVIDER_ID
 
-    def __init__(self, store) -> None:
+    def __init__(self, store, providers_dir: str | None = None) -> None:
         self._store = store
+        self._providers_dir = providers_dir
         self._servers: dict[str, _Server] = {}
         self._lock = threading.Lock()
         self._epochs: dict[str, int] = {}
@@ -96,7 +96,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     # -- readiness ---------------------------------------------------------
     @property
     def has_ready_artifact(self) -> bool:
-        if _server_binary() is None:
+        if _server_binary(self._providers_dir) is None:
             return False
         return any(p.source is not None and self._store.is_ready(p.source)
                    for p in self._profiles)
@@ -153,52 +153,11 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
 
     # -- inference -----------------------------------------------------------
     def _serve_path(self, profile) -> str:
-        """Directory handed to `vllm-mlx serve`. Artifacts that declare a
-        ForConditionalGeneration (VLM) architecture are routed by
-        vllm-mlx to its uncached multimodal path even when the weights
-        are text-only (e.g. Qwen3.8-9B-Distill). For those, build a
-        symlink overlay: every verified file linked, config.json patched
-        to the matching CausalLM arch. The store stays byte-verified;
-        the overlay lives inside models/ as a dot dir (ignored by
-        listing and the root safety whitelist)."""
-        directory = self._store.directory(profile.source)
-        config_path = os.path.join(directory, "config.json")
-        try:
-            with open(config_path) as f:
-                config = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return directory
-        archs = config.get("architectures") or []
-        patched = [a[:-len("ForConditionalGeneration")] + "ForCausalLM"
-                   if a.endswith("ForConditionalGeneration") else a
-                   for a in archs]
-        # vllm-mlx also flags VLM on config keys (image_token_id etc.);
-        # a text-routed artifact must not carry those markers.
-        vlm_keys = {k for k in config
-                    if k in _VLM_MARKER_KEYS
-                    or k.endswith(("_token_id", "_token_index"))
-                    and ("image" in k or "video" in k or "audio" in k
-                         or "vision" in k)}
-        if patched == list(archs) and not vlm_keys:
-            return directory
-        overlay = os.path.join(self._store._root.models_path,
-                               ".vllmmlx-" + os.path.basename(directory))
-        shutil.rmtree(overlay, ignore_errors=True)
-        os.makedirs(overlay)
-        for name in os.listdir(directory):
-            if name == "config.json":
-                continue
-            os.symlink(os.path.join(directory, name),
-                       os.path.join(overlay, name))
-        config["architectures"] = patched
-        for key in vlm_keys:
-            config.pop(key, None)
-        with open(os.path.join(overlay, "config.json"), "w") as f:
-            json.dump(config, f)
-        return overlay
+        return overlay.serve_text_dir(self._store._root.models_path,
+                                      self._store.directory(profile.source))
 
     def _server_for(self, profile, token=None):
-        binary = _server_binary()
+        binary = _server_binary(self._providers_dir)
         if binary is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "vllm-mlx not installed "

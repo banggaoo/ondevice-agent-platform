@@ -529,10 +529,11 @@ class PlatformSupervisor:
                 self._provider_finished(job_id, result=result)
             except PlatformError as e:
                 self._provider_finished(job_id, error=e)
-            except Exception:
+            except Exception as e:
                 self._provider_finished(
                     job_id, error=PlatformError(
-                        ErrorCode.PROVIDER_UNAVAILABLE))
+                        ErrorCode.PROVIDER_UNAVAILABLE,
+                        f"{type(e).__name__}: {e}"))
 
         thread = threading.Thread(target=run, daemon=True,
                                   name=f"oap-{job_id}")

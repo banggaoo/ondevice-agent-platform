@@ -999,6 +999,22 @@ Operator agent - the choice persists in config.json
 (`enableOperator`/`enableAppleModel`/`operatorModel`), which `serve`
 reads as defaults below explicit flags. CLI errors now append the
 owner-visible `detail` to the safe message (the API still receives
-safe_message only). llama.cpp remains the cross-platform route; this
-policy change is macOS-observed but the warn/defer semantics apply on
-every OS.
+safe_message only). Managed provider env (same "install what needed"
+direction): `provider install` creates <root>/providers/oap-env, a
+venv (Python >=3.10 from PATH) pinned to vllm-mlx==0.5.0,
+mlx-lm==0.32.0, mlx-vlm==0.7.6. Provider binaries resolve
+env-override -> managed env -> PATH; when the env exists `serve`
+re-execs under its interpreter (guarded by OAP_PROVIDER_ENV) so the
+in-process mlx providers import there - previously the daemon ran
+under Xcode Python 3.9 where mlx-lm/mlx-vlm cannot import, so the
+mlx and vision routes were silently dead, and vllm-mlx only worked
+via a hand-made /tmp venv + OAP_VLLM_MLX env var. `provider list`
+reports per-provider prerequisite status; guided setup offers the env
+when selected routes need it. Two latent bugs surfaced and fixed: the
+shared text-overlay (providers/overlay.py) is now applied by the mlx
+route too (the 9B's VLM-labeled config fails mlx_lm.load unpatched),
+and mlx-lm 0.32's stream_generate takes a Sampler, not temperature/
+top_p kwargs. Supervisor now carries the underlying exception as
+error detail instead of bare provider_unavailable. llama.cpp remains
+the cross-platform route; this policy change is macOS-observed but
+the warn/defer semantics apply on every OS.

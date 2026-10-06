@@ -118,6 +118,10 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "model artifact not pulled")
         path = self._store.directory(profile.source)
         vision = "vision" in profile.capabilities
+        if not vision:
+            from . import overlay
+            path = overlay.serve_text_dir(
+                self._store._root.models_path, path)
         with self._lock:
             epoch = self._epochs.get(profile.alias, 0)
         if vision:
@@ -213,12 +217,19 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             tokenize=False, add_generation_prompt=True,
             tools=tools)
         text, prompt_tokens, completion_tokens = "", 0, 0
+        # mlx-lm >=0.29 moved sampling to a Sampler callable; temperature/
+        # top_p kwargs are no longer accepted by stream_generate.
+        from mlx_lm.sample_utils import make_sampler
+        sampler = make_sampler(
+            temp=request.temperature or 0.0,
+            top_p=request.top_p if request.top_p is not None else 1.0)
+        if request.seed is not None:
+            import mlx.core as mx
+            mx.random.seed(request.seed)
         for chunk in lm.stream_generate(
                 container.model, tokenizer, prompt=prompt,
                 max_tokens=request.max_output_tokens,
-                temperature=request.temperature or 0.0,
-                top_p=request.top_p if request.top_p is not None else 1.0,
-                seed=request.seed):
+                sampler=sampler):
             if flag.is_set():
                 raise PlatformError(ErrorCode.CANCELLED)
             text += getattr(chunk, "text", "")

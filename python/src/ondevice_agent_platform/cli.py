@@ -3,9 +3,12 @@ setup / acp. Stdlib argparse; no shell scripts."""
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 
@@ -22,6 +25,15 @@ from .providers.linear import LinearPredictor
 from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
                        LLAMACPP_PROVIDER_ID, MLX_PROVIDER_ID,
                        VLLMMLX_PROVIDER_ID, parse_registry)
+
+# One managed venv under <root>/providers/oap-env owns the platform's
+# provider dependencies: vllm-mlx's server binary resolves there without
+# env vars, and `serve` re-execs under its interpreter so the in-process
+# mlx-lm/mlx-vlm providers import. Everything pinned - same governed-pull
+# posture as model artifacts.
+_PROVIDER_ENV = "oap-env"
+_PROVIDER_PINS = ("vllm-mlx==0.5.0", "mlx-lm==0.32.0", "mlx-vlm==0.7.6")
+_REEXEC_GUARD = "OAP_PROVIDER_ENV"
 from .runtime_root import RuntimeRoot
 from .server import PlatformHTTPServer
 from .supervisor import PlatformSupervisor
@@ -66,7 +78,8 @@ def _build_supervisor(root: RuntimeRoot, args):
             provider = providers[MLX_PROVIDER_ID]
         elif profile.provider_id == VLLMMLX_PROVIDER_ID:
             from .providers.vllmmlx import VllmMlxProvider
-            providers.setdefault(VLLMMLX_PROVIDER_ID, VllmMlxProvider(store))
+            providers.setdefault(VLLMMLX_PROVIDER_ID, VllmMlxProvider(
+                store, providers_dir=root.providers_path))
             provider = providers[VLLMMLX_PROVIDER_ID]
         elif profile.provider_id == LLAMACPP_PROVIDER_ID:
             if entry.artifact_file:
@@ -77,7 +90,8 @@ def _build_supervisor(root: RuntimeRoot, args):
     if artifact_files or any(e.profile.provider_id == LLAMACPP_PROVIDER_ID
                              for e in entries):
         from .providers.llamacpp import LlamaCppProvider
-        provider = LlamaCppProvider(store, artifact_files=artifact_files)
+        provider = LlamaCppProvider(store, artifact_files=artifact_files,
+                                  providers_dir=root.providers_path)
         providers[LLAMACPP_PROVIDER_ID] = provider
         for entry in entries:
             if entry.profile.provider_id == LLAMACPP_PROVIDER_ID:
@@ -108,12 +122,100 @@ def _default_resource_source():
     return PollingResourceSource()
 
 
+def _provider_env_python(root: RuntimeRoot) -> str | None:
+    name = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    path = os.path.join(root.providers_path, _PROVIDER_ENV, name)
+    return path if os.path.isfile(path) else None
+
+
+def _provider_missing(root: RuntimeRoot) -> dict[str, str]:
+    """provider_id -> missing prerequisite, for status and setup offers."""
+    out: dict[str, str] = {}
+    pd = root.providers_path
+    from .providers.vllmmlx import _server_binary as _vllm
+    from .providers.llamacpp import _server_binary as _llama
+    if _vllm(pd) is None:
+        out[VLLMMLX_PROVIDER_ID] = "vllm-mlx"
+    if _llama(pd) is None:
+        out[LLAMACPP_PROVIDER_ID] = "llama-server"
+    if _provider_env_python(root) is None:
+        # In-process deps matter only when no managed env exists - with
+        # one installed, serve re-execs into it before boot.
+        miss = [m for m in ("mlx_lm", "mlx_vlm")
+                if importlib.util.find_spec(m) is None]
+        if miss:
+            out[MLX_PROVIDER_ID] = "python: " + "/".join(miss)
+    from .providers.apple import _bridge_binary
+    if _bridge_binary() is None:
+        out[APPLE_PROVIDER_ID] = "oap-apple-bridge"
+    return out
+
+
+def _provider_env_candidates():
+    for name in ("python3.13", "python3.12", "python3.11", "python3.10"):
+        found = shutil.which(name)
+        if found:
+            yield found
+    if sys.version_info >= (3, 10):
+        yield sys.executable
+
+
+def _install_provider_env(root: RuntimeRoot) -> str:
+    """Create <root>/providers/oap-env and install the pinned provider
+    dependencies. Provider pins are a governed prerequisite - same class
+    of install as `model pull`."""
+    os.makedirs(root.providers_path, exist_ok=True)
+    env_dir = os.path.join(root.providers_path, _PROVIDER_ENV)
+    if os.path.isdir(env_dir):
+        shutil.rmtree(env_dir)
+    created = False
+    for py in _provider_env_candidates():
+        try:
+            subprocess.run([py, "-m", "venv", env_dir], check=True)
+            created = True
+            break
+        except (subprocess.CalledProcessError, OSError):
+            shutil.rmtree(env_dir, ignore_errors=True)
+    if not created:
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "provider env needs Python >=3.10 on PATH")
+    pip = os.path.join(env_dir, "Scripts" if os.name == "nt" else "bin",
+                       "pip")
+    try:
+        subprocess.run([pip, "install", *_PROVIDER_PINS], check=True)
+    except subprocess.CalledProcessError:
+        raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                            "provider env dependency install failed")
+    return env_dir
+
+
+def _maybe_reexec_provider_env(root: RuntimeRoot) -> None:
+    """When the managed provider env exists the daemon must run under its
+    interpreter - in-process providers import there, not in whatever
+    python launched the CLI."""
+    if os.environ.get(_REEXEC_GUARD):
+        return
+    env_py = _provider_env_python(root)
+    if env_py is None or \
+            os.path.realpath(env_py) == os.path.realpath(sys.executable):
+        return
+    env = dict(os.environ)
+    env[_REEXEC_GUARD] = "1"
+    src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"]
+                               if env.get("PYTHONPATH") else "")
+    _eprint(f"managed provider env detected; restarting under {env_py}")
+    os.execve(env_py, [env_py, "-m", "ondevice_agent_platform",
+                       *sys.argv[1:]], env)
+
+
 def cmd_serve(args) -> int:
     root = _root_for(args)
     root.prepare()
     root.check_state_files()
     _apply_serve_config(args, _read_config(root))
     _first_run_setup(root)
+    _maybe_reexec_provider_env(root)
     root.acquire_lock()
     try:
         supervisor, _store, _providers = _build_supervisor(root, args)
@@ -351,6 +453,29 @@ def _finish_setup(root: RuntimeRoot, selection, *, pull: bool,
           f"{len(merged['models'])} total")
     if interactive:
         _prompt_operator_agent(root, selection, input_fn)
+    if interactive and selection and _provider_env_python(root) is None:
+        missing = {pid: name for pid, name in _provider_missing(root).items()
+                   if pid in {e.provider for e in selection}}
+        coverable = sorted({n for pid, n in missing.items()
+                            if pid in (VLLMMLX_PROVIDER_ID,
+                                       MLX_PROVIDER_ID)})
+        if coverable:
+            if input_fn(f"provider runtime(s) missing: "
+                        f"{', '.join(coverable)} - install the managed "
+                        "provider env now? [y/N] ").strip().lower() == "y":
+                print("installing provider env "
+                      f"({', '.join(_PROVIDER_PINS)})")
+                _install_provider_env(root)
+                print("  provider env ready")
+            else:
+                print("  those routes will report provider-unavailable "
+                      "until installed (`provider install`)")
+        external = sorted({n for pid, n in missing.items()
+                           if pid not in (VLLMMLX_PROVIDER_ID,
+                                          MLX_PROVIDER_ID)})
+        for name in external:
+            print(f"  provider {name}: not managed - install it "
+                  "separately (env override or PATH)")
     if not pull and interactive and selection:
         pull = input_fn("pull selected models now? [y/N] "
                         ).strip().lower() == "y"
@@ -418,6 +543,33 @@ def cmd_setup(args) -> int:
     return 0
 
 
+# -- provider ---------------------------------------------------------------------
+
+
+def cmd_provider_list(args) -> int:
+    root = _root_for(args)
+    root.prepare()
+    missing = _provider_missing(root)
+    for pid in (VLLMMLX_PROVIDER_ID, MLX_PROVIDER_ID,
+                LLAMACPP_PROVIDER_ID, APPLE_PROVIDER_ID,
+                LINEAR_PROVIDER_ID):
+        print(f"{pid:16} "
+              + ("ok" if pid not in missing
+                 else f"missing: {missing[pid]}"))
+    env_py = _provider_env_python(root)
+    print(f"{'provider-env':16} {env_py or 'not installed'}")
+    return 0
+
+
+def cmd_provider_install(args) -> int:
+    root = _root_for(args)
+    root.prepare()
+    print(f"installing provider env ({', '.join(_PROVIDER_PINS)})")
+    path = _install_provider_env(root)
+    print(f"provider env ready: {path}")
+    return 0
+
+
 # -- acp ------------------------------------------------------------------------
 
 
@@ -480,6 +632,16 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--none", action="store_true")
     setup.add_argument("--pull", action="store_true")
     setup.set_defaults(func=cmd_setup)
+
+    prov = sub.add_parser("provider", help="provider runtime commands")
+    psub = prov.add_subparsers(dest="provider_command", required=True)
+    plist = psub.add_parser("list", help="provider prerequisite status")
+    data_root(plist)
+    plist.set_defaults(func=cmd_provider_list)
+    pinst = psub.add_parser(
+        "install", help="install the managed provider environment")
+    data_root(pinst)
+    pinst.set_defaults(func=cmd_provider_install)
 
     acp = sub.add_parser("acp", help="ACP stdio facade")
     acp.add_argument("--agent", required=True)

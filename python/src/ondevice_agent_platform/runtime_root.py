@@ -14,7 +14,7 @@ from .limits import PlatformLimits
 _OWNED_NAMES = {
     "config.json", "registry.json", "state.sqlite3",
     "state.sqlite3-wal", "state.sqlite3-shm",
-    "lock.fd", "daemon.json", "sessions", "models",
+    "lock.fd", "daemon.json", "sessions", "models", "providers",
     # macOS Finder metadata - not user content; a Finder visit must not
     # brick an existing root. (Swift ownedNames lacks it; parity fix TODO.)
     ".DS_Store",
@@ -60,6 +60,10 @@ class RuntimeRoot:
     @property
     def models_path(self) -> str:
         return os.path.join(self.path, "models")
+
+    @property
+    def providers_path(self) -> str:
+        return os.path.join(self.path, "providers")
 
     def prepare(self) -> None:
         """Fresh or previously created root. Refuses symlinked roots and
