@@ -29,6 +29,13 @@ from ..errors import ErrorCode, PlatformError
 from ..registry import VLLMMLX_PROVIDER_ID
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
 
+# vllm-mlx's _config_indicates_vlm markers (vllm_mlx/api/utils.py) plus
+# the vision-token keys this family of artifacts carries.
+_VLM_MARKER_KEYS = {
+    "vision_config", "audio_config", "vision_tower", "mm_vision_tower",
+    "vision_start_token_id", "vision_end_token_id",
+}
+
 
 def _server_binary() -> str | None:
     override = os.environ.get("OAP_VLLM_MLX")
@@ -55,7 +62,8 @@ class _Server:
         self.proc = subprocess.Popen(
             [binary, "serve", model_path,
              "--served-model-name", alias,
-             "--host", "127.0.0.1", "--port", str(self.port)],
+             "--host", "127.0.0.1", "--port", str(self.port),
+             "--enable-prefix-cache"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.last_used = time.time()
 
@@ -122,6 +130,51 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         return len(idle)
 
     # -- inference -----------------------------------------------------------
+    def _serve_path(self, profile) -> str:
+        """Directory handed to `vllm-mlx serve`. Artifacts that declare a
+        ForConditionalGeneration (VLM) architecture are routed by
+        vllm-mlx to its uncached multimodal path even when the weights
+        are text-only (e.g. Qwen3.8-9B-Distill). For those, build a
+        symlink overlay: every verified file linked, config.json patched
+        to the matching CausalLM arch. The store stays byte-verified;
+        the overlay lives inside models/ as a dot dir (ignored by
+        listing and the root safety whitelist)."""
+        directory = self._store.directory(profile.source)
+        config_path = os.path.join(directory, "config.json")
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return directory
+        archs = config.get("architectures") or []
+        patched = [a[:-len("ForConditionalGeneration")] + "ForCausalLM"
+                   if a.endswith("ForConditionalGeneration") else a
+                   for a in archs]
+        # vllm-mlx also flags VLM on config keys (image_token_id etc.);
+        # a text-routed artifact must not carry those markers.
+        vlm_keys = {k for k in config
+                    if k in _VLM_MARKER_KEYS
+                    or k.endswith(("_token_id", "_token_index"))
+                    and ("image" in k or "video" in k or "audio" in k
+                         or "vision" in k)}
+        if patched == list(archs) and not vlm_keys:
+            return directory
+        overlay = os.path.join(self._store._root.models_path,
+                               ".vllmmlx-" + os.path.basename(directory))
+        shutil.rmtree(overlay, ignore_errors=True)
+        os.makedirs(overlay)
+        for name in os.listdir(directory):
+            if name == "config.json":
+                continue
+            os.symlink(os.path.join(directory, name),
+                       os.path.join(overlay, name))
+        config["architectures"] = patched
+        for key in vlm_keys:
+            config.pop(key, None)
+        with open(os.path.join(overlay, "config.json"), "w") as f:
+            json.dump(config, f)
+        return overlay
+
     def _server_for(self, profile, token=None):
         binary = _server_binary()
         if binary is None:
@@ -132,7 +185,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 profile.source):
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "model artifact not pulled")
-        model_path = self._store.directory(profile.source)
+        model_path = self._serve_path(profile)
         with self._lock:
             epoch = self._epochs.get(profile.alias, 0)
         server = _Server(binary, model_path, profile.alias)
@@ -187,7 +240,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 inflight.append(r)
-                payload = json.loads(r.read())
+                payload = self._read_stream(r, token)
         except Exception as e:
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
@@ -200,6 +253,59 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             raise PlatformError(ErrorCode.CANCELLED)
         server.last_used = time.time()
         return self._wire_result(payload, request.model)
+
+    def _read_stream(self, response, token=None):
+        """The prompt/LRU prefix cache only engages on the streaming path;
+        the provider aggregates SSE frames into the completion shape
+        callers already expect. Mid-stream cancellation closes the
+        response, ending the turn truthfully."""
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        finish = None
+        usage = {}
+        for raw in response:
+            if token is not None and token.is_cancelled:
+                response.close()
+                raise PlatformError(ErrorCode.CANCELLED)
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls.setdefault(
+                    idx, {"id": tc.get("id"), "name": None,
+                          "args": []})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"].append(fn["arguments"])
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+        message = {"content": "".join(content_parts) or None}
+        if tool_calls:
+            message["tool_calls"] = [
+                {"id": s["id"], "function": {"name": s["name"],
+                 "arguments": "".join(s["args"])}}
+                for _, s in sorted(tool_calls.items())]
+        return {"choices": [{"message": message,
+                             "finish_reason": finish or "stop"}],
+                "usage": usage}
 
     def cancel(self, job_id: str) -> None:
         # Cooperative cancel rides the token's in-flight close observer.
@@ -235,7 +341,9 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         body: dict = {"model": request.model, "messages": messages,
                       "max_tokens": request.max_output_tokens,
                       "temperature": request.temperature if
-                      request.temperature is not None else 0.0}
+                      request.temperature is not None else 0.0,
+                      "stream": True,
+                      "stream_options": {"include_usage": True}}
         if request.top_p is not None:
             body["top_p"] = request.top_p
         if request.seed is not None:
