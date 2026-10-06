@@ -20,7 +20,8 @@ from .modelstore import ModelStore
 from .profiles import ModelKind, ModelProfile, ModelSource
 from .providers.linear import LinearPredictor
 from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
-                       LLAMACPP_PROVIDER_ID, MLX_PROVIDER_ID, parse_registry)
+                       LLAMACPP_PROVIDER_ID, MLX_PROVIDER_ID,
+                       VLLMMLX_PROVIDER_ID, parse_registry)
 from .runtime_root import RuntimeRoot
 from .server import PlatformHTTPServer
 from .supervisor import PlatformSupervisor
@@ -63,6 +64,10 @@ def _build_supervisor(root: RuntimeRoot, args):
             from .providers.mlx_provider import MLXProvider
             providers.setdefault(MLX_PROVIDER_ID, MLXProvider(store))
             provider = providers[MLX_PROVIDER_ID]
+        elif profile.provider_id == VLLMMLX_PROVIDER_ID:
+            from .providers.vllmmlx import VllmMlxProvider
+            providers.setdefault(VLLMMLX_PROVIDER_ID, VllmMlxProvider(store))
+            provider = providers[VLLMMLX_PROVIDER_ID]
         elif profile.provider_id == LLAMACPP_PROVIDER_ID:
             if entry.artifact_file:
                 artifact_files[profile.alias] = entry.artifact_file

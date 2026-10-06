@@ -886,3 +886,22 @@ on Linux/Windows hosts; `llama-server -ngl 99` is a pending per-host
 calibration. The Swift implementation remains the reference and keeps
 its own test suite; both cores share the wire surface, admission, and
 truthful-refusal contract.
+
+vllm-mlx route (2026-10-05): `vllm-mlx` (waybarrios/vllm-mlx, PyPI
+0.5.0) is adopted as a fourth LLM provider - an owned `vllm-mlx serve`
+child per profile on a loopback port, the same subprocess-container
+shape as llamacpp (requires_load, epochs, evict_resident drops the
+server and its KV cache on deny_and_cancel). Its prefix cache +
+continuous batching run *inside* platform admission, not as the
+foundational layer: the supervisor stays scheduler-of-record. Registry
+entries declare `"provider": "vllm-mlx"` with an MLX-format source;
+the route truthfully refuses when the `vllm-mlx` binary (PATH or
+OAP_VLLM_MLX) or the pulled artifact is absent. Deliberately not
+curated into the setup catalog: per the measured-evidence rule it
+needs an on-host benchmark vs the direct mlx route (prefix-cache TTFT
+on repeated agent-loop contexts vs ~25 extra runtime dependencies)
+before a recommendation. Claims check vs the circulating proposal:
+prefix caching/continuous batching/OpenAI+Anthropic APIs are real;
+"SHA-256 image hashing 28x", `vllm.entrypoints` serving, and
+`sudo sysctl wired_mem_alloc_limit` requirements are not - the real
+entry is `vllm-mlx serve <model> --local-files-only`.

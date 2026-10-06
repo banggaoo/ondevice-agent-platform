@@ -22,6 +22,7 @@ _MODEL_KEYS = {
 
 MLX_PROVIDER_ID = "mlx"
 LLAMACPP_PROVIDER_ID = "llamacpp"
+VLLMMLX_PROVIDER_ID = "vllm-mlx"
 APPLE_PROVIDER_ID = "apple-foundation-models"
 LINEAR_PROVIDER_ID = "builtin.linear"
 
@@ -139,7 +140,8 @@ def _finite(value) -> float:
 
 def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
     provider = obj.get("provider")
-    if provider not in (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID):
+    if provider not in (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID,
+                        VLLMMLX_PROVIDER_ID):
         raise PlatformError(ErrorCode.INVALID_REQUEST,
                             "unknown llm provider")
     for key in ("inputSchema", "outputSchema", "linear"):
