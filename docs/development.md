@@ -908,7 +908,19 @@ prefix cache - while llama.cpp's slot context-reuse drops repeat turns
 to ~7s (12x). For repeated-context agent workloads on this model the
 GGUF route is currently the fastest on macOS too; vllm-mlx's batching
 (~2x on 2 concurrent) and prefix cache may pay off on a text-only
-artifact. Claims check vs the circulating proposal:
+artifact. Follow-up: every public MLX build of this distill (keXjos,
+schsu MXFP4, enginil, PocketAiHub, nvythong) inherits
+`Qwen3_5ForConditionalGeneration` from the source - the model is a
+hybrid linear-attention VLM-family distill, so no text-arch MLX
+package exists. Serving the artifact with `model_type: qwen3_5` +
+`architectures: ["Qwen3_5ForCausalLM"]` (nested `text_config` kept)
+makes vllm-mlx route it as `type: llm`: prefix cache then engages
+(0.76-0.93s TTFT, ~6-9s repeat turns vs 40-80s uncached; coherent
+output verified) - the fastest measured macOS path for this model,
+ahead of llama.cpp (~7s) with faster decode. Caveat: patching
+config.json breaks manifest verification; a symlink-overlay dir
+(store files linked, config patched) would preserve the byte
+contract if adopted. Claims check vs the circulating proposal:
 prefix caching/continuous batching/OpenAI+Anthropic APIs are real;
 "SHA-256 image hashing 28x", `vllm.entrypoints` serving, and
 `sudo sysctl wired_mem_alloc_limit` requirements are not - the real
