@@ -2,7 +2,27 @@
 
 A proposed local-first, resource-aware agent serving platform for Apple Silicon macOS, intended for engineers broadly. Local, free-to-use, and performant operation are product goals, not measured performance, an established license, or authorization to publish or distribute.
 
-**Status: strategy draft v0.9 + bounded implementation, 2026-10-05.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console with five views, opt-in Apple Foundation Models provider, owned open-weight MLX route, and optional read-only runtime Operator described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
+**Status: strategy draft v0.9 + bounded implementation, 2026-10-05.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console with five views, opt-in Apple Foundation Models provider, owned open-weight MLX route, and optional read-only runtime Operator described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. A cross-platform Python core (`python/`, D54) now mirrors the same contract for Linux/Windows/macOS serving and is covered by `python3 -m unittest discover -s python/tests`. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
+
+## Cross-platform Python core
+
+The Python implementation under `python/` ports the deterministic platform to every OS where Windows support is mandatory (D54). It is stdlib-only in the core; providers are optional imports:
+
+- **llama.cpp** (`provider: "llamacpp"`, GGUF artifact + `llama-server` binary on PATH or `OAP_LLAMA_SERVER`) — the all-OS open-weight route.
+- **mlx-lm / mlx-vlm** (`provider: "mlx"`, pulled MLX artifacts) — the macOS open-weight route; MLX is Python-first, no Swift needed.
+- **Apple Foundation Models** (`--enable-apple-model`) — macOS only, via the `oap-apple-bridge` Swift helper (`swift build --target AppleBridge`; discovered on PATH, `OAP_APPLE_BRIDGE`, or `.build/`), because FoundationModels has no Python binding.
+- **builtin.linear** — typed ML everywhere.
+
+Each catalog entry declares `requires` (OS, accelerator, format, minimum free memory); `setup` presents only routes the host can actually satisfy. Same wire surface, admission, cancellation, ledger, and truthful-refusal contract as the Swift core:
+
+```sh
+cd python && python3 -m unittest discover -s tests     # 47 tests
+PYTHONPATH=src python3 -m ondevice_agent_platform setup --none
+PYTHONPATH=src python3 -m ondevice_agent_platform serve --port 8080
+PYTHONPATH=src python3 -m ondevice_agent_platform acp --agent reference.status
+```
+
+Verified on macOS: `serve`, `/api/status`, `/v1/models`, `/api/ml/predictions` (live linear result), `/_bridge/acp` (session + streamed turn + `end_turn`), and the Apple FM route through the bridge (live `READY`, 2.8 s). Linux/Windows sampling and lock code paths are written but not yet host-verified; the `-ngl 99` GPU-offload flag passed to `llama-server` is a pending per-host calibration, not a requirement.
 
 ## Build and run
 

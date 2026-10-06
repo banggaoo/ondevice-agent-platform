@@ -857,3 +857,32 @@ call until thermal allows a reload. Tests:
 healthy push). An idle-TTL bound rather than LRU/eviction-on-write is
 deliberate: the single inference slot makes ordering trivial and keeps
 warm reload behavior predictable for interactive use.
+
+Python cross-platform core (2026-10-05): per D54 the deterministic
+platform is now also implemented under `python/` (stdlib-only core;
+optional provider imports). Ported: runtime root + owned-file/symlink
+safety + cross-OS locking, strict registry + curated catalog + per-route
+`requires` host filtering (os/accelerator/format/min-free-memory),
+content-free sqlite job/session ledger (with crash-recovery
+interrupted marking), resource samplers (Linux MemAvailable+PSI+cgroup
+v2+thermal zones; macOS `kern.memorystatus_level` + pmset therm/lowpowermode;
+Windows GlobalMemoryStatusEx + GetSystemPowerStatus), the lock+threading
+supervisor (fair-share dispatch, queue/inference deadlines, cancellation
+grace -> unconfirmed -> inference-blocked, deny_and_cancel eviction +
+idle-TTL trim + epoch guards), providers (builtin.linear, llama.cpp
+subprocess on all OS, mlx-lm/mlx-vlm on macOS, Apple FM via the
+`oap-apple-bridge` Swift executable on macOS), the loopback HTTP router
+(console static + sessions/CSRF, admin reads, /v1 chat+models, typed-ML,
+SSE events, private ACP bridge), ACP v1 stdio facade + bridge, the
+three built-in harnesses including the bounded read-only Operator, and
+the setup/model/serve/acp CLI. Verified live on macOS: 47 unit tests,
+linear prediction 200, truthful provider-unavailable for unpulled
+weights, ACP initialize/session/prompt with streamed chunk + end_turn,
+and the Apple route through the bridge (`READY`, 2.8 s). Sampler note:
+`kern.memorystatus_level` is percent-free (higher = healthier); the
+warning boundary follows the kernel's own
+`vm_pressure_level_transition_threshold` (observed 30). Not yet verified
+on Linux/Windows hosts; `llama-server -ngl 99` is a pending per-host
+calibration. The Swift implementation remains the reference and keeps
+its own test suite; both cores share the wire surface, admission, and
+truthful-refusal contract.

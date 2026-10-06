@@ -9,6 +9,9 @@ let package = Package(
         .library(name: "PlatformServing", targets: ["PlatformServing"]),
         .executable(name: "ondevice-agent-platform", targets: ["PlatformCLI"]),
         .executable(name: "acp-fixture", targets: ["ACPFixture"]),
+        /// macOS-only stdio bridge the Python core uses for the Apple
+        /// Foundation Models route (the one API with no Python binding).
+        .executable(name: "oap-apple-bridge", targets: ["AppleBridge"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.31.4"),
@@ -42,6 +45,13 @@ let package = Package(
             name: "PlatformCLI",
             dependencies: ["PlatformCore", "PlatformServing", "PlatformMLX"],
             path: "Sources/PlatformCLI"
+        ),
+        /// macOS-only: one JSON chat request per stdin line, one JSON result
+        /// per stdout line; the Python apple provider subprocesses into it.
+        .executableTarget(
+            name: "AppleBridge",
+            dependencies: [],
+            path: "Sources/AppleBridge"
         ),
         .target(
             name: "PlatformTestSupport",

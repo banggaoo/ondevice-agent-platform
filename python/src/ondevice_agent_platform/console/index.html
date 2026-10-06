@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ondevice-agent-platform</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main class="panel">
+  <header class="masthead">
+    <h1>ondevice-agent-platform</h1>
+    <p class="tagline">Local models and agents</p>
+  </header>
+
+  <nav class="viewnav" aria-label="Console views">
+    <a href="#overview" id="nav-overview" class="navbtn" aria-current="page">Overview</a>
+    <a href="#models" id="nav-models" class="navbtn">Models</a>
+    <a href="#history" id="nav-history" class="navbtn">History</a>
+    <a href="#train" id="nav-train" class="navbtn">Train</a>
+    <a href="#chat" id="nav-chat" class="navbtn">Chat</a>
+  </nav>
+
+  <p id="connstate" class="hint" role="status">
+    Connecting to the local platform service.
+  </p>
+  <p id="offline" class="error" role="status" hidden>
+    Cannot reach the platform service. Check that the daemon is running.
+  </p>
+
+  <section id="view-overview" class="view" aria-label="Overview">
+    <div class="row">
+      <div class="card gauge">
+        <h2>Thermal</h2>
+        <p id="thermal" class="reading">unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Memory pressure</h2>
+        <p id="pressure" class="reading">unknown</p>
+        <p id="pressure-source" class="hint">source unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Low power</h2>
+        <p id="lowpower" class="reading">unknown</p>
+      </div>
+      <div class="card gauge">
+        <h2>Apple models</h2>
+        <p id="apple" class="reading">unknown</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Serving</h2>
+      <p>Active inference <span id="active" class="mono">0</span>
+         &middot; pending <span id="pending" class="mono">0</span>
+         &middot; blocked <span id="blocked" class="mono">false</span></p>
+      <p>Occupied slots <span id="slots" class="mono">0</span> of
+         <span id="slots-total" class="mono">5</span>
+         &middot; Resource admission <span id="admission" class="mono">-</span></p>
+      <p id="denied" class="error" role="status" hidden>
+        Resource conditions currently defer or deny inference;
+        administration remains available.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Provider categories</h2>
+      <ul class="plain">
+        <li>Apple Foundation Models: <span id="cat-apple" class="mono">-</span></li>
+        <li>Owned open-weight LLM: <span id="cat-owned" class="mono">-</span></li>
+        <li>Typed ML: <span id="cat-ml" class="mono">-</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="view-models" class="view" aria-label="Models" hidden>
+    <div class="card">
+      <h2>Model profiles</h2>
+      <ul id="model-list" class="plain"></ul>
+      <h3>Agents</h3>
+      <ul id="agents" class="plain"></ul>
+      <p class="hint">Model artifacts are governed through the CLI, not this
+        console. Declare and fetch with
+        <code>ondevice-agent-platform model pull</code>, inspect with
+        <code>model list</code>, remove with
+        <code>model remove --alias ALIAS</code>. Nothing is downloaded at
+        inference time.</p>
+    </div>
+  </section>
+
+  <section id="view-history" class="view" aria-label="Job history" hidden>
+    <div class="card">
+      <h2>Jobs</h2>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>id</th><th>kind</th><th>consumer</th><th>state</th>
+                <th>parent</th><th>updated</th><th></th></tr>
+          </thead>
+          <tbody id="jobs"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-train" class="view" aria-label="Training" hidden>
+    <div class="card">
+      <h2>Training</h2>
+      <p class="hint">Training is deferred and not available in this build.
+        Governed model artifacts arrive through
+        <code>ondevice-agent-platform model pull</code>.</p>
+    </div>
+  </section>
+
+  <section id="view-chat" class="view" aria-label="Operator chat" hidden>
+    <div class="card">
+      <h2>Operator</h2>
+      <p class="hint" id="chat-meta">One bounded call per question; fresh
+        snapshot; no conversation memory or applied actions.</p>
+      <p class="hint">Bound model <span id="chat-model" class="mono">-</span>
+         &middot; harness <span id="chat-harness" class="mono">-</span></p>
+      <p id="chat-unavailable" class="error" role="status" hidden>
+        The Operator is not enabled. Start the daemon with
+        <code>--enable-operator</code> to use this view.
+      </p>
+      <div id="chat-log" class="chatlog" aria-live="polite"></div>
+      <form id="chat-form">
+        <label class="hint" for="chat-input">Question for the runtime Operator</label>
+        <textarea id="chat-input" rows="3" maxlength="16384"
+                  placeholder="Explain runtime status."></textarea>
+        <div class="chat-actions">
+          <button type="submit" id="chat-send">Send</button>
+          <button type="button" id="chat-stop" hidden>Stop</button>
+        </div>
+      </form>
+      <p id="chat-status" class="hint" role="status"></p>
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
