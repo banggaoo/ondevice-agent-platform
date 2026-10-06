@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -61,6 +62,101 @@ class TestRuntimeRoot(unittest.TestCase):
             root.release_lock()
             other.acquire_lock()
             other.release_lock()
+
+    def test_interrupted_write_preserves_old_bytes(self):
+        from unittest import mock
+        from ondevice_agent_platform import compat
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(d)
+            root.prepare()
+            root.write_json({"a": 1}, root.config_path)
+            original = Path(root.config_path).read_bytes()
+
+            def boom(*a, **k):
+                raise OSError("simulated crash before replace")
+
+            with mock.patch.object(compat.os, "replace", boom):
+                with self.assertRaises(OSError):
+                    root.write_json({"a": 2}, root.config_path)
+            self.assertEqual(Path(root.config_path).read_bytes(),
+                             original)
+            # Only the staged temp file may be cleaned up - and it is.
+            self.assertNotIn(".oap-write-",
+                             " ".join(os.listdir(root.path)))
+
+    def test_write_json_symlink_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(os.path.join(d, "rt"))
+            root.prepare()
+            target = os.path.join(d, "victim.json")
+            with open(target, "w") as f:
+                f.write('{"precious": true}')
+            os.symlink(target, root.config_path)
+            raises(ErrorCode.ROOT_UNSAFE,
+                   root.write_json, {"a": 1}, root.config_path)
+            with open(target) as f:
+                self.assertEqual(json.load(f), {"precious": True})
+
+    def test_write_json_nonregular_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(d)
+            root.prepare()
+            os.mkdir(root.config_path)
+            raises(ErrorCode.ROOT_UNSAFE,
+                   root.write_json, {"a": 1}, root.config_path)
+
+    def test_write_json_foreign_owned_refused(self):
+        from unittest import mock
+        from ondevice_agent_platform import compat
+        if not compat.IS_POSIX:
+            self.skipTest("uid check is POSIX-only")
+        with tempfile.TemporaryDirectory() as d:
+            root = RuntimeRoot(d)
+            root.prepare()
+            root.write_json({"a": 1}, root.config_path)
+            original = Path(root.config_path).read_bytes()
+            with mock.patch.object(compat.os, "getuid",
+                                   return_value=-1):
+                raises(ErrorCode.ROOT_UNSAFE,
+                       root.write_json, {"a": 2}, root.config_path)
+            self.assertEqual(Path(root.config_path).read_bytes(),
+                             original)
+
+    def test_crash_stage_residue_tolerated(self):
+        # A write_owned stage orphaned by real process death has the
+        # exact platform temp shape; prepare must not brick the root
+        # over it, and it is preserved untouched.
+        with tempfile.TemporaryDirectory() as d:
+            root_path = os.path.join(d, "rt")
+            stage = os.path.join(
+                root_path,
+                f".oap-write-{os.getpid()}-{'a' * 32}")
+            os.mkdir(root_path)
+            with open(stage, "w") as f:
+                f.write("partial")
+            root = RuntimeRoot(root_path)
+            root.prepare()
+            self.assertEqual(Path(stage).read_text(), "partial")
+            root.write_json({"a": 1}, root.config_path)
+            self.assertEqual(root.read_json(root.config_path),
+                             {"a": 1})
+
+    def test_stage_lookalikes_still_refused(self):
+        # Prefix-lookalike dirs/symlinks/non-pattern names are NOT the
+        # platform's stage and remain unrelated entries.
+        with tempfile.TemporaryDirectory() as d:
+            for name, make in (
+                    (f".oap-write-{os.getpid()}-{'b' * 32}",
+                     lambda p: os.mkdir(p)),
+                    (".oap-write-x-nothex",
+                     lambda p: open(p, "w").close()),
+                    (f".oap-write-{os.getpid()}-{'c' * 32}",
+                     lambda p: os.symlink(os.devnull, p))):
+                root_path = os.path.join(d, name.replace("/", "_"))
+                os.mkdir(root_path)
+                make(os.path.join(root_path, name))
+                raises(ErrorCode.ROOT_UNSAFE,
+                       RuntimeRoot(root_path).prepare)
 
 
 class TestRegistry(unittest.TestCase):
@@ -256,6 +352,49 @@ class TestChatParse(unittest.TestCase):
             ChatMessage(role=ChatRole.USER, parts=["x"])],
             max_output_tokens=64, has_explicit_output_limit=True)
         raises(ErrorCode.INVALID_REQUEST, validate_chat, req, profile)
+
+    def test_json_schema_strict_parsed_not_dropped(self):
+        req, _, _ = parse_chat_request(json.dumps({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "json_schema",
+                                "json_schema": {
+                                    "name": "answer",
+                                    "schema": {"type": "object"},
+                                    "strict": True}}}).encode())
+        self.assertEqual(req.response_format.kind, "json_schema")
+        self.assertIs(req.response_format.strict, True)
+        self.assertEqual(req.response_format.name, "answer")
+
+    def test_json_schema_strict_false_kept(self):
+        req, _, _ = parse_chat_request(json.dumps({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "response_format": {"type": "json_schema",
+                                "json_schema": {
+                                    "schema": {"type": "object"},
+                                    "strict": False}}}).encode())
+        self.assertIs(req.response_format.strict, False)
+
+    def test_json_schema_strict_nonbool_rejected(self):
+        raises(ErrorCode.INVALID_REQUEST, parse_chat_request,
+               json.dumps({
+                   "model": "m",
+                   "messages": [{"role": "user", "content": "x"}],
+                   "response_format": {"type": "json_schema",
+                                       "json_schema": {
+                                           "schema": {"type": "object"},
+                                           "strict": "yes"}}}).encode())
+
+    def test_json_schema_bad_keys_rejected(self):
+        raises(ErrorCode.INVALID_REQUEST, parse_chat_request,
+               json.dumps({
+                   "model": "m",
+                   "messages": [{"role": "user", "content": "x"}],
+                   "response_format": {"type": "json_schema",
+                                       "json_schema": {
+                                           "schema": {"type": "object"},
+                                           "surprise": 1}}}).encode())
 
 
 class TestResources(unittest.TestCase):

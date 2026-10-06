@@ -347,9 +347,25 @@ def _parse_response_format(value) -> ResponseFormat | None:
         if not isinstance(schema_obj, dict):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "json_schema malformed")
+        for key in schema_obj:
+            if key not in ("name", "description", "schema", "strict"):
+                raise PlatformError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"unsupported json_schema field: {key}")
+        name = schema_obj.get("name")
+        if name is not None and not isinstance(name, str):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "json_schema name must be a string")
+        schema = schema_obj.get("schema")
+        if schema is not None and not isinstance(schema, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "json_schema schema must be an object")
+        strict = schema_obj.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "json_schema strict must be a boolean")
         return ResponseFormat(kind="json_schema",
-                              name=schema_obj.get("name"),
-                              schema=schema_obj.get("schema"))
+                              name=name, schema=schema, strict=strict)
     raise PlatformError(ErrorCode.INVALID_REQUEST,
                         "unsupported response_format")
 
@@ -357,6 +373,19 @@ def _parse_response_format(value) -> ResponseFormat | None:
 # ---------------------------------------------------------------------------
 # Responses.
 # ---------------------------------------------------------------------------
+
+
+def _usage_object(usage) -> dict | None:
+    """The OpenAI usage object only when all three counts are genuinely
+    known - a partial result is never zero-filled into a lie."""
+    if usage is None:
+        return None
+    if usage.prompt_tokens is None or usage.completion_tokens is None \
+            or usage.total_tokens is None:
+        return None
+    return {"prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens}
 
 
 def chat_response(result, requested_model: str) -> dict:
@@ -376,12 +405,9 @@ def chat_response(result, requested_model: str) -> dict:
         "model": requested_model,
         "choices": [choice],
     }
-    if result.usage is not None:
-        body["usage"] = {
-            "prompt_tokens": result.usage.prompt_tokens or 0,
-            "completion_tokens": result.usage.completion_tokens or 0,
-            "total_tokens": result.usage.total_tokens or 0,
-        }
+    usage = _usage_object(result.usage)
+    if usage is not None:
+        body["usage"] = usage
     return body
 
 
@@ -420,13 +446,7 @@ def stream_frames(result, requested_model: str,
         frames.append(frame({
             "id": cid, "object": "chat.completion.chunk", "created": created,
             "model": requested_model, "choices": [],
-            "usage": {
-                "prompt_tokens": (result.usage.prompt_tokens
-                                  if result.usage else 0),
-                "completion_tokens": (result.usage.completion_tokens
-                                      if result.usage else 0),
-                "total_tokens": (result.usage.total_tokens
-                                 if result.usage else 0)}}))
+            "usage": _usage_object(result.usage)}))
     frames.append(b"data: [DONE]\n\n")
     return frames
 

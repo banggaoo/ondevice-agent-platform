@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -25,6 +26,9 @@ from .providers.linear import LinearPredictor
 from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
                        LLAMACPP_PROVIDER_ID, MLX_PROVIDER_ID,
                        VLLMMLX_PROVIDER_ID, parse_registry)
+from .runtime_root import RuntimeRoot
+from .server import PlatformHTTPServer
+from .supervisor import PlatformSupervisor
 
 # One managed venv under <root>/providers/oap-env owns the platform's
 # provider dependencies: vllm-mlx's server binary resolves there without
@@ -33,10 +37,9 @@ from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
 # posture as model artifacts.
 _PROVIDER_ENV = "oap-env"
 _PROVIDER_PINS = ("vllm-mlx==0.5.0", "mlx-lm==0.32.0", "mlx-vlm==0.7.6")
+_PROVIDER_DISTS = ("vllm-mlx", "mlx-lm", "mlx-vlm")
+_MIN_PYTHON = (3, 11)
 _REEXEC_GUARD = "OAP_PROVIDER_ENV"
-from .runtime_root import RuntimeRoot
-from .server import PlatformHTTPServer
-from .supervisor import PlatformSupervisor
 
 
 def _eprint(*args) -> None:
@@ -128,48 +131,234 @@ def _provider_env_python(root: RuntimeRoot) -> str | None:
     return path if os.path.isfile(path) else None
 
 
+def _host_supports_mlx() -> bool:
+    from .requirements import host_info
+    return host_info().has_metal
+
+
+def _env_python_path(env_dir: str) -> str | None:
+    name = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    path = os.path.join(env_dir, name)
+    return path if os.path.isfile(path) else None
+
+
+def _env_structural_check(env_dir: str) -> str:
+    """Validate an existing env directory's shape and ownership: real
+    pyvenv.cfg (regular, non-symlink, owned) plus an interpreter. Raises
+    ROOT_UNSAFE on anything else - refuse, never wipe."""
+    import stat
+    cfg = os.path.join(env_dir, "pyvenv.cfg")
+    try:
+        st = os.lstat(cfg)
+    except OSError:
+        raise PlatformError(
+            ErrorCode.ROOT_UNSAFE,
+            f"{env_dir} is not a managed python env - move it aside or "
+            "re-run `provider install` on a clean providers dir")
+    if not stat.S_ISREG(st.st_mode):
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "pyvenv.cfg is not a regular file")
+    if os.name == "posix" and st.st_uid != os.getuid():
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "pyvenv.cfg not owned by this user")
+    env_py = _env_python_path(env_dir)
+    if env_py is None:
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "provider env has no interpreter")
+    return env_py
+
+
+def _probe_provider_env(env_py: str, names=None) -> dict | None:
+    """Ask the env interpreter itself for version, sys.prefix, and
+    installed distribution versions - importlib.metadata only, no
+    package imports. None means the interpreter is not usable."""
+    names = list(names) if names is not None \
+        else list(_PROVIDER_DISTS) + ["setuptools"]
+    script = (
+        "import json,sys;"
+        "import importlib.metadata as M;"
+        "names=sys.argv[1:];"
+        "have={d.metadata.get('Name','').lower():d.version "
+        "for d in M.distributions()};"
+        "print(json.dumps({'version':list(sys.version_info[:2]),"
+        "'prefix':sys.prefix,"
+        "'packages':{n:have.get(n.lower()) for n in names}}))")
+    try:
+        proc = subprocess.run(
+            [env_py, "-c", script, *names],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _validate_env_interpreter(env_py: str, env_dir: str,
+                              probe: dict | None) -> None:
+    """The interpreter must be a real >=3.11 whose sys.prefix IS the env
+    dir - a shell wrapper or foreign python fails."""
+    if probe is None:
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "provider env interpreter is not usable")
+    version = probe.get("version")
+    if (not isinstance(version, list) or len(version) < 2
+            or tuple(version[:2]) < _MIN_PYTHON):
+        raise PlatformError(
+            ErrorCode.ROOT_UNSAFE,
+            f"provider env interpreter is too old "
+            f"(needs Python >={_MIN_PYTHON[0]}.{_MIN_PYTHON[1]})")
+    prefix = probe.get("prefix")
+    if not isinstance(prefix, str) or os.path.normcase(
+            os.path.realpath(prefix)) != os.path.normcase(
+            os.path.realpath(env_dir)):
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "provider env interpreter prefix mismatch")
+
+
+def _missing_pins(packages: dict) -> list[str]:
+    """Pinned dists absent or at the wrong version. Exact pins only."""
+    missing = []
+    for pin in _PROVIDER_PINS:
+        name, _, want = pin.partition("==")
+        if packages.get(name) != want:
+            missing.append(pin)
+    return missing
+
+
 def _provider_missing(root: RuntimeRoot) -> dict[str, str]:
     """provider_id -> missing prerequisite, for status and setup offers."""
     out: dict[str, str] = {}
     pd = root.providers_path
     from .providers.vllmmlx import _server_binary as _vllm
     from .providers.llamacpp import _server_binary as _llama
-    if _vllm(pd) is None:
-        out[VLLMMLX_PROVIDER_ID] = "vllm-mlx"
-    if _llama(pd) is None:
-        out[LLAMACPP_PROVIDER_ID] = "llama-server"
-    if _provider_env_python(root) is None:
-        # In-process deps matter only when no managed env exists - with
-        # one installed, serve re-execs into it before boot.
-        miss = [m for m in ("mlx_lm", "mlx_vlm")
-                if importlib.util.find_spec(m) is None]
+    from .providers.apple import _bridge_binary
+    if _host_supports_mlx():
+        if _vllm(pd) is None:
+            out[VLLMMLX_PROVIDER_ID] = "vllm-mlx"
+        env_py = _provider_env_python(root)
+        if env_py is not None:
+            # An env directory alone proves nothing; dists are probed in
+            # the env interpreter itself, never imported here.
+            probe = _probe_provider_env(env_py, ("mlx-lm", "mlx-vlm"))
+            packages = probe.get("packages", {}) if probe else {}
+            miss = [d for d in ("mlx-lm", "mlx-vlm")
+                    if not packages.get(d)]
+        else:
+            # In-process deps matter only when no managed env exists -
+            # with one installed, serve re-execs into it before boot.
+            miss = [m for m in ("mlx_lm", "mlx_vlm")
+                    if importlib.util.find_spec(m) is None]
         if miss:
             out[MLX_PROVIDER_ID] = "python: " + "/".join(miss)
-    from .providers.apple import _bridge_binary
+    else:
+        out[VLLMMLX_PROVIDER_ID] = "requires Metal (Apple Silicon)"
+        out[MLX_PROVIDER_ID] = "requires Metal (Apple Silicon)"
+    if _llama(pd) is None:
+        out[LLAMACPP_PROVIDER_ID] = "llama-server"
     if _bridge_binary() is None:
         out[APPLE_PROVIDER_ID] = "oap-apple-bridge"
     return out
 
 
+def _python_supports(path: str) -> bool:
+    """Probe the candidate interpreter itself; the PATH name (or the
+    running interpreter) proves nothing about its real version."""
+    try:
+        proc = subprocess.run(
+            [path, "-c",
+             "import sys;sys.exit(0 if sys.version_info[:2] >= "
+             f"({_MIN_PYTHON[0]},{_MIN_PYTHON[1]}) else 1)"],
+            capture_output=True, timeout=15)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _provider_env_candidates():
-    for name in ("python3.13", "python3.12", "python3.11", "python3.10"):
+    seen = set()
+    for name in ("python3.13", "python3.12", "python3.11", "python3",
+                 "python"):
         found = shutil.which(name)
-        if found:
+        if found and found not in seen:
+            seen.add(found)
             yield found
-    if sys.version_info >= (3, 10):
+    if sys.executable and sys.executable not in seen:
         yield sys.executable
 
 
-def _install_provider_env(root: RuntimeRoot) -> str:
-    """Create <root>/providers/oap-env and install the pinned provider
-    dependencies. Provider pins are a governed prerequisite - same class
-    of install as `model pull`."""
-    os.makedirs(root.providers_path, exist_ok=True)
-    env_dir = os.path.join(root.providers_path, _PROVIDER_ENV)
+def _pip_install(env_py: str, args: list) -> None:
+    """Owner-visible failure only: pip errors map to a typed error with
+    the exit status, never a traceback."""
+    try:
+        subprocess.run([env_py, "-m", "pip", "install", *args],
+                       check=True)
+    except subprocess.CalledProcessError as e:
+        raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                            f"pip install failed (exit {e.returncode})")
+    except (OSError, subprocess.SubprocessError) as e:
+        raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                            f"pip install failed: {e}")
+
+
+def _ensure_provider_env(root: RuntimeRoot,
+                         install_pins: bool | None = None) -> str:
+    """Ensure <root>/providers/oap-env exists with its dependencies.
+    Existing envs are reused, never wiped; a symlinked or non-venv
+    directory is refused rather than repaired. Every existing env is
+    re-validated for real: structure, interpreter version and prefix,
+    and on Metal hosts the exact provider pins - missing or wrong pins
+    are repaired through the governed provider-install flow, not by
+    deleting the env. Callers hold the root lifetime lock."""
+    if install_pins is None:
+        install_pins = _host_supports_mlx()
+    pdir = root.providers_path
+    if os.path.islink(pdir):
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "providers dir is a symlink")
+    env_dir = os.path.join(pdir, _PROVIDER_ENV)
+    if os.path.islink(env_dir):
+        raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                            "provider env is a symlink")
     if os.path.isdir(env_dir):
-        shutil.rmtree(env_dir)
+        env_py = _env_structural_check(env_dir)
+        _validate_env_interpreter(env_py, env_dir,
+                                  _probe_provider_env(env_py))
+    else:
+        if os.path.exists(env_dir):
+            raise PlatformError(
+                ErrorCode.ROOT_UNSAFE,
+                f"{env_dir} is not a managed python env - move it aside "
+                "or remove it, then re-run `provider install`")
+        os.makedirs(pdir, exist_ok=True)
+        env_py = _create_venv(env_dir)
+    if install_pins:
+        probe = _probe_provider_env(env_py)
+        missing = _missing_pins(
+            probe.get("packages", {}) if probe else {})
+        if missing:
+            _pip_install(env_py, list(_PROVIDER_PINS))
+            probe = _probe_provider_env(env_py)
+            missing = _missing_pins(
+                probe.get("packages", {}) if probe else {})
+            if missing:
+                raise PlatformError(
+                    ErrorCode.STORAGE_FAILURE,
+                    "provider env still lacks: " + ", ".join(missing))
+    return env_py
+
+
+def _create_venv(env_dir: str) -> str:
+    """Create the env with the first probed interpreter meeting the
+    minimum; candidates are version-probed before use."""
     created = False
     for py in _provider_env_candidates():
+        if not _python_supports(py):
+            continue
         try:
             subprocess.run([py, "-m", "venv", env_dir], check=True)
             created = True
@@ -177,28 +366,99 @@ def _install_provider_env(root: RuntimeRoot) -> str:
         except (subprocess.CalledProcessError, OSError):
             shutil.rmtree(env_dir, ignore_errors=True)
     if not created:
-        raise PlatformError(ErrorCode.INVALID_REQUEST,
-                            "provider env needs Python >=3.10 on PATH")
-    pip = os.path.join(env_dir, "Scripts" if os.name == "nt" else "bin",
-                       "pip")
-    try:
-        subprocess.run([pip, "install", *_PROVIDER_PINS], check=True)
-    except subprocess.CalledProcessError:
+        raise PlatformError(
+            ErrorCode.INVALID_REQUEST,
+            f"provider env needs Python >={_MIN_PYTHON[0]}."
+            f"{_MIN_PYTHON[1]} on PATH")
+    env_py = _env_python_path(env_dir)
+    if env_py is None:
         raise PlatformError(ErrorCode.STORAGE_FAILURE,
-                            "provider env dependency install failed")
-    return env_dir
+                            "venv created no interpreter")
+    return env_py
+
+
+def _build_requires(source: str) -> list[str]:
+    """[build-system] requires of the package being installed - the only
+    build prerequisites --no-build-isolation may need."""
+    import tomllib
+    try:
+        with open(os.path.join(source, "pyproject.toml"), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    requires = data.get("build-system", {}).get("requires", [])
+    return [r for r in requires if isinstance(r, str)]
+
+
+def _version_meets(have: str | None, spec: str) -> bool:
+    """True when installed `have` satisfies a name[>=|==]version spec."""
+    m = re.match(r"\s*([A-Za-z0-9_.-]+)\s*(>=|==)\s*([0-9.]+)\s*$", spec)
+    if m is None:
+        return have is not None
+    if have is None:
+        return False
+    want = m.group(3)
+    if m.group(2) == "==":
+        return have == want
+    try:
+        wv = tuple(int(x) for x in want.split("."))
+        hv = tuple(int(x) for x in have.split(".")[:len(wv)])
+    except ValueError:
+        return False
+    return hv >= wv
+
+
+def _check_build_prereqs(env_py: str, source: str) -> None:
+    """The package's declared build prerequisites must exist in the env
+    (>=3.12 venvs no longer ship setuptools). Missing declared specs are
+    provisioned via the governed pip step; an unmet prerequisite under
+    PIP_NO_INDEX fails as an installer error, never a silent download."""
+    specs = _build_requires(source)
+    if not specs:
+        return
+    names = []
+    for spec in specs:
+        m = re.match(r"\s*([A-Za-z0-9_.-]+)", spec)
+        names.append(m.group(1) if m else spec)
+    probe = _probe_provider_env(env_py, names)
+    packages = probe.get("packages", {}) if probe else {}
+    absent = [spec for spec, name in zip(specs, names)
+              if not _version_meets(packages.get(name), spec)]
+    if not absent:
+        return
+    _pip_install(env_py, absent)
+    probe = _probe_provider_env(env_py, names)
+    packages = probe.get("packages", {}) if probe else {}
+    still = [spec for spec, name in zip(specs, names)
+             if not _version_meets(packages.get(name), spec)]
+    if still:
+        raise PlatformError(
+            ErrorCode.STORAGE_FAILURE,
+            "managed env lacks build prerequisites: " + ", ".join(still)
+            + " - install them into the env or provide a package index")
+
+
+def _needs_provider_reexec(root: RuntimeRoot) -> bool:
+    """A managed env exists and this interpreter is not its python. The
+    comparison is sys.prefix vs the env dir, not interpreter realpaths -
+    venv binaries resolve to the same base Python and previously skipped
+    a needed reexec."""
+    if os.environ.get(_REEXEC_GUARD):
+        return False
+    env_dir = os.path.join(root.providers_path, _PROVIDER_ENV)
+    if _provider_env_python(root) is None:
+        return False
+    return os.path.normcase(os.path.realpath(sys.prefix)) != \
+        os.path.normcase(os.path.realpath(env_dir))
 
 
 def _maybe_reexec_provider_env(root: RuntimeRoot) -> None:
     """When the managed provider env exists the daemon must run under its
     interpreter - in-process providers import there, not in whatever
     python launched the CLI."""
-    if os.environ.get(_REEXEC_GUARD):
+    if not _needs_provider_reexec(root):
         return
     env_py = _provider_env_python(root)
-    if env_py is None or \
-            os.path.realpath(env_py) == os.path.realpath(sys.executable):
-        return
     env = dict(os.environ)
     env[_REEXEC_GUARD] = "1"
     src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -213,11 +473,22 @@ def cmd_serve(args) -> int:
     root = _root_for(args)
     root.prepare()
     root.check_state_files()
-    _apply_serve_config(args, _read_config(root))
-    _first_run_setup(root)
-    _maybe_reexec_provider_env(root)
+    # The lifetime lock precedes every guided-setup write; a running
+    # daemon holding it makes serve (and any setup write) fail loudly.
     root.acquire_lock()
     try:
+        _first_run_setup(root)
+        # Config applies after the prompts: an enableOperator answer from
+        # guided setup takes effect on this same launch, while explicit
+        # CLI flags still win over stored choices.
+        _apply_serve_config(args, _read_config(root))
+        if _needs_provider_reexec(root):
+            # A setup-created env means the interpreter must change. The
+            # lock fd cannot survive execve - release before exec, and
+            # reacquire when exec turns out not to run.
+            root.release_lock()
+            _maybe_reexec_provider_env(root)
+            root.acquire_lock()
         supervisor, _store, _providers = _build_supervisor(root, args)
         agents = AgentService(supervisor)
         agents.attach(supervisor)
@@ -451,25 +722,37 @@ def _finish_setup(root: RuntimeRoot, selection, *, pull: bool,
     root.write_json(merged, root.registry_path)
     print(f"registry: {len(selection)} catalog model(s) declared, "
           f"{len(merged['models'])} total")
+    # Even an empty selection is an intentional answer - mark the setup
+    # completed so first-run serve does not re-prompt every launch.
+    config = _read_config(root)
+    if not config.get("setupCompleted"):
+        config["setupCompleted"] = True
+        root.write_json(config, root.config_path)
     if interactive:
         _prompt_operator_agent(root, selection, input_fn)
-    if interactive and selection and _provider_env_python(root) is None:
+    if interactive and selection:
+        # A base/core managed env may already exist without provider
+        # pins; that must not suppress the offer for selected runtimes.
         missing = {pid: name for pid, name in _provider_missing(root).items()
                    if pid in {e.provider for e in selection}}
         coverable = sorted({n for pid, n in missing.items()
-                            if pid in (VLLMMLX_PROVIDER_ID,
-                                       MLX_PROVIDER_ID)})
+                            if _host_supports_mlx()
+                            and pid in (VLLMMLX_PROVIDER_ID,
+                                        MLX_PROVIDER_ID)})
         if coverable:
             if input_fn(f"provider runtime(s) missing: "
                         f"{', '.join(coverable)} - install the managed "
                         "provider env now? [y/N] ").strip().lower() == "y":
                 print("installing provider env "
                       f"({', '.join(_PROVIDER_PINS)})")
-                _install_provider_env(root)
+                _ensure_provider_env(root, install_pins=True)
                 print("  provider env ready")
             else:
                 print("  those routes will report provider-unavailable "
                       "until installed (`provider install`)")
+            missing = {pid: n for pid, n in missing.items()
+                       if pid not in (VLLMMLX_PROVIDER_ID,
+                                      MLX_PROVIDER_ID)}
         external = sorted({n for pid, n in missing.items()
                            if pid not in (VLLMMLX_PROVIDER_ID,
                                           MLX_PROVIDER_ID)})
@@ -490,25 +773,42 @@ def _finish_setup(root: RuntimeRoot, selection, *, pull: bool,
         print("run `model pull --alias ALIAS` to fetch artifacts")
 
 
-def _first_run_setup(root: RuntimeRoot) -> None:
+def _first_run_setup(root: RuntimeRoot, input_fn=input) -> None:
     """A root with no declared models: interactive runs get guided setup
     inline; non-interactive runs get a one-line hint, then boot empty."""
     payload = root.read_json(root.registry_path) \
         if os.path.isfile(root.registry_path) else None
     if isinstance(payload, dict) and payload.get("models"):
         return
+    if _read_config(root).get("setupCompleted"):
+        # An intentional "none" answer is a settled choice, not an
+        # unfinished setup - do not re-prompt on every launch.
+        return
     if not sys.stdin.isatty():
         _eprint("no models declared - run "
                 "`ondevice-agent-platform setup` for guided install")
         return
     print("first run - choose models to serve (or 'none' to skip):")
-    selection = _select_models_interactive(catalog.available_entries())
-    _finish_setup(root, selection, pull=False, interactive=True)
+    selection = _select_models_interactive(catalog.available_entries(),
+                                           input_fn=input_fn)
+    _finish_setup(root, selection, pull=False, interactive=True,
+                  input_fn=input_fn)
 
 
 def cmd_setup(args) -> int:
     root = _root_for(args)
     root.prepare()
+    root.check_state_files()
+    # Setup writes registry/config and may install the env - all under
+    # the lifetime lock so it refuses while a daemon is running.
+    root.acquire_lock()
+    try:
+        return _cmd_setup_locked(root, args)
+    finally:
+        root.release_lock()
+
+
+def _cmd_setup_locked(root: RuntimeRoot, args) -> int:
     available = catalog.available_entries()
     eligible = [(e, reason) for e, ok, reason in available if ok]
     if args.all:
@@ -564,9 +864,19 @@ def cmd_provider_list(args) -> int:
 def cmd_provider_install(args) -> int:
     root = _root_for(args)
     root.prepare()
-    print(f"installing provider env ({', '.join(_PROVIDER_PINS)})")
-    path = _install_provider_env(root)
-    print(f"provider env ready: {path}")
+    root.check_state_files()
+    root.acquire_lock()
+    try:
+        if _host_supports_mlx():
+            print(f"installing provider env "
+                  f"({', '.join(_PROVIDER_PINS)})")
+        else:
+            print("installing provider env (no mlx pins on this host)")
+        _ensure_provider_env(root)
+        print(f"provider env ready: "
+              f"{os.path.join(root.providers_path, _PROVIDER_ENV)}")
+    finally:
+        root.release_lock()
     return 0
 
 
@@ -582,51 +892,106 @@ def _repo_python_dir() -> str | None:
 
 
 def _link_executable(root: RuntimeRoot, bin_name: str) -> str:
-    """Put the console script on PATH: symlink into ~/.local/bin when that
-    dir is on PATH, else the first writable PATH dir; returns the link
-    path. POSIX only - Windows callers get the env Scripts dir printed."""
+    """Link the env console script into ~/.local/bin only - never an
+    arbitrary writable PATH dir. A link already pointing at this exact
+    script is idempotent; unrelated files/symlinks are preserved and
+    reported. POSIX only - Windows callers get the Scripts dir printed."""
     script = os.path.join(root.providers_path, _PROVIDER_ENV,
                           "bin", bin_name)
     if not os.path.isfile(script):
         raise PlatformError(ErrorCode.INTERNAL,
                             "installed console script missing")
-    home = os.path.expanduser("~")
-    candidates = [os.path.join(home, ".local", "bin")] + \
-        os.environ.get("PATH", "").split(os.pathsep)
-    for d in candidates:
-        if d and os.path.isdir(d) and os.access(d, os.W_OK):
-            link = os.path.join(d, bin_name)
-            if os.path.islink(link) or os.path.isfile(link):
-                os.remove(link)
-            os.symlink(script, link)
+    target_dir = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    os.makedirs(target_dir, exist_ok=True)
+    link = os.path.join(target_dir, bin_name)
+    if os.path.lexists(link):
+        if os.path.islink(link) and \
+                os.path.realpath(link) == os.path.realpath(script):
             return link
-    raise PlatformError(ErrorCode.INVALID_REQUEST,
-                        f"no writable PATH dir; add "
-                        f"{os.path.dirname(script)} to PATH")
+        raise PlatformError(
+            ErrorCode.INVALID_REQUEST,
+            f"{link} exists and is unrelated - move it aside or remove "
+            "it, then re-run install")
+    os.symlink(script, link)
+    return link
 
 
 def cmd_install(args) -> int:
-    """Install the platform: managed provider env, editable package into
-    it, and an ondevice-agent-platform executable linked onto PATH."""
+    """Install the platform: managed provider env (reused, never wiped),
+    the package installed non-editably from --source, and an
+    ondevice-agent-platform executable linked into ~/.local/bin."""
     root = _root_for(args)
     root.prepare()
-    env_py = _provider_env_python(root)
-    if env_py is None:
-        print(f"installing provider env ({', '.join(_PROVIDER_PINS)})")
-        _install_provider_env(root)
-        env_py = _provider_env_python(root)
-    repo_python = _repo_python_dir()
-    if repo_python is not None:
-        pip = os.path.join(root.providers_path, _PROVIDER_ENV,
-                           "Scripts" if os.name == "nt" else "bin", "pip")
-        subprocess.run([pip, "install", "-e", repo_python], check=True)
+    root.check_state_files()
+    root.acquire_lock()
+    try:
+        return _install_impl(root, args)
+    finally:
+        root.release_lock()
+
+
+def _root_needs_mlx(root: RuntimeRoot) -> bool:
+    """'Install only what is needed': provision the pinned MLX stack
+    only when the declared registry uses an MLX-backed provider on a
+    Metal host - a bare or empty-registry install stays core-only."""
+    if not _host_supports_mlx():
+        return False
+    payload = root.read_json(root.registry_path) \
+        if os.path.isfile(root.registry_path) else None
+    if not isinstance(payload, dict):
+        return False
+    return any(e.profile.provider_id in (MLX_PROVIDER_ID,
+                                         VLLMMLX_PROVIDER_ID)
+               for e in parse_registry(payload))
+
+
+def _install_impl(root: RuntimeRoot, args) -> int:
+    source = getattr(args, "source", None) or _repo_python_dir()
+    script_name = "ondevice-agent-platform" + \
+        (".exe" if os.name == "nt" else "")
+    script = os.path.join(root.providers_path, _PROVIDER_ENV,
+                          "Scripts" if os.name == "nt" else "bin",
+                          script_name)
+    have_script = os.path.isfile(script)
+    if source is not None and not os.path.isfile(
+            os.path.join(source, "pyproject.toml")):
+        # An explicitly supplied source that is not a package directory
+        # must not be silently ignored, even with a script installed.
+        raise PlatformError(
+            ErrorCode.INVALID_REQUEST,
+            f"no pyproject.toml at --source {source} - pass the repo's "
+            "python/ package directory")
+    have_source = source is not None
+    if not have_source and not have_script:
+        # Fail before touching the env: a new install needs a package
+        # source to make the console script.
+        raise PlatformError(
+            ErrorCode.INVALID_REQUEST,
+            "no package source found - pass --source PATH to the repo's "
+            "python/ directory or run via bin/ondevice-agent-platform "
+            "from a checkout")
+    env_py = _ensure_provider_env(root,
+                                  install_pins=_root_needs_mlx(root))
+    if have_source:
+        # An explicit (or source-mode default) source always means
+        # "install this package": run the pip step even when a console
+        # script already exists - that is how updates/reinstalls work.
+        _check_build_prereqs(env_py, source)
+        _pip_install(env_py,
+                     ["--no-deps", "--no-build-isolation", source])
+        if not os.path.isfile(script):
+            raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                                "package install produced no console "
+                                "script")
     if os.name == "nt":
-        scripts = os.path.join(root.providers_path, _PROVIDER_ENV,
-                               "Scripts")
-        print(f"installed; add {scripts} to PATH")
+        print(f"installed; add {os.path.dirname(script)} to PATH")
     else:
         link = _link_executable(root, "ondevice-agent-platform")
         print(f"executable linked: {link}")
+        bindir = os.path.dirname(link)
+        if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+            print(f"note: {bindir} is not on PATH - add it: "
+                  f'export PATH="{bindir}:$PATH"')
     if os.path.isfile(root.daemon_path):
         print("note: a daemon is running - restart `serve` to pick up "
               "the new install")
@@ -710,6 +1075,10 @@ def build_parser() -> argparse.ArgumentParser:
         "install", help="install provider env + ondevice-agent-platform "
         "executable onto PATH")
     data_root(inst)
+    inst.add_argument("--source", default=None,
+                      help="path to the repo's python/ package directory "
+                      "(containing pyproject.toml); defaults to the "
+                      "checkout this CLI was launched from")
     inst.set_defaults(func=cmd_install)
 
     acp = sub.add_parser("acp", help="ACP stdio facade")

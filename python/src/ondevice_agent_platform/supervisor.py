@@ -23,7 +23,8 @@ from .limits import PlatformLimits
 from .profiles import (AgentProfile, CategoryStatus, ConsumerScope, Grant,
                        LocalConsumers, ModelKind, ModelProfile, Principal)
 from .providers.base import (ModelCacheEvicting, ProviderReadiness)
-from .registry import APPLE_PROVIDER_ID, MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID
+from .registry import (APPLE_PROVIDER_ID, MLX_PROVIDER_ID,
+                       LLAMACPP_PROVIDER_ID, VLLMMLX_PROVIDER_ID)
 from . import resources
 from .state import JobKind, JobRecord, JobState, StateStore
 
@@ -87,6 +88,8 @@ class PlatformSupervisor:
         self._insertion_reservations = 0
         self._job_cancellations: dict[str, tuple] = {}
         self._job_tokens: dict[str, CancellationToken] = {}
+        self._job_deadline_timers: dict[str, threading.Timer] = {}
+        self._job_grace_timers: dict[str, threading.Timer] = {}
         self._job_sequence = 0
         self._next_consumer_index = 0
         self._inference_blocked = False
@@ -111,15 +114,65 @@ class PlatformSupervisor:
                 self.agent_service.register_builtin_echo(model_alias=alias)
 
     def shutdown(self) -> None:
+        # Order: stop resource callbacks (no re-entry after teardown),
+        # cancel every job, close agent sessions and providers, then wait
+        # for running workers - but only inside the existing cancellation
+        # grace. A noncooperative provider keeps its slot until it truly
+        # finishes; shutdown never releases a slot early. Idempotent.
         with self._lock:
+            if self._shutting_down:
+                return
             self._shutting_down = True
+        try:
+            self._source.stop()
+        except Exception:
+            pass
         self._cancel_all(PlatformError(ErrorCode.CANCELLED))
-        time.sleep(0.2)
-        self._source.stop()
         if self.agent_service:
-            self.agent_service.close_all()
-        self._store.close()
-        self._root.release_lock()
+            try:
+                self.agent_service.close_all()
+            except Exception:
+                pass
+        seen: set[int] = set()
+        for provider in (list(self._llm_providers.values())
+                         + list(self._ml_predictors.values())):
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            close = getattr(provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        deadline = time.time() + PlatformLimits.CANCELLATION_GRACE_SECONDS
+        while True:
+            with self._lock:
+                threads = [t for t in self._running_threads.values()
+                           if t.is_alive()]
+            remaining = deadline - time.time()
+            if not threads or remaining <= 0:
+                break
+            for t in threads:
+                t.join(timeout=min(0.05, max(remaining, 0.001)))
+        with self._lock:
+            # Grace timers stay live through the bounded wait so they remain
+            # the caller's resume path. For any still-unconfirmed request
+            # whose bound elapsed, run the existing expiry path now so the
+            # submitter cannot be stranded after shutdown returns. The slot
+            # stays held until the provider truly finishes.
+            for job in list(self._active.values()):
+                if job.state == JobState.CANCEL_REQUESTED:
+                    self._grace_expired(job.id)
+            for timer in (list(self._job_deadline_timers.values())
+                          + list(self._job_grace_timers.values())):
+                timer.cancel()
+            self._job_deadline_timers.clear()
+            self._job_grace_timers.clear()
+        try:
+            self._store.close()
+        finally:
+            self._root.release_lock()
 
     # -- grants ------------------------------------------------------------
 
@@ -275,12 +328,14 @@ class PlatformSupervisor:
                 else CategoryStatus.NOT_CONFIGURED)
 
     def _open_weight_category(self) -> CategoryStatus:
-        providers = [self._llm_providers.get(MLX_PROVIDER_ID),
-                     self._llm_providers.get(LLAMACPP_PROVIDER_ID)]
+        providers = [self._llm_providers.get(pid) for pid in
+                     (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID,
+                      VLLMMLX_PROVIDER_ID)]
         if not any(providers):
             return (CategoryStatus.OBSERVING
                     if any(p.provider_id in (MLX_PROVIDER_ID,
-                                             LLAMACPP_PROVIDER_ID)
+                                             LLAMACPP_PROVIDER_ID,
+                                             VLLMMLX_PROVIDER_ID)
                            for p in self._model_profiles.values())
                     else CategoryStatus.NOT_CONFIGURED)
         ready = any(isinstance(p, ProviderReadiness) and p.has_ready_artifact
@@ -406,13 +461,15 @@ class PlatformSupervisor:
             job_token = CancellationToken()
             self._job_tokens[job.id] = job_token
             if cancellation is not None:
+                # The observer must only schedule the locked cancel path:
+                # _cancel_job_record marks/persists CANCEL_REQUESTED before
+                # the private token fires, so a fast worker's CANCELLED
+                # return can never race an ACTIVE record into FAILED.
                 observer = cancellation.observe(
-                    lambda jt=job_token, j=job.id: (
-                        jt.cancel(),
-                        threading.Thread(
-                            target=self._cancel_job_record_safely,
-                            args=(j, PlatformError(ErrorCode.CANCELLED)),
-                            daemon=True).start()))
+                    lambda j=job.id: threading.Thread(
+                        target=self._cancel_job_record_safely,
+                        args=(j, PlatformError(ErrorCode.CANCELLED)),
+                        daemon=True).start())
                 self._job_cancellations[job.id] = (cancellation, observer)
             self._insertion_reservations += 1
         try:
@@ -539,18 +596,23 @@ class PlatformSupervisor:
                         ErrorCode.PROVIDER_UNAVAILABLE,
                         f"{type(e).__name__}: {e}"))
 
-        thread = threading.Thread(target=run, daemon=True,
-                                  name=f"oap-{job_id}")
-        self._running_threads[job_id] = thread
-        thread.start()
+        # The deadline is owned and registered before the worker starts so
+        # a fast provider can never finish ahead of ownership.
         deadline = threading.Timer(
             PlatformLimits.INFERENCE_DEADLINE_SECONDS,
             self._inference_deadline, args=(job_id,))
         deadline.daemon = True
+        deadline.name = f"oap-deadline-{job_id}"
+        self._job_deadline_timers[job_id] = deadline
+        thread = threading.Thread(target=run, daemon=True,
+                                  name=f"oap-{job_id}")
+        self._running_threads[job_id] = thread
+        thread.start()
         deadline.start()
 
     def _inference_deadline(self, job_id: str) -> None:
         with self._lock:
+            self._job_deadline_timers.pop(job_id, None)
             job = self._active.get(job_id)
             if job is None or job.state != JobState.ACTIVE:
                 return
@@ -567,6 +629,7 @@ class PlatformSupervisor:
     def _provider_finished(self, job_id: str, result=None,
                            error: Exception | None = None) -> None:
         with self._lock:
+            self._cancel_job_timers_locked(job_id)
             self._running_threads.pop(job_id, None)
             self._running_work.pop(job_id, None)
             self._release_job_cancellation(job_id)
@@ -586,7 +649,14 @@ class PlatformSupervisor:
                 self._persist(job)
             elif job.state == JobState.ACTIVE:
                 del self._active[job_id]
-                if error is not None:
+                if isinstance(error, PlatformError) \
+                        and error.code == ErrorCode.CANCELLED:
+                    # The worker really returned CANCELLED while the record
+                    # was still ACTIVE (e.g. token signal raced the locked
+                    # cancel path): the job ends cancelled, not failed.
+                    self._finish_terminal(job, JobState.CANCELLED)
+                    self._resume(job_id, None, error)
+                elif error is not None:
                     self._finish_terminal(job, JobState.FAILED)
                     self._resume(job_id, None, error)
                 elif result is not None:
@@ -616,15 +686,21 @@ class PlatformSupervisor:
             job.state = JobState.CANCEL_REQUESTED
             job.updated_at = time.time()
             self._persist(job)
-            job_token = self._job_tokens.get(job_id)
-            if job_token is not None:
-                job_token.cancel()
-            self._ask_provider_cancel_locked(job_id)
+            # The old deadline is obsolete once a cancel is requested, and
+            # the owned grace timer must exist before the provider signal so
+            # a fast completion cannot race an unregistered grace handle.
+            self._cancel_job_timers_locked(job_id)
             timer = threading.Timer(
                 PlatformLimits.CANCELLATION_GRACE_SECONDS,
                 self._grace_expired, args=(job_id,))
             timer.daemon = True
+            timer.name = f"oap-grace-{job_id}"
+            self._job_grace_timers[job_id] = timer
             timer.start()
+            job_token = self._job_tokens.get(job_id)
+            if job_token is not None:
+                job_token.cancel()
+            self._ask_provider_cancel_locked(job_id)
 
     def _cancel_job_record_safely(self, job_id: str, error: PlatformError) -> None:
         with self._lock:
@@ -639,8 +715,17 @@ class PlatformSupervisor:
         except Exception:
             pass
 
+    def _cancel_job_timers_locked(self, job_id: str) -> None:
+        deadline = self._job_deadline_timers.pop(job_id, None)
+        if deadline is not None:
+            deadline.cancel()
+        grace = self._job_grace_timers.pop(job_id, None)
+        if grace is not None:
+            grace.cancel()
+
     def _grace_expired(self, job_id: str) -> None:
         with self._lock:
+            self._job_grace_timers.pop(job_id, None)
             job = self._active.get(job_id)
             if job is None or job.state != JobState.CANCEL_REQUESTED:
                 return
@@ -713,6 +798,7 @@ class PlatformSupervisor:
         job.updated_at = time.time()
         job.provider_finished = True
         self._persist(job)
+        self._cancel_job_timers_locked(job.id)
         self._release_job_cancellation(job.id)
 
     def _resume(self, job_id: str, result, error: Exception | None) -> None:
@@ -738,6 +824,8 @@ class PlatformSupervisor:
 
     def resource_changed(self, snapshot) -> None:
         with self._lock:
+            if self._shutting_down:
+                return
             if snapshot.captured_at < self._latest_snapshot.captured_at:
                 return
             self._latest_snapshot = snapshot

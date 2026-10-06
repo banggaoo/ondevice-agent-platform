@@ -1,15 +1,22 @@
 """Loopback HTTP/1.1 server + router, mirroring HTTPServer.swift and
-Router.swift. Built on the stdlib threaded HTTP server; the route table,
-guards, session/CSRF checks, SSE framing, and the private ACP bridge carry
-over unchanged in semantics."""
+Router.swift. The transport parses requests itself on raw loopback
+sockets (bounded heads, bounded bodies, one request per connection) so a
+buffered reader can never hide smuggled bytes; the route table, guards,
+session/CSRF checks, SSE framing, and the private ACP bridge carry over
+unchanged in semantics."""
 from __future__ import annotations
 
+import http.client
+import io
 import json
 import posixpath
+import select
+import socket
+import socketserver
 import threading
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 
 from . import openai_adapter
 from .acp_service import _rpc_error  # NDJSON error frames for the bridge
@@ -42,22 +49,25 @@ def _status_code(error: PlatformError) -> int:
     return _STATUS.get(error.code, 500)
 
 
-def _valid_host(host: str | None) -> bool:
-    """Loopback-only: the listener binds loopback, and the Host header must
-    name the same authority so a browser cannot be driven at a foreign
-    loopback service."""
+def _valid_host(host: str | None, port: int | None) -> bool:
+    """Loopback-only: the listener binds loopback and the Host header must
+    name this exact listener authority (loopback name + actual port) so a
+    browser cannot be driven at a foreign loopback service. A None port
+    means no bound listener is known; the name check still applies."""
     if not host:
         return False
+    if port is not None:
+        return host in (f"127.0.0.1:{port}", f"localhost:{port}")
     name = host.split(":", 1)[0].lower()
     return name in ("127.0.0.1", "localhost", "::1", "[::1]")
 
 
 class _Request:
-    def __init__(self, handler: "BaseHTTPRequestHandler",
+    def __init__(self, method: str, target: str, headers,
                  body: bytes, token: CancellationToken) -> None:
-        self.method = handler.command
-        self.path = urllib.parse.urlsplit(handler.path).path
-        self.headers = handler.headers
+        self.method = method
+        self.path = urllib.parse.urlsplit(target).path
+        self.headers = headers
         self.body = body
         self.cancellation = token
 
@@ -87,6 +97,7 @@ class Router:
         self._sessions = sessions
         self._bridge = bridge
         self._static_dir = static_dir
+        self._expected_port: int | None = None   # set by the bound server
         self._consumer_windows: dict[str, list[float]] = {}
         self._window_lock = threading.Lock()
         self._event_subscribers = 0
@@ -155,7 +166,7 @@ class Router:
     # -- routing ----------------------------------------------------------------
 
     def handle(self, req: _Request, wfile) -> None:
-        if not _valid_host(req.header("Host")):
+        if not _valid_host(req.header("Host"), self._expected_port):
             self._send(wfile, _Response.json(
                 openai_adapter.error_body(
                     PlatformError(ErrorCode.INVALID_REQUEST)), 400))
@@ -432,7 +443,9 @@ class Router:
             200: "OK", 400: "Bad Request", 401: "Unauthorized",
             403: "Forbidden", 404: "Not Found", 409: "Conflict",
             410: "Gone", 413: "Payload Too Large",
-            429: "Too Many Requests", 500: "Internal Server Error",
+            417: "Expectation Failed", 429: "Too Many Requests",
+            431: "Request Header Fields Too Large",
+            500: "Internal Server Error",
             503: "Service Unavailable", 504: "Gateway Timeout",
         }.get(response.status, "OK")
         head = f"HTTP/1.1 {response.status} {reason}\r\n"
@@ -453,48 +466,299 @@ class Router:
             wfile.write(response.body)
 
 
+# ---------------------------------------------------------------------------
+# Transport: raw-socket single-request connections. A buffered rfile can
+# consume pipelined bytes ahead of the current request and hide them, so
+# the head is read with an explicit terminator scan and the body with an
+# exact-length loop; every byte beyond the declared framing is refusal.
+# ---------------------------------------------------------------------------
+
+_READ_CHUNK = 4096
+
+
+class _Refuse(Exception):
+    """Transport-level refusal that still writes a bounded response."""
+
+    def __init__(self, status: int, code: ErrorCode) -> None:
+        self.status = status
+        self.code = code
+        super().__init__(code.value)
+
+
+def _refusal(err: _Refuse):
+    return _Response.json(
+        openai_adapter.error_body(PlatformError(err.code)), err.status)
+
+
+class _SockWriter:
+    """sendall-backed wfile for _Response stream callables."""
+
+    def __init__(self, sock) -> None:
+        self._sock = sock
+
+    def write(self, data) -> int:
+        self._sock.sendall(data)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+
+def _watch_disconnect(sock, token: CancellationToken,
+                      stop: threading.Event) -> None:
+    """Peer-liveness monitor for the request's lifetime: any readable
+    state on the request socket after a complete bounded read is EOF,
+    an error, or post-request bytes - all end the call. MSG_PEEK only:
+    inbound data is never consumed."""
+    while not stop.is_set() and not token.is_cancelled:
+        try:
+            ready, _, _ = select.select([sock], [], [], 0.25)
+        except (OSError, ValueError):
+            token.cancel()
+            return
+        if not ready:
+            continue
+        try:
+            sock.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            continue
+        except OSError:
+            token.cancel()
+            return
+        token.cancel()
+        return
+
+
+class _Handler(socketserver.BaseRequestHandler):
+    """One connection, one request, always Connection: close. Its
+    worker slot was already reserved by process_request."""
+
+    def handle(self) -> None:
+        server = self.server.platform_server
+        sock = self.request
+        token = CancellationToken()
+        monitor_stop = threading.Event()
+        self._monitor = None
+        with server._conn_lock:
+            server._conn_sockets.add(sock)
+            server._conn_tokens.add(token)
+        try:
+            self._serve(token, monitor_stop,
+                        lambda: self._start_monitor(sock, token,
+                                                    monitor_stop))
+        except _Refuse as e:
+            self._reply(_refusal(e))
+        except (TimeoutError, ConnectionResetError, BrokenPipeError,
+                OSError):
+            pass
+        except Exception:
+            pass
+        finally:
+            monitor_stop.set()
+            if self._monitor is not None:
+                self._monitor.join(timeout=2)
+            token.cancel()
+            with server._conn_lock:
+                server._conn_sockets.discard(sock)
+                server._conn_tokens.discard(token)
+            server._slots.release()
+            self._close()
+
+    def _close(self) -> None:
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.request.close()
+        except OSError:
+            pass
+
+    def _reply(self, response: _Response) -> None:
+        try:
+            Router._send(_SockWriter(self.request), response)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _start_monitor(self, sock, token, stop) -> None:
+        self._monitor = threading.Thread(
+            target=_watch_disconnect, args=(sock, token, stop),
+            daemon=True, name="oap-conn-watch")
+        self._monitor.start()
+
+    def _serve(self, token, monitor_stop, start_monitor) -> None:
+        sock = self.request
+        port = self.server.server_address[1]
+        # Absolute request-read budget: setup -> body completion only.
+        deadline = time.monotonic() \
+            + PlatformLimits.CONNECTION_READ_SECONDS
+        parsed = self._read_request(sock, port, deadline)
+        if parsed is None:
+            return
+        method, target, headers, body = parsed
+        # Request fully read: the read deadline stops here - it must
+        # never cancel admitted inference. Writes stay bounded.
+        sock.settimeout(PlatformLimits.CONNECTION_READ_SECONDS)
+        start_monitor()
+        try:
+            req = _Request(method, target, headers, body, token)
+            self.server.router.handle(req, _SockWriter(sock))
+        finally:
+            monitor_stop.set()
+
+    # -- request parsing ------------------------------------------------------
+
+    def _read_request(self, sock, port: int, deadline: float):
+        head, leftover = self._read_head(sock, deadline)
+        if head is None:
+            return None
+        rline, _, hbytes = head.partition(b"\r\n")
+        parts = rline.decode("latin-1").split(" ")
+        if len(parts) != 3 or parts[2] not in ("HTTP/1.0", "HTTP/1.1"):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        method, target = parts[0], parts[1]
+        if not method.isascii() or not method.isalpha() \
+                or not target.startswith("/"):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        # Refuse the malformed lines email-style parsing tolerates:
+        # obs-fold continuations and colonless garbage must not
+        # silently become part of a neighbouring field's value.
+        for line in hbytes.split(b"\r\n"):
+            if not line:
+                continue
+            if line[:1] in (b" ", b"\t"):
+                raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+            name, sep, _ = line.partition(b":")
+            if not sep or not name \
+                    or not all(0x21 <= c <= 0x7e for c in name):
+                raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        try:
+            headers = http.client.parse_headers(io.BytesIO(hbytes))
+        except Exception:
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        hosts = headers.get_all("Host") or []
+        if len(hosts) != 1 or not _valid_host(hosts[0], port):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        if headers.get_all("Transfer-Encoding"):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        if headers.get("Expect") is not None:
+            raise _Refuse(417, ErrorCode.INVALID_REQUEST)
+        lengths = headers.get_all("Content-Length") or []
+        if len(lengths) > 1:
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        length = 0
+        if lengths:
+            raw = lengths[0].strip()
+            if not raw.isdigit():
+                raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+            length = int(raw)
+            if length > PlatformLimits.REQUEST_BODY_BYTES:
+                raise _Refuse(413, ErrorCode.PAYLOAD_TOO_LARGE)
+        if method != "POST" and (length or leftover):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        body, extra = self._read_body(sock, leftover, length, deadline)
+        # Anything beyond the declared framing - buffered lookahead or a
+        # pipelined second request - refuses the exchange rather than
+        # dispatching bytes the framing never promised.
+        if extra or self._pending_input(sock):
+            raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+        return method, target, headers, body
+
+    def _read_head(self, sock, deadline: float):
+        buf = bytearray()
+        cap = PlatformLimits.REQUEST_HEADER_BYTES
+        while True:
+            # The delimiter is checked before size: lookahead body bytes
+            # past a complete head count against the body, not the cap.
+            idx = buf.find(b"\r\n\r\n")
+            if idx >= 0:
+                if idx + 4 > cap:
+                    raise _Refuse(431, ErrorCode.INVALID_REQUEST)
+                return bytes(buf[:idx + 4]), bytes(buf[idx + 4:])
+            if len(buf) > cap:
+                raise _Refuse(431, ErrorCode.INVALID_REQUEST)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([sock], [], [], remaining)
+            if not ready:
+                raise TimeoutError
+            chunk = sock.recv(min(_READ_CHUNK, cap + 1 - len(buf)))
+            if not chunk:
+                if not buf:
+                    return None, b""          # idle close, nothing sent
+                raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+            buf += chunk
+
+    def _read_body(self, sock, leftover: bytes, length: int,
+                   deadline: float):
+        buf = bytearray(leftover[:length])
+        extra = leftover[length:]
+        while len(buf) < length:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([sock], [], [], remaining)
+            if not ready:
+                raise TimeoutError
+            chunk = sock.recv(min(_READ_CHUNK, length - len(buf)))
+            if not chunk:
+                raise _Refuse(400, ErrorCode.INVALID_REQUEST)
+            buf += chunk
+        return bytes(buf), extra
+
+    def _pending_input(self, sock) -> bool:
+        try:
+            ready, _, _ = select.select([sock], [], [], 0)
+            if not ready:
+                return False
+            return bool(sock.recv(1, socket.MSG_PEEK))
+        except OSError:
+            return False
+
+
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    """Reserves the connection slot before the worker thread exists -
+    ThreadingHTTPServer would otherwise spawn one thread per accepted
+    socket and saturation would grow unboundedly."""
+
+    def process_request(self, request, client_address):
+        server = self.platform_server
+        if not server._slots.acquire(blocking=False):
+            try:
+                request.settimeout(PlatformLimits.CONNECTION_READ_SECONDS)
+                Router._send(_SockWriter(request), _refusal(
+                    _Refuse(429, ErrorCode.CAPACITY_LIMITED)))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            server._slots.release()
+            raise
+
+
 class PlatformHTTPServer:
-    """Threaded loopback HTTP server owning the router."""
+    """Bounded threaded loopback HTTP server owning the router."""
 
     def __init__(self, supervisor, acp=None, sessions=None, bridge=None,
                  host: str = "127.0.0.1", port: int = 8080) -> None:
+        if host != "127.0.0.1":
+            raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                                "the platform server binds loopback only")
         self.router = Router(supervisor, acp,
                              sessions or ConsoleSessions(), bridge)
-        router = self.router
-        limits_body = PlatformLimits.REQUEST_BODY_BYTES
-
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-            server_version = "OnDeviceAgentPlatform/0.2"
-
-            def log_message(self, fmt, *args):   # content-free: no request log
-                pass
-
-            def _dispatch(self) -> None:
-                token = CancellationToken()
-                body = b""
-                if self.command == "POST":
-                    try:
-                        length = int(self.headers.get("Content-Length", "0"))
-                    except ValueError:
-                        length = -1
-                    if length < 0 or length > limits_body:
-                        Router._send(self.wfile, _Response.json(
-                            openai_adapter.error_body(PlatformError(
-                                ErrorCode.PAYLOAD_TOO_LARGE)), 413))
-                        return
-                    body = self.rfile.read(length)
-                req = _Request(self, body, token)
-                try:
-                    router.handle(req, self.wfile)
-                finally:
-                    token.cancel()
-
-            do_GET = _dispatch
-            do_POST = _dispatch
-
-        self._httpd = ThreadingHTTPServer((host, port), Handler)
+        self._slots = threading.BoundedSemaphore(PlatformLimits.CONNECTIONS)
+        self._conn_lock = threading.Lock()
+        self._conn_sockets: set = set()
+        self._conn_tokens: set = set()
+        self._httpd = _BoundedHTTPServer((host, port), _Handler)
         self._httpd.daemon_threads = True
+        self._httpd.platform_server = self
+        self._httpd.router = self.router
+        self.router._expected_port = self._httpd.server_address[1]
         self._thread: threading.Thread | None = None
 
     @property
@@ -509,4 +773,20 @@ class PlatformHTTPServer:
 
     def stop(self) -> None:
         self._httpd.shutdown()
+        # Cancel in-flight requests and close their sockets so handlers
+        # blocked in inference/ACP unwind instead of lingering on daemons.
+        with self._conn_lock:
+            tokens = list(self._conn_tokens)
+            sockets = list(self._conn_sockets)
+        for token in tokens:
+            token.cancel()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
         self._httpd.server_close()

@@ -65,10 +65,13 @@ class ChatMessage:
 
 @dataclass
 class ResponseFormat:
-    """Requested output shape: guidance, never enforced decoding."""
+    """Requested output shape: guidance, never enforced decoding.
+    `strict` is only honored by providers that enforce it (vllm-mlx);
+    guidance-only providers must refuse strict=True rather than pretend."""
     kind: str                       # "json_object" | "json_schema"
     name: str | None = None
     schema: dict | None = None
+    strict: bool | None = None
 
     def guidance(self) -> str:
         if self.kind == "json_object":

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 
 from .compat import (
     acquire_lock, is_symlink, release_lock, read_owned, set_private_dir,
-    write_owned, home_dir,
+    write_owned, home_dir, IS_POSIX,
 )
 from .errors import ErrorCode, PlatformError
 from .limits import PlatformLimits
@@ -19,6 +21,26 @@ _OWNED_NAMES = {
     # brick an existing root. (Swift ownedNames lacks it; parity fix TODO.)
     ".DS_Store",
 }
+
+# A write_owned stage orphaned by process death mid-write. Only this
+# exact name pattern, on an owned regular non-symlink file, is tolerated
+# (and preserved - cleanup belongs to no one but its writer).
+_STAGED_WRITE = re.compile(r"\.oap-write-\d+-[0-9a-f]{32}\Z")
+
+
+def _is_staged_write(root: str, name: str) -> bool:
+    if _STAGED_WRITE.match(name) is None:
+        return False
+    path = os.path.join(root, name)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if IS_POSIX and st.st_uid != os.getuid():
+        return False
+    return True
 
 
 class RuntimeRoot:
@@ -74,9 +96,12 @@ class RuntimeRoot:
             if not os.path.isdir(self.path):
                 raise PlatformError(ErrorCode.ROOT_UNSAFE, "root not directory")
             for name in os.listdir(self.path):
-                if name not in _OWNED_NAMES:
-                    raise PlatformError(ErrorCode.ROOT_UNSAFE,
-                                        "unrelated entry: present")
+                if name in _OWNED_NAMES:
+                    continue
+                if _is_staged_write(self.path, name):
+                    continue
+                raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                                    "unrelated entry: present")
         else:
             os.mkdir(self.path, 0o700)
         set_private_dir(self.path)

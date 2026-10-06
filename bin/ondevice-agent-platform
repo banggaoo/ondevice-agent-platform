@@ -3,4 +3,16 @@
 # without any install. `bin/ondevice-agent-platform install` installs
 # the managed provider env and links a PATH-level executable.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHONPATH="$ROOT/python/src" exec python3 -m ondevice_agent_platform "$@"
+PY=""
+for cand in python3.13 python3.12 python3.11 python3 python; do
+    if command -v "$cand" >/dev/null 2>&1 && \
+       "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null; then
+        PY="$cand"
+        break
+    fi
+done
+if [ -z "$PY" ]; then
+    echo "error: ondevice-agent-platform needs Python >=3.11 on PATH" >&2
+    exit 1
+fi
+PYTHONPATH="$ROOT/python/src" exec "$PY" -m ondevice_agent_platform "$@"

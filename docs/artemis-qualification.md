@@ -2,7 +2,9 @@
 
 **Status:** source audit against pinned commit `351ca84` (see
 artemis-integration.md Source identity), plus live endpoint verification
-on this platform, 2026-10-04. ARTEMIS is an external consumer only - no
+on the Swift implementation (2026-10-04, recorded below) and live
+consumer verification on the installed Python platform (2026-10-07, see
+the final section). ARTEMIS is an external consumer only - no
 ARTEMIS code is modified, vendored, or invoked by the platform. The
 temporary in-repo checkout at `artemis/` was removed 2026-10-05; the
 canonical working tree is the standalone repository under
@@ -73,3 +75,42 @@ agent/tool call sites:
 4. **Concurrency:** single-inference-slot admission serializes ARTEMIS's
    parallel sub-agent calls; throughput for its multi-agent graphs needs
    measurement before claiming fitness.
+
+## Live consumer verification on the Python platform (2026-10-07)
+
+Run against the installed non-editable daemon on `127.0.0.1:8080/v1`,
+using ARTEMIS's real `ModelFactory` → endpoint resolution →
+`ChatOpenAI`/`invoke` path (venv: `langchain-openai` 1.5.2,
+`langchain-core` 1.5.6, `openai` 3.3.0). The working copy was source
+revision `897c8c4` with dirty user modifications preserved - this
+qualifies that revision's client paths, not clean upstream. All
+non-loopback networking was blocked during the probes.
+
+- **Direct text** (`qwen3.8-9b`, direct mlx route): invoke returned a
+  real completion with usage - passed.
+- **Agent shape** (`qwen3.8-9b-vllm`, primary): text primary call,
+  `bind_tools`, synthetic tool-result history, and
+  `with_structured_output` on the strict-JSON-enforcing vllm route -
+  all four calls returned HTTP 200 with correct model identity, parsed
+  tool calls, and usage - passed.
+- **Vision** (`qwen-vl`, synthetic PNG): real image turn returned
+  `content: "Red"`, usage 99/2/101, finish `stop`, while the `vllm-mlx`
+  primary stayed resident in the same daemon under `admit`/normal
+  pressure - passed on the fixed build (the earlier run surfaced an
+  image-ABI defect, since repaired and reverified). One bounded
+  coexistence observation, not capacity/headroom evidence.
+
+Current contract deltas versus the 2026-10-04 table above: tools and
+`tool_choice` are now served on the open-weight routes (the platform
+forwards schemas and parses returned calls; the platform still never
+executes consumer tools); `stream: true` is served as buffered SSE
+completion framing (not incremental token streaming); `json_schema`
+with `strict: true` is enforced only on the `vllm-mlx` route - the
+guidance-only mlx/llamacpp/Apple routes refuse `strict=True` and
+forced tool choices explicitly rather than silently degrading.
+
+**Residual - not qualified:** the optional `planner_validation` and
+`validator_pixel_safety_net` routes still default to Google in the
+inspected source (a frozen audit finding); they were not invoked by
+these probes. Full local-only ARTEMIS mobile workflows, device action,
+and automation behavior are outside this qualification.

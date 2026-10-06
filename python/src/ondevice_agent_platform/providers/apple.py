@@ -51,7 +51,11 @@ class AppleFoundationProvider(LLMProvider):
     provider_id = APPLE_PROVIDER_ID
 
     def __init__(self) -> None:
+        # _lock owns the _proc reference only. _io_lock serializes the
+        # stdin/stdout exchange; _kill must never take either while it
+        # holds them - aborting a blocking readline is the whole point.
         self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
 
     @staticmethod
@@ -94,6 +98,11 @@ class AppleFoundationProvider(LLMProvider):
                 raise PlatformError(
                     ErrorCode.INVALID_REQUEST,
                     "tool messages and calls are not expressible")
+        rf = request.response_format
+        if rf is not None and rf.strict is True:
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                "strict json schema is not enforced by this provider")
 
     def complete(self, request, profile, token=None):
         proc = self._ensure()
@@ -109,24 +118,34 @@ class AppleFoundationProvider(LLMProvider):
             payload["formatGuidance"] = request.response_format.guidance()
 
         # Cancellation kills the shared bridge: the readline returns empty
-        # and the next call respawns. Calls are serialized on the lock.
+        # and the next call respawns. Calls are serialized on the io lock;
+        # _kill runs outside it so an abort is never queued behind the
+        # very readline it is meant to wake.
         observer = (token.observe(lambda: self._kill(proc))
                     if token is not None else None)
         try:
-            with self._lock:
+            with self._io_lock:
                 try:
                     proc.stdin.write(json.dumps(payload) + "\n")
                     proc.stdin.flush()
                     line = proc.stdout.readline()
                 except (OSError, ValueError):
-                    self._proc = None
+                    # A cancelled token's observer closed these pipes to
+                    # wake this readline - the closed-pipe error is the
+                    # cancellation surfacing, not a bridge failure.
+                    if token is not None and token.is_cancelled:
+                        raise PlatformError(ErrorCode.CANCELLED)
+                    with self._lock:
+                        if self._proc is proc:
+                            self._proc = None
                     raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                         "apple bridge failed")
             if not line:
                 if token is not None and token.is_cancelled:
                     raise PlatformError(ErrorCode.CANCELLED)
                 with self._lock:
-                    self._proc = None
+                    if self._proc is proc:
+                        self._proc = None
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                     "apple bridge closed")
             try:
@@ -158,10 +177,55 @@ class AppleFoundationProvider(LLMProvider):
             usage=ChatUsage(completion_tokens=result.get("tokens")))
 
     def _kill(self, proc) -> None:
+        # Kill outside _lock: complete() may be inside a blocking readline
+        # and _lock is never held by it, but ownership clearing must not
+        # race another _ensure() respawn of a different process.
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
         with self._lock:
             if self._proc is proc:
                 self._proc = None
+
+    def close(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc is None:
+            return
+        try:
             try:
-                proc.kill()
-            except OSError:
+                proc.terminate()
+            except (OSError, ProcessLookupError):
                 pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+        finally:
+            # Reaping alone leaves our pipe ends open; close them so the
+            # child cannot linger on inherited fds.
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except (OSError, ValueError):
+                    pass

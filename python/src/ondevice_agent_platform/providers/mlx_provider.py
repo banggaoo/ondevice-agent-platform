@@ -7,11 +7,13 @@ Swift PlatformMLX provider.
 """
 from __future__ import annotations
 
-import os
+import importlib.util
 import threading
 import time
+from io import BytesIO
 
-from ..chat import ChatResult, ChatToolCall, ChatUsage, FinishReason
+from ..chat import (ChatResult, ChatToolCall, ChatUsage, FinishReason,
+                    NamedToolChoice, ToolChoice)
 from ..errors import ErrorCode, PlatformError
 from ..registry import MLX_PROVIDER_ID
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
@@ -31,6 +33,15 @@ def _import_mlx_vlm():
         return mlx_vlm
     except ImportError:
         return None
+
+
+def _module_present(name: str) -> bool:
+    """Presence check without import: the readiness path must never pay
+    the multi-second mlx import under the supervisor status lock."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 class _Container:
@@ -57,10 +68,16 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
 
     @property
     def has_ready_artifact(self) -> bool:
-        if _import_mlx_lm() is None:
-            return False
-        return any(p.source is not None and self._store.is_ready(p.source)
-                   for p in self._profiles)
+        # Health-path answer only: stat the store and probe module
+        # presence by spec. Importing mlx-lm here once blocked admin
+        # reads for seconds under the supervisor lock.
+        for p in self._profiles:
+            if p.source is None or not self._store.is_ready(p.source):
+                continue
+            dep = "mlx_vlm" if "vision" in p.capabilities else "mlx_lm"
+            if _module_present(dep):
+                return True
+        return False
 
     def artifact_ready(self, profile) -> bool | None:
         if profile.source is None:
@@ -112,6 +129,30 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         # the supervisor cancels directly; no per-job map is needed.
         return None
 
+    def close(self) -> None:
+        self.evict_resident()
+
+    def validate(self, request, profile) -> None:
+        # mlx-lm/vlm's sampler surface has no presence/frequency penalty;
+        # tool_choice beyond auto/none is not guaranteed; strict JSON is
+        # guidance-only here. Refuse all of it rather than drop silently.
+        for value, name in ((request.presence_penalty, "presence_penalty"),
+                            (request.frequency_penalty,
+                             "frequency_penalty")):
+            if value is not None and float(value) != 0.0:
+                raise PlatformError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"{name} is not expressible on the mlx route")
+        if isinstance(request.tool_choice, NamedToolChoice) \
+                or request.tool_choice == ToolChoice.REQUIRED:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "forced tool choice is not guaranteed")
+        rf = request.response_format
+        if rf is not None and rf.strict is True:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "strict json schema is not enforced by "
+                                "this provider")
+
     def _container_for(self, profile):
         if profile.source is None or not self._store.is_ready(profile.source):
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
@@ -123,7 +164,10 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             path = overlay.serve_text_dir(
                 self._store._root.models_path, path)
         with self._lock:
-            epoch = self._epochs.get(profile.alias, 0)
+            # The alias must own an epoch before load starts so an
+            # eviction mid-load bumps it and the guard below discards
+            # this container.
+            epoch = self._epochs.setdefault(profile.alias, 0)
         if vision:
             vlm = _import_mlx_vlm()
             if vlm is None:
@@ -202,21 +246,26 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "content": request.response_format.guidance()})
         return messages
 
+    def _tool_schemas(self, request) -> list | None:
+        # tool_choice=none suppresses schema forwarding AND any parsed
+        # tool calls; validate() already refused forced choices.
+        if not request.tools or request.tool_choice == ToolChoice.NONE:
+            return None
+        return [
+            {"type": "function",
+             "function": {"name": t.name, "description": t.description,
+                          "parameters": t.parameters or {}}}
+            for t in request.tools]
+
     def _complete_text(self, container, request, profile, flag) -> ChatResult:
         lm = _import_mlx_lm()
         tokenizer = container.processor
-        tools = None
-        if request.tools:
-            tools = [
-                {"type": "function",
-                 "function": {"name": t.name, "description": t.description,
-                              "parameters": t.parameters or {}}}
-                for t in request.tools]
         prompt = tokenizer.apply_chat_template(
             self._messages_payload(request, profile),
             tokenize=False, add_generation_prompt=True,
-            tools=tools)
+            tools=self._tool_schemas(request))
         text, prompt_tokens, completion_tokens = "", 0, 0
+        finish = None
         # mlx-lm >=0.29 moved sampling to a Sampler callable; temperature/
         # top_p kwargs are no longer accepted by stream_generate.
         from mlx_lm.sample_utils import make_sampler
@@ -236,31 +285,101 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             prompt_tokens = getattr(chunk, "prompt_tokens", prompt_tokens)
             completion_tokens = getattr(chunk, "generation_tokens",
                                         completion_tokens)
-        return self._result(text, request, prompt_tokens, completion_tokens)
+            if getattr(chunk, "finish_reason", None):
+                finish = chunk.finish_reason
+        return self._result(text, request, prompt_tokens,
+                            completion_tokens, finish)
+
+    def _vlm_messages(self, request) -> list[dict]:
+        """Full ordered history for apply_chat_template: every turn is
+        preserved; image-bearing user content carries text/image markers
+        in order on that turn. Tool calls/results ride through unchanged."""
+        messages = []
+        for m in request.messages:
+            role = ("system" if m.role.value in ("system", "developer")
+                    else m.role.value)
+            msg: dict = {"role": role}
+            if m.images:
+                msg["content"] = (
+                    [{"type": "text", "text": t} for t in m.parts]
+                    + [{"type": "image"} for _ in m.images])
+            else:
+                msg["content"] = m.combined_text or None
+            if m.tool_calls:
+                msg["tool_calls"] = [
+                    {"id": c.id or f"call_{i}", "type": "function",
+                     "function": {"name": c.name,
+                                  "arguments": c.arguments}}
+                    for i, c in enumerate(m.tool_calls)]
+            if m.tool_call_id:
+                msg["tool_call_id"] = m.tool_call_id
+            messages.append(msg)
+        if request.response_format is not None:
+            messages.insert(0, {"role": "system",
+                                "content": request.response_format.guidance()})
+        return messages
 
     def _complete_vlm(self, container, request, profile, flag) -> ChatResult:
         vlm = _import_mlx_vlm()
-        images = [img.data for m in request.messages for img in m.images]
-        prompt_text = self._messages_payload(request, profile)[-1]["content"]
-        output = vlm.generate(
-            container.model, container.processor, prompt_text,
-            image=images if images else None,
-            max_tokens=request.max_output_tokens,
-            temp=request.temperature or 0.0)
-        if flag.is_set():
-            raise PlatformError(ErrorCode.CANCELLED)
-        text = output.text if hasattr(output, "text") else str(output)
-        return self._result(text, request, None, None)
+        if vlm is None:
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "mlx-vlm not installed")
+        stream_generate = getattr(vlm, "stream_generate", None)
+        apply_template = getattr(
+            getattr(vlm, "prompt_utils", None), "apply_chat_template", None)
+        load_image = getattr(getattr(vlm, "utils", None), "load_image", None)
+        if stream_generate is None or apply_template is None \
+                or load_image is None:
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "mlx-vlm version lacks the required API")
+        # process_image only normalizes str inputs; BytesIO would reach the
+        # transformers processor unconverted. Decode to PIL via load_image
+        # (RGB + EXIF normalization) before handing images to stream_generate.
+        images = [load_image(BytesIO(img.data))
+                  for m in request.messages for img in m.images]
+        kwargs: dict = {}
+        tools = self._tool_schemas(request)
+        if tools is not None:
+            kwargs["tools"] = tools
+        prompt = apply_template(
+            container.processor, container.model.config,
+            self._vlm_messages(request),
+            add_generation_prompt=True, num_images=len(images), **kwargs)
+        # mlx-vlm 0.7.x stream_generate(model, processor, prompt, image=...);
+        # kwargs flow into generate_step where the temperature key is
+        # `temperature` (not the mlx-lm `temp` sampler name).
+        gen_kwargs = {"max_tokens": request.max_output_tokens,
+                      "temperature": request.temperature
+                      if request.temperature is not None else 0.0}
+        if request.top_p is not None:
+            gen_kwargs["top_p"] = request.top_p
+        if request.seed is not None:
+            gen_kwargs["seed"] = request.seed
+        text, prompt_tokens, completion_tokens = "", 0, 0
+        finish = None
+        for chunk in stream_generate(
+                container.model, container.processor, prompt,
+                image=images if images else None, **gen_kwargs):
+            if flag.is_set():
+                raise PlatformError(ErrorCode.CANCELLED)
+            text += getattr(chunk, "text", "")
+            prompt_tokens = getattr(chunk, "prompt_tokens", prompt_tokens)
+            completion_tokens = getattr(chunk, "generation_tokens",
+                                        completion_tokens)
+            if getattr(chunk, "finish_reason", None):
+                finish = chunk.finish_reason
+        return self._result(text, request, prompt_tokens,
+                            completion_tokens, finish)
 
     def _result(self, text: str, request, prompt_tokens,
-                completion_tokens) -> ChatResult:
+                completion_tokens, finish=None) -> ChatResult:
         import json as _json
         import re
         calls: list[ChatToolCall] = []
         content = text
         # mlx-lm tool templates emit calls as JSON inside the text; parse
         # the common {"name":..., "arguments":{...}} envelope back out.
-        if request.tools:
+        if request.tools and request.tool_choice != ToolChoice.NONE:
             for match in re.finditer(
                     r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*'
                     r'"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
@@ -273,7 +392,12 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if calls:
                 content = re.sub(r'<think>.*?</think>', '', text,
                                  flags=re.DOTALL).strip()
-        reason = (FinishReason.TOOL_CALLS if calls else FinishReason.STOP)
+        if calls:
+            reason = FinishReason.TOOL_CALLS
+        elif finish == "length":
+            reason = FinishReason.LENGTH
+        else:
+            reason = FinishReason.STOP
         usage = ChatUsage(prompt_tokens=prompt_tokens or None,
                           completion_tokens=completion_tokens or None,
                           total_tokens=(prompt_tokens + completion_tokens)

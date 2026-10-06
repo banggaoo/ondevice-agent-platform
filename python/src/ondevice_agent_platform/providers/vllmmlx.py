@@ -23,12 +23,11 @@ import socket
 import subprocess
 import threading
 import time
-import urllib.request
 
-from ..chat import ChatResult, ChatToolCall, ChatUsage, FinishReason
 from ..errors import ErrorCode, PlatformError
+from ..limits import PlatformLimits
 from ..registry import VLLMMLX_PROVIDER_ID
-from . import overlay
+from . import _openai, overlay
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
 
 
@@ -73,13 +72,28 @@ class _Server:
     def stop(self) -> None:
         # Must finish inside the supervisor's cancellation grace (5s):
         # a slow terminate would leave the job unconfirmed and block
-        # daemon-wide inference.
-        if self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        # daemon-wide inference. Kill is always followed by a reap so the
+        # zombie cannot linger; exit races between checks are benign.
+        proc = self.proc
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
@@ -110,10 +124,26 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     def track_profiles(self, profiles) -> None:
         self._profiles = list(profiles)
 
+    def close(self) -> None:
+        self.evict_resident()
+
     # -- cache lifecycle ----------------------------------------------------
     def requires_load(self, profile) -> bool:
+        # A cached entry whose process died is a load, not a resident:
+        # drop and reap it so defer_load admission stays truthful.
+        dead = None
         with self._lock:
-            return profile.alias not in self._servers
+            server = self._servers.get(profile.alias)
+            if server is None:
+                return True
+            if server.healthy():
+                return False
+            self._servers.pop(profile.alias, None)
+            self._epochs[profile.alias] = \
+                self._epochs.get(profile.alias, 0) + 1
+            dead = server
+        dead.stop()
+        return True
 
     def evict_resident(self) -> int:
         with self._lock:
@@ -169,7 +199,10 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "model artifact not pulled")
         model_path = self._serve_path(profile)
         with self._lock:
-            epoch = self._epochs.get(profile.alias, 0)
+            # The alias must own an epoch before load starts so an
+            # eviction mid-load bumps it and the guard below discards
+            # this server.
+            epoch = self._epochs.setdefault(profile.alias, 0)
         server = _Server(binary, model_path, profile.alias)
         # Load deadline: weights map before /health answers.
         deadline = time.time() + 180
@@ -180,12 +213,9 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if server.proc.poll() is not None:
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                     "vllm-mlx exited during load")
-            try:
-                urllib.request.urlopen(
-                    f"http://127.0.0.1:{server.port}/health", timeout=1)
+            if _openai.health_ready(server.port):
                 break
-            except Exception:
-                time.sleep(0.25)
+            time.sleep(0.25)
         else:
             server.stop()
             raise PlatformError(ErrorCode.DEADLINE_EXCEEDED,
@@ -212,6 +242,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if not server.healthy():
                 with self._lock:
                     self._servers.pop(profile.alias, None)
+                server.stop()
                 server = self._server_for(profile, token)
             server.last_used = time.time()
             if token is not None and token.is_cancelled:
@@ -246,16 +277,35 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             observer = (token.observe(_abort)
                         if token is not None else None)
             try:
+                # The observer may already have fired: a pre-cancelled
+                # token must never send the request.
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
                 conn.request("POST", "/v1/chat/completions",
                              body=json.dumps(body),
                              headers={"Content-Type": "application/json"})
+                # conn.sock may clear on Connection: close - the captured
+                # reference stays the abort handle.
                 sock = conn.sock
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
                 resp = conn.getresponse()
+                if token is not None and token.is_cancelled:
+                    resp.close()
+                    raise PlatformError(ErrorCode.CANCELLED)
                 inflight.append(resp)
                 try:
+                    _openai.require_ok(resp, "vllm-mlx")
                     payload = self._read_stream(resp, token)
                 finally:
                     resp.close()
+            except PlatformError as e:
+                # A cancel can race an upstream error surfacing (e.g. the
+                # observer's socket close reads as a truncated stream):
+                # the caller's cancellation still reports as cancelled.
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
+                raise
             except Exception as e:
                 if token is not None and token.is_cancelled:
                     raise PlatformError(ErrorCode.CANCELLED)
@@ -265,10 +315,16 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 if token is not None and observer is not None:
                     token.remove_observer(observer)
                 conn.close()
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             server.last_used = time.time()
-            return self._wire_result(payload, request.model)
+            return _openai.wire_result(payload, request.model)
         finally:
             with self._lock:
                 self._serving_drop(profile.alias)
@@ -276,46 +332,113 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     def _read_stream(self, response, token=None):
         """The prompt/LRU prefix cache only engages on the streaming path;
         the provider aggregates SSE frames into the completion shape
-        callers already expect. Mid-stream cancellation closes the
-        response, ending the turn truthfully."""
+        callers already expect (the platform boundary stays buffered).
+        Comments and blank heartbeat lines are skipped; every data frame
+        must be valid JSON, an error object fails the call, and the
+        stream is only successful after a terminal finish_reason followed
+        by [DONE]."""
         content_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
         finish = None
         usage = {}
-        for raw in response:
+        done = False
+        received = 0
+        cap = PlatformLimits.REQUEST_BODY_BYTES
+        while True:
             if token is not None and token.is_cancelled:
                 response.close()
                 raise PlatformError(ErrorCode.CANCELLED)
+            try:
+                # Bounded per-read: one huge line cannot allocate
+                # unboundedly before the cumulative size check below.
+                raw = response.readline(cap + 1 - received)
+            except Exception:
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream failed")
+            if not raw:
+                break
+            received += len(raw)
+            if received > cap:
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream exceeded size bound")
             line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
+            if not line or line.startswith(":"):
                 continue
+            if not line.startswith("data:"):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream frame malformed")
             data = line[5:].strip()
             if data == "[DONE]":
+                done = True
                 break
             try:
                 chunk = json.loads(data)
             except json.JSONDecodeError:
-                continue
-            if chunk.get("usage"):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream frame not JSON")
+            if not isinstance(chunk, dict):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream frame malformed")
+            if chunk.get("error") is not None:
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream error frame")
+            if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
-            choice = (chunk.get("choices") or [{}])[0]
-            delta = choice.get("delta") or {}
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-            for tc in delta.get("tool_calls") or []:
+            choices = chunk.get("choices")
+            if choices is not None and (
+                    not isinstance(choices, list) or len(choices) > 1
+                    or (choices and not isinstance(choices[0], dict))):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream choices malformed")
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta")
+            if delta is None:
+                delta = {}
+            if not isinstance(delta, dict):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream stream delta malformed")
+            text = delta.get("content")
+            if text is not None:
+                if not isinstance(text, str):
+                    raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                        "upstream content delta malformed")
+                content_parts.append(text)
+            tcs = delta.get("tool_calls")
+            if tcs is not None and not isinstance(tcs, list):
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "upstream tool delta malformed")
+            for tc in tcs or []:
+                if not isinstance(tc, dict):
+                    raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                        "upstream tool delta malformed")
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(
                     idx, {"id": tc.get("id"), "name": None,
                           "args": []})
                 if tc.get("id"):
                     slot["id"] = tc["id"]
-                fn = tc.get("function") or {}
+                fn = tc.get("function")
+                if fn is not None and not isinstance(fn, dict):
+                    raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                        "upstream tool delta malformed")
+                fn = fn or {}
                 if fn.get("name"):
                     slot["name"] = fn["name"]
                 if fn.get("arguments"):
                     slot["args"].append(fn["arguments"])
-            if choice.get("finish_reason"):
+            if choice.get("finish_reason") is not None:
                 finish = choice["finish_reason"]
+        if not done:
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "upstream stream ended before [DONE]")
+        if finish not in _openai.FINISH_REASONS:
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "upstream stream lacks a terminal "
+                                "finish reason")
         message = {"content": "".join(content_parts) or None}
         if tool_calls:
             message["tool_calls"] = [
@@ -323,7 +446,7 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                  "arguments": "".join(s["args"])}}
                 for _, s in sorted(tool_calls.items())]
         return {"choices": [{"message": message,
-                             "finish_reason": finish or "stop"}],
+                             "finish_reason": finish}],
                 "usage": usage}
 
     def cancel(self, job_id: str) -> None:
@@ -390,39 +513,12 @@ class VllmMlxProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if rf.kind == "json_object":
                 body["response_format"] = {"type": "json_object"}
             elif rf.kind == "json_schema" and rf.schema is not None:
+                # vllm-mlx enforces the schema itself; strict passes
+                # through unchanged (guidance-only providers refuse it).
                 body["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {"name": rf.name or "response",
-                                    "schema": rf.schema}}
+                                    "schema": rf.schema,
+                                    **({"strict": rf.strict}
+                                       if rf.strict is not None else {})}}
         return body
-
-    def _wire_result(self, payload: dict, model: str) -> ChatResult:
-        choices = payload.get("choices") or []
-        choice = choices[0] if choices else {}
-        message = choice.get("message") or {}
-        content = message.get("content") or ""
-        calls = []
-        for c in message.get("tool_calls") or []:
-            fn = c.get("function") or {}
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append(ChatToolCall(
-                id=c.get("id"), name=fn.get("name", ""), arguments=args))
-        raw_reason = choice.get("finish_reason") or "stop"
-        reason = {
-            "stop": FinishReason.STOP, "length": FinishReason.LENGTH,
-            "tool_calls": FinishReason.TOOL_CALLS,
-            "content_filter": FinishReason.CONTENT_FILTER,
-        }.get(raw_reason, FinishReason.ERROR)
-        if calls and reason == FinishReason.STOP:
-            reason = FinishReason.TOOL_CALLS
-        usage_raw = payload.get("usage") or {}
-        usage = ChatUsage(
-            prompt_tokens=usage_raw.get("prompt_tokens"),
-            completion_tokens=usage_raw.get("completion_tokens"),
-            total_tokens=usage_raw.get("total_tokens"))
-        return ChatResult(model_identity=model, content=content,
-                          finish_reason=reason, usage=usage,
-                          tool_calls=calls)

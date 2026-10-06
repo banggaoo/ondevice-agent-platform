@@ -1,32 +1,45 @@
 # ondevice-agent-platform
 
-A proposed local-first, resource-aware agent serving platform for Apple Silicon macOS, intended for engineers broadly. Local, free-to-use, and performant operation are product goals, not measured performance, an established license, or authorization to publish or distribute.
+A local-first, resource-aware agent and model serving platform with a deterministic Python core and optional providers. Local, free-to-use, and performant operation are product goals, not universal performance guarantees or an established open-source license.
 
-**Status: strategy draft v0.9 + bounded implementation, 2026-10-05.** The deterministic foundation, baseline ACP/OpenAI/typed-ML serving surfaces, local console with five views, opt-in Apple Foundation Models provider, owned open-weight MLX route, and optional read-only runtime Operator described in [docs/development.md](docs/development.md) are implemented in Swift and covered by the `swift test` suite plus a gated live model test. A cross-platform Python core (`python/`, D54) now mirrors the same contract for Linux/Windows/macOS serving and is covered by `python3 -m unittest discover -s python/tests`. No cloud integration, ARTEMIS mutation, automation, or release artifact exists yet.
+**Status: implemented platform, installed and live-verified 2026-10-07.** The shipped implementation is the Python platform under `python/` (D54): a managed-venv install with a `~/.local/bin/ondevice-agent-platform` console script, verified end-to-end on this Apple Silicon host — full software gates, installed control-plane/ACP checks, and real ARTEMIS, OpenCode, and native consumers against the loopback daemon (see [docs/production-readiness.md](docs/production-readiness.md) for the exact tested envelope and limits). The Swift implementation remains in tree as the macOS reference and the `oap-apple-bridge` helper path; `swift test` covers it. No cloud integration, ARTEMIS mutation, automation executors, or approved release artifact exists.
 
-## Cross-platform Python core
+## Install and run (Python platform — the shipped path)
 
-The Python implementation under `python/` ports the deterministic platform to every OS where Windows support is mandatory (D54). It is stdlib-only in the core; providers are optional imports:
-
-- **llama.cpp** (`provider: "llamacpp"`, GGUF artifact + `llama-server` binary on PATH or `OAP_LLAMA_SERVER`) — the all-OS open-weight route.
-- **mlx-lm / mlx-vlm** (`provider: "mlx"`, pulled MLX artifacts) — the macOS open-weight route; MLX is Python-first, no Swift needed.
-- **Apple Foundation Models** (`--enable-apple-model`) — macOS only, via the `oap-apple-bridge` Swift helper (`swift build --target AppleBridge`; discovered on PATH, `OAP_APPLE_BRIDGE`, or `.build/`), because FoundationModels has no Python binding.
-- **builtin.linear** — typed ML everywhere.
-
-Each catalog entry declares `requires` (OS, accelerator, format, minimum free memory); `setup` presents only routes the host can actually satisfy. Same wire surface, admission, cancellation, ledger, and truthful-refusal contract as the Swift core:
+Requires Python >=3.11. From a clone, `bin/ondevice-agent-platform` runs the CLI directly; `install` creates/reuses the managed provider venv at `~/.ondevice-agent-platform/providers/oap-env`, installs the package non-editable, and links the console script onto `~/.local/bin`:
 
 ```sh
-cd python && python3 -m unittest discover -s tests     # 47 tests
-PYTHONPATH=src python3 -m ondevice_agent_platform setup --none
-PYTHONPATH=src python3 -m ondevice_agent_platform serve --port 8080
-PYTHONPATH=src python3 -m ondevice_agent_platform acp --agent reference.status
+bin/ondevice-agent-platform install        # managed env + console script
+ondevice-agent-platform setup              # optional guided first run (declares models; --pull downloads)
+ondevice-agent-platform serve --port 8080  # loopback daemon + console
+ondevice-agent-platform model list         # declared routes and readiness
+ondevice-agent-platform provider list      # provider prerequisites and env path
+ondevice-agent-platform acp --agent reference.status   # requires serve --enable-reference-agent
 ```
 
-Verified on macOS: `serve`, `/api/status`, `/v1/models`, `/api/ml/predictions` (live linear result), `/_bridge/acp` (session + streamed turn + `end_turn`), and the Apple FM route through the bridge (live `READY`, 2.8 s). Linux/Windows sampling and lock code paths are written but not yet host-verified; the `-ngl 99` GPU-offload flag passed to `llama-server` is a pending per-host calibration, not a requirement.
+`install --source /path/to/checkout/python` updates an existing installation (stop the daemon first — the root holds a lifetime lock); a bare `install` is idempotent. The provider env is reused only after structural checks and a real interpreter/`importlib.metadata` probe against the frozen pins (`vllm-mlx==0.5.0`, `mlx-lm==0.32.0`, `mlx-vlm==0.7.6`); it is never destructively replaced, and MLX pins are installed only when the registry declares MLX routes on a Metal host. Inference never downloads models; `model pull` is the only acquisition path.
 
-## Build and run
+The Python core is stdlib-only; providers are optional imports:
 
-Requires macOS 27+ on Apple Silicon and the installed Xcode 27 / Swift 6.4 toolchain (including the downloadable Metal toolchain component: `xcodebuild -downloadComponent MetalToolchain`). Third-party runtime dependencies are pinned exactly in `Package.resolved`: `mlx-swift-lm` 3.31.4 (MLX Swift LLM runtime), `swift-huggingface` 0.11.0 (hub downloads), and `swift-transformers` 1.3.4 (tokenizer loading). They are confined to the `PlatformMLX` target; `PlatformCore` links only system frameworks and system SQLite.
+- **llama.cpp** (`provider: "llamacpp"`, GGUF artifact + `llama-server` binary on PATH or `OAP_LLAMA_SERVER`) — the all-OS open-weight route; catalog-scoped to Windows/Linux.
+- **mlx-lm / mlx-vlm** (`provider: "mlx"`) and **vllm-mlx** (`provider: "vllm-mlx"`) — the macOS open-weight routes; MLX is Python-first, no Swift needed.
+- **Apple Foundation Models** (`--enable-apple-model`) — macOS only, via the `oap-apple-bridge` Swift helper (`swift build --target AppleBridge`; discovered on PATH, `OAP_APPLE_BRIDGE`, or `.build/`). Absent in a source-independent install unless separately built — optional and unselected on this host.
+- **builtin.linear** — typed ML everywhere.
+
+Each catalog entry declares `requires` (OS, accelerator, format, minimum free memory); `setup` presents only routes the host can actually satisfy. Serve on a fresh empty root works with no models or inference provider — admin/status/ACP answer truthfully, and an interactive first `serve` offers the guided catalog menu.
+
+Verified on macOS (2026-10-07): non-editable install and self-update, `serve` on `127.0.0.1:8080`, `/api/status`, `/v1/models`, buffered-SSE completions with real usage, native job cancel and client-disconnect cancellation, ACP `reference.status`, and real ARTEMIS/OpenCode consumer turns — details and limits in [docs/production-readiness.md](docs/production-readiness.md). Windows/Linux sampling and lock paths are written but not host-verified.
+
+For development from the checkout (no install):
+
+```sh
+cd python && python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m ondevice_agent_platform serve --port 8080
+```
+
+## Swift reference implementation and Apple bridge (optional)
+
+The Swift package is the macOS reference implementation and the build path for `oap-apple-bridge`, the helper the Python platform uses for the optional Apple Foundation Models route. It is not required for the core platform. Building it requires macOS 27+ on Apple Silicon and the installed Xcode 27 / Swift 6.4 toolchain (including the downloadable Metal toolchain component: `xcodebuild -downloadComponent MetalToolchain`). Third-party runtime dependencies are pinned exactly in `Package.resolved`: `mlx-swift-lm` 3.31.4 (MLX Swift LLM runtime), `swift-huggingface` 0.11.0 (hub downloads), and `swift-transformers` 1.3.4 (tokenizer loading). They are confined to the `PlatformMLX` target; `PlatformCore` links only system frameworks and system SQLite.
 
 ```sh
 swift build                                  # build the package
@@ -91,6 +104,7 @@ Trying Apple Foundation Models first is a confirmed experiment direction, not pr
 | [Evaluation](docs/evaluation.md) | Operator and ARTEMIS baselines and gates |
 | [Decision register](docs/decisions.md) | Confirmed scope versus proposed technical choices |
 | [Discussion questions](docs/open-questions.md) | Remaining decisions |
+| [Production readiness](docs/production-readiness.md) | Tested envelope, verification record, and honest limits (2026-10-07) |
 | [Change proposal template](docs/templates/change-proposal.md) | Reviewable recommendation format |
 | [Source notes](docs/references/sources.md) | Primary sources and verification limits |
 | [Original proposal](docs/references/original-proposal.md) | Unmodified initial user-supplied reference |
@@ -111,4 +125,4 @@ Trying Apple Foundation Models first is a confirmed experiment direction, not pr
 
 The observed development host is an M4 MacBook Air with 16 GB memory; the requested device range includes other eligible Apple Silicon Macs. Hardware eligibility does not establish that a 9B model or Android emulator will fit.
 
-Implemented so far: the code-owned core lifecycle, the OpenAI-compatible endpoint (text + bounded image input, honored sampling hints, best-effort response-format guidance) and ACP agent adapter, typed-ML inference through the `builtin.linear` registry route, the opt-in Apple Foundation Models provider, and the owned open-weight MLX route with governed pull/manifest/lazy-load, real token usage, and VLM support; installed agent profiles and the Operator remain optional. The ARTEMIS consumption audit lives in [docs/artemis-qualification.md](docs/artemis-qualification.md). Still open: remaining M3+ gates, and the engineering checks of signing/notarization/build/release/license, PCC eligibility for the chosen GitHub-delivered executable plus the cloud payload policy, RAM/provider/context calibration, and the pinned wire-compatibility/offline routes. PCC eligibility is a separate cloud gate, not a blocker for local-only feasibility. Public research can seed starting device/provider profiles; native observations and bounded measurements still validate them. This is a local Git repository; GitHub is the selected delivery target; licensing and release details remain open. No publication is performed by this revision.
+Implemented so far: the code-owned core lifecycle, the OpenAI-compatible endpoint (text + bounded image input, honored sampling, tool calls/results, strict-JSON enforcement on the vllm route, buffered SSE) and ACP agent adapter, typed-ML inference through the `builtin.linear` registry route, the opt-in Apple Foundation Models provider, and the owned open-weight routes (`vllm-mlx` primary, `mlx`/`mlx-vlm` direct + vision) with governed pull/manifest/lazy-load, real token usage, and coherent cancellation; installed agent profiles and the Operator remain optional. The ARTEMIS consumption audit lives in [docs/artemis-qualification.md](docs/artemis-qualification.md), the OpenCode record in [docs/opencode-qualification.md](docs/opencode-qualification.md), and the verified envelope plus honest limits in [docs/production-readiness.md](docs/production-readiness.md). Still open: signing/notarization/build/release/license, PCC eligibility plus the cloud payload policy, RAM/provider/context calibration, Windows/Linux host qualification, and iOS. This is a local Git repository; GitHub is the selected delivery target and the user has requested private source publication — the remote namespace confirmation is still pending, no repository has been created, and no release, license, or public distribution is approved.

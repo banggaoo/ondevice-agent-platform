@@ -1042,3 +1042,47 @@ macOS - aborting the pre-headers wait that hid the socket inside
 urlopen. Verified live: cancel during model load confirms cancelled in
 ~1s and mid-generation in ~0s on the resident server; inference stays
 unblocked.
+
+## Installed-artifact finalization and live verification (2026-10-07)
+
+Correction to the paragraph above: the installed package is a real
+non-editable wheel install (`pip install --no-deps --no-build-isolation`;
+`direct_url` carries no `editable` flag), not `pip -e`. `install` now
+validates an explicit `--source` before any env work, and the provider
+env carries no sentinel cache - every reuse checks the venv structure,
+the interpreter (`sys.prefix`, `>=3.11`), and the exact frozen pins via
+`importlib.metadata` without importing MLX/Torch. Empty-registry
+install is core-only; `_finish_setup` still offers the governed MLX
+runtimes explicitly.
+
+Release fixes verified in the two post-gate batches (targeted suites
+only: 50 + 14 tests - the frozen full gates above were not rerun):
+strict one-choice/finish/tool-call/usage wire hygiene on the shared
+OpenAI path plus bounded SSE parsing (no empty-success on non-2xx or
+truncated upstreams, no fabricated zero usage); coherent cancellation -
+per-job private tokens signalled only after the ledger records
+CANCEL_REQUESTED, worker CANCELLED resolves to durable CANCELLED,
+disconnect detection via socket shutdown, Apple bridge pipe close/reap;
+owned per-job deadline/grace timers cancelled on terminal outcomes and
+at shutdown without suppressing CANCELLATION_UNCONFIRMED for
+noncooperative providers; bounded HTTP admission before worker threads
+plus bounded head/body/deadline reads; atomic owned writes tolerating
+crash residue; no heavy inference-library import on the status path;
+mlx-vlm 0.7.6 image ABI fixed by decoding BytesIO via
+`utils.load_image` to PIL before `stream_generate`.
+
+Live verification on the updated installed daemon (self-updated in
+place, `PIP_NO_INDEX=1`, no downloads): code-only scratch-daemon probe
+passed (empty-model admin, truthful missing-model, ACP stdio
+`reference.status`, Origin/CSRF, clean shutdown); ARTEMIS real
+`ModelFactory`/endpoint/`ChatOpenAI` paths passed - direct on
+`qwen3.8-9b`, agent (`bind_tools` + tool-result history +
+`with_structured_output`) on `qwen3.8-9b-vllm`, and a real vision turn
+on `qwen-vl` ("Red", usage 99/2/101) alongside the resident primary;
+stock OpenCode 1.18.34 passed text and tools modes inside the loopback
+`sandbox-exec` profile with only the synthetic fixture readable; native
+job cancel, client-disconnect-only cancellation (durable CANCELLED,
+provider_finished), and buffered-SSE finish/usage/`[DONE]` passed. One
+bounded coexistence observation only - not capacity or headroom
+evidence. See docs/production-readiness.md for the consolidated tested
+envelope and limitations.

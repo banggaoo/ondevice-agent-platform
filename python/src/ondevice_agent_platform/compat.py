@@ -11,6 +11,7 @@ import os
 import platform
 import stat
 import sys
+import uuid
 
 SYSTEM = platform.system()  # "Darwin" | "Linux" | "Windows"
 IS_POSIX = os.name == "posix"
@@ -123,18 +124,78 @@ def open_owned(path: str, flags: int) -> int:
 
 
 def write_owned(path: str, data: bytes) -> None:
-    fd = open_owned(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+    """Atomic owned-file write: validate the existing target, stage into a
+    private same-directory temp file, fsync, then os.replace. A failed or
+    interrupted write never truncates the live file; only the temp file
+    this call created is ever removed."""
+    from .errors import ErrorCode, PlatformError
+
+    # Validate the existing target before any mutation.
+    if is_symlink(path):
+        raise PlatformError(ErrorCode.ROOT_UNSAFE, "symlinked state file")
     try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISREG(st.st_mode):
+            raise PlatformError(ErrorCode.ROOT_UNSAFE, "not a regular file")
+        if IS_POSIX and st.st_uid != os.getuid():
+            raise PlatformError(ErrorCode.ROOT_UNSAFE, "not owned")
+
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(directory,
+                       f".oap-write-{os.getpid()}-{uuid.uuid4().hex}")
+    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL
+    if IS_POSIX and hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise PlatformError(ErrorCode.ROOT_UNSAFE,
+                                    "not a regular file")
+            if IS_POSIX and st.st_uid != os.getuid():
+                raise PlatformError(ErrorCode.ROOT_UNSAFE, "not owned")
+        except BaseException:
+            os.close(fd)
+            fd = -1
+            raise
         view = memoryview(data)
         while view:
             n = os.write(fd, view)
             if n <= 0:
-                from .errors import ErrorCode, PlatformError
                 raise PlatformError(ErrorCode.STORAGE_FAILURE,
                                     f"write errno {n}")
             view = view[n:]
-    finally:
+        os.fsync(fd)
         os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+        # Rename durability: fsync the containing directory on POSIX so a
+        # crash cannot lose the replacement. No claim beyond best effort.
+        if IS_POSIX:
+            try:
+                dfd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_owned(path: str, cap: int) -> bytes | None:

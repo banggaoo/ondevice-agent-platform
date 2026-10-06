@@ -13,16 +13,16 @@ import http.client
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import threading
 import time
-import urllib.request
 
-from ..chat import ChatResult, ChatToolCall, ChatUsage, FinishReason
+from ..chat import NamedToolChoice, ToolChoice
 from ..errors import ErrorCode, PlatformError
+from ..limits import PlatformLimits
 from ..registry import LLAMACPP_PROVIDER_ID
+from . import _openai
 from .base import LLMProvider, ModelCacheEvicting, ProviderReadiness
 
 
@@ -69,13 +69,29 @@ class _Server:
 
     def stop(self) -> None:
         # Inside the supervisor's 5s cancellation grace, or the job lands
-        # cancellation_unconfirmed and blocks daemon-wide inference.
-        if self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        # cancellation_unconfirmed and blocks daemon-wide inference. Kill
+        # is always followed by a reap so the zombie cannot linger; exit
+        # races between checks are benign.
+        proc = self.proc
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
@@ -111,10 +127,40 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     def track_profiles(self, profiles) -> None:
         self._profiles = list(profiles)
 
+    def close(self) -> None:
+        self.evict_resident()
+
+    def validate(self, request, profile) -> None:
+        # llama.cpp guidance is best-effort: strict JSON schema is never
+        # claimed, and a forced tool choice is not guaranteed by this
+        # route - refuse rather than silently drop it.
+        rf = request.response_format
+        if rf is not None and rf.strict is True:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "strict json schema is not enforced by "
+                                "this provider")
+        if isinstance(request.tool_choice, NamedToolChoice) \
+                or request.tool_choice == ToolChoice.REQUIRED:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "forced tool choice is not guaranteed")
+
     # -- cache lifecycle ----------------------------------------------------
     def requires_load(self, profile) -> bool:
+        # A cached entry whose process died is a load, not a resident:
+        # drop and reap it so defer_load admission stays truthful.
+        dead = None
         with self._lock:
-            return profile.alias not in self._servers
+            server = self._servers.get(profile.alias)
+            if server is None:
+                return True
+            if server.healthy():
+                return False
+            self._servers.pop(profile.alias, None)
+            self._epochs[profile.alias] = \
+                self._epochs.get(profile.alias, 0) + 1
+            dead = server
+        dead.stop()
+        return True
 
     def evict_resident(self) -> int:
         with self._lock:
@@ -174,7 +220,10 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "no gguf artifact")
         model_path = os.path.join(directory, gguf)
         with self._lock:
-            epoch = self._epochs.get(profile.alias, 0)
+            # The alias must own an epoch before load starts so an
+            # eviction mid-load bumps it and the guard below discards
+            # this server.
+            epoch = self._epochs.setdefault(profile.alias, 0)
         server = _Server(binary, model_path, profile.alias)
         # Wait for readiness: the server answers /health once weights map.
         deadline = time.time() + 120
@@ -185,12 +234,9 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if server.proc.poll() is not None:
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                     "llama-server exited during load")
-            try:
-                urllib.request.urlopen(
-                    f"http://127.0.0.1:{server.port}/health", timeout=1)
+            if _openai.health_ready(server.port):
                 break
-            except Exception:
-                time.sleep(0.25)
+            time.sleep(0.25)
         else:
             server.stop()
             raise PlatformError(ErrorCode.DEADLINE_EXCEEDED,
@@ -217,6 +263,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if not server.healthy():
                 with self._lock:
                     self._servers.pop(profile.alias, None)
+                server.stop()
                 server = self._server_for(profile, token)
             server.last_used = time.time()
             if token is not None and token.is_cancelled:
@@ -250,16 +297,45 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             observer = (token.observe(_abort)
                         if token is not None else None)
             try:
+                # The observer may already have fired: a pre-cancelled
+                # token must never send the request.
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
                 conn.request("POST", "/v1/chat/completions",
                              body=json.dumps(body),
                              headers={"Content-Type": "application/json"})
+                # conn.sock may clear on Connection: close - the captured
+                # reference stays the abort handle.
                 sock = conn.sock
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
                 resp = conn.getresponse()
+                if token is not None and token.is_cancelled:
+                    resp.close()
+                    raise PlatformError(ErrorCode.CANCELLED)
                 inflight.append(resp)
                 try:
-                    payload = json.loads(resp.read())
+                    _openai.require_ok(resp, "llama-server")
+                    data = resp.read(PlatformLimits.REQUEST_BODY_BYTES + 1)
+                    if len(data) > PlatformLimits.REQUEST_BODY_BYTES:
+                        raise PlatformError(
+                            ErrorCode.PROVIDER_UNAVAILABLE,
+                            "upstream body exceeded size bound")
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        raise PlatformError(
+                            ErrorCode.PROVIDER_UNAVAILABLE,
+                            "upstream body not valid JSON")
                 finally:
                     resp.close()
+            except PlatformError as e:
+                # A cancel can race an upstream error surfacing (the
+                # observer's close reads as a truncated response): the
+                # caller's cancellation still reports as cancelled.
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
+                raise
             except Exception as e:
                 if token is not None and token.is_cancelled:
                     raise PlatformError(ErrorCode.CANCELLED)
@@ -269,10 +345,16 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 if token is not None and observer is not None:
                     token.remove_observer(observer)
                 conn.close()
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
             server.last_used = time.time()
-            return self._wire_result(payload, request.model)
+            return _openai.wire_result(payload, request.model)
         finally:
             with self._lock:
                 self._serving_drop(profile.alias)
@@ -307,7 +389,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 "max_tokens": request.max_output_tokens,
                 "temperature": request.temperature if
                 request.temperature is not None else 0.0}
-        if request.tools:
+        if request.tools and request.tool_choice != ToolChoice.NONE:
             body["tools"] = [
                 {"type": "function",
                  "function": {"name": t.name,
@@ -323,34 +405,3 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         if request.frequency_penalty is not None:
             body["frequency_penalty"] = request.frequency_penalty
         return body
-
-    def _wire_result(self, payload: dict, model: str) -> ChatResult:
-        choices = payload.get("choices") or []
-        choice = choices[0] if choices else {}
-        message = choice.get("message") or {}
-        content = message.get("content") or ""
-        calls = []
-        for c in message.get("tool_calls") or []:
-            fn = c.get("function") or {}
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append(ChatToolCall(
-                id=c.get("id"), name=fn.get("name", ""), arguments=args))
-        raw_reason = choice.get("finish_reason") or "stop"
-        reason = {
-            "stop": FinishReason.STOP, "length": FinishReason.LENGTH,
-            "tool_calls": FinishReason.TOOL_CALLS,
-            "content_filter": FinishReason.CONTENT_FILTER,
-        }.get(raw_reason, FinishReason.ERROR)
-        if calls and reason == FinishReason.STOP:
-            reason = FinishReason.TOOL_CALLS
-        usage_raw = payload.get("usage") or {}
-        usage = ChatUsage(
-            prompt_tokens=usage_raw.get("prompt_tokens"),
-            completion_tokens=usage_raw.get("completion_tokens"),
-            total_tokens=usage_raw.get("total_tokens"))
-        return ChatResult(model_identity=model, content=content,
-                          finish_reason=reason, usage=usage,
-                          tool_calls=calls)

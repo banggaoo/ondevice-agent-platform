@@ -1,8 +1,10 @@
 # OpenCode consumer qualification
 
 Status: request surface, a bounded native text turn, and a real
-tool-call agent loop verified, 2026-10-05. Multiturn coding quality and
-broader client qualification remain open gates. OpenCode is an external
+tool-call agent loop verified on the Swift implementation (2026-10-05);
+bounded text and tool turns verified on the installed Python platform
+(2026-10-07, final section). Multiturn coding quality and broader
+client qualification remain open gates. OpenCode is an external
 model consumer alongside ARTEMIS, not an automation backend invoked by
 this platform.
 
@@ -176,61 +178,68 @@ the client configuration is needed - the daemon keeps its own state.
 1. Run the platform (it is a long-lived process; nothing auto-starts it):
 
    ```bash
-   swift build
-   .build/debug/ondevice-agent-platform serve \
-     --data-root ~/.ondevice-agent-platform --port 8080 \
-     --enable-apple-model --enable-reference-agent --enable-operator
+   ondevice-agent-platform serve --port 8080
    ```
 
-   The data root already holds `registry.json` and the pulled artifacts.
-   Verify readiness: `GET /v1/models` lists `qwen3.8-9b`, `qwen-vl`, and
-   `apple-foundation-model`, and `GET /api/status` reports `admission:
-   admit` (a `deny_and_cancel`/`defer_load` verdict is the host's real
+   (Installed console script; from a checkout, `bin/ondevice-agent-platform
+   serve --port 8080` works the same.) Verify readiness: `GET /v1/models`
+   lists `qwen3.8-9b-vllm`, `qwen3.8-9b`, and `qwen-vl`, and
+   `GET /api/status` reports `admission: admit` (a
+   `deny_and_cancel`/`defer_load` verdict is the host's real
    resource state, not a config problem - see the resource notes below).
 
-2. Create `~/.config/opencode/opencode.json`:
+2. Merge the following block into your existing
+   `~/.config/opencode/opencode.json` (do not overwrite the file - keep
+   your other providers and settings):
 
    ```json
    {
-     "$schema": "https://opencode.ai/config.json",
      "provider": {
        "ondevice": {
          "npm": "@ai-sdk/openai-compatible",
          "name": "OnDevice Agent Platform",
          "options": {
            "baseURL": "http://127.0.0.1:8080/v1",
-           "apiKey": "{file:~/.config/opencode/ondevice.token}"
+           "apiKey": "local"
          },
          "models": {
-           "qwen3.8-9b": { "name": "Qwen3.8 9B Distill 4bit (MLX)",
-             "limit": { "context": 32768, "output": 4096 } },
-           "qwen-vl": { "name": "Qwen3 VL 2B (MLX)",
-             "limit": { "context": 32768, "output": 1024 } },
-           "apple-foundation-model": { "name": "Apple Foundation Models",
-             "limit": { "context": 4096, "output": 512 } }
+           "qwen3.8-9b-vllm": {
+             "name": "Qwen3.8 9B (MLX, prefix-cached)",
+             "limit": {
+               "context": 32768,
+               "output": 4096
+             }
+           }
          }
        }
      },
-     "model": "ondevice/qwen3.8-9b"
+     "model": "ondevice/qwen3.8-9b-vllm",
+     "small_model": "ondevice/qwen3.8-9b-vllm"
    }
    ```
 
-   `limit.output` must not exceed the registry's `maxOutputTokens` per
-   alias (qwen3.8-9b 4096, qwen-vl 1024, apple-foundation-model 512) -
-   the platform refuses over-cap requests as `invalid_request` rather
-   than truncating. Under D50 the daemon ignores `Authorization`; the
-   referenced token file only needs to exist for `{file:...}`
-   interpolation (e.g. `printf 'local' > ~/.config/opencode/ondevice.token`,
-   mode 600). Do not store real credentials there.
+   `limit.output` must not exceed the registry's `maxOutputTokens` for
+   the alias (4096 here) - the platform refuses over-cap requests as
+   `invalid_request` rather than truncating. `context` 32768 is a
+   client-side example bound, not a calibrated capacity figure. The
+   `small_model` utility slot reuses the same primary alias; no separate
+   utility model exists in this lineup. Under D50 the daemon ignores
+   `Authorization`; the literal `"local"` is a non-secret placeholder
+   that satisfies the SDK - do not store real credentials or token
+   files for this endpoint.
 
-3. Use it: `opencode` (TUI), `opencode run "..."`, `opencode run -m
-   ondevice/qwen-vl "..."` to select a lighter route.
+3. Use it: `opencode` (TUI), `opencode run "..."`, or
+   `opencode run -m ondevice/qwen3.8-9b-vllm "..."`.
 
 Notes and limits:
 
-- `apple-foundation-model` truthfully refuses `tools`; it can serve
-  plain text turns but cannot drive OpenCode's tool agent loop. Use the
-  MLX routes for agent work.
+- `qwen3.8-9b-vllm` is the agent/coding route (structured tool calls and
+  prefix cache); `qwen3.8-9b` is the direct mlx route sharing the same
+  artifact; `qwen-vl` serves image turns. An optional Apple Foundation
+  Models route can serve plain text only (it refuses `tools` and cannot
+  drive OpenCode's tool agent loop) and is not installed by default in a
+  source-independent install - the `oap-apple-bridge` helper must be
+  built and on PATH.
 - `resource_denied` means the host is under real memory pressure or
   serious thermal (check `/api/status`); `deadline_exceeded` after ~60 s
   means a queued request never reached an `admit` window under
@@ -244,3 +253,24 @@ Notes and limits:
 - OpenCode owns tool execution and permissions; an `external_directory`
   rejection on absolute paths outside the workspace is client-side and
   expected in non-interactive runs.
+
+## Live verification on the installed Python platform (2026-10-07)
+
+Stock OpenCode `1.18.34` was exercised against the updated installed
+daemon using a sanitized copy of the ondevice provider selection
+(`ondevice/qwen3.8-9b-vllm`), a private HOME/config/data/cache/workspace,
+the literal non-secret key `"local"`, and a mandatory `sandbox-exec`
+loopback profile (all non-loopback networking denied). Mutating and
+network tools were denied; the only permitted read was the exact
+synthetic fixture path. Both modes passed:
+
+- **text** - a bounded client turn against the local endpoint completed
+  successfully.
+- **tools** - a real `read` tool execution against the fixture ran inside
+  OpenCode's own agent loop and completed, including a final stop.
+
+This proves bounded turns through the stock client's real wire surface,
+not long-session stability, arbitrary coding-edit success, or
+compatibility with OpenCode's external/cloud providers (none were
+enabled). The user's own OpenCode configuration and processes were not
+modified or killed.

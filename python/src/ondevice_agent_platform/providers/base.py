@@ -32,6 +32,13 @@ class LLMProvider:
         Conservative default: assume a call loads weights."""
         return True
 
+    def close(self) -> None:
+        """Daemon shutdown seam: release resident containers/servers/
+        helpers. Called once after jobs are cancelled; a worker still
+        holding a container reference finishes on it - close only drops
+        the provider's cache ownership."""
+        return None
+
 
 class MLPredictor:
     provider_id: str = ""
@@ -40,6 +47,9 @@ class MLPredictor:
         raise NotImplementedError
 
     def cancel(self, job_id: str) -> None:
+        return None
+
+    def close(self) -> None:
         return None
 
 

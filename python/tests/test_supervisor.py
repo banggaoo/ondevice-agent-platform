@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -25,6 +26,7 @@ from ondevice_agent_platform.profiles import (ConsumerScope, Grant,
 from ondevice_agent_platform.providers.base import (
     LLMProvider, ModelCacheEvicting, MLPredictor, ProviderReadiness)
 from ondevice_agent_platform.runtime_root import RuntimeRoot
+from ondevice_agent_platform.state import JobState
 from ondevice_agent_platform.supervisor import PlatformSupervisor
 
 
@@ -287,6 +289,485 @@ class TestSupervisor(unittest.TestCase):
         self.assertIn("resource", snap)
         self.assertIn("models", snap)
         self.assertEqual(snap["models"][0]["alias"], "m")
+
+
+class _TokenOnlyLLM(LLMProvider):
+    """Cooperative only via the job token: provider.cancel() is a no-op,
+    so every cancellation must arrive through the private job token the
+    supervisor hands to complete()."""
+
+    provider_id = "token-only"
+
+    def __init__(self, release=None):
+        self.started = threading.Event()
+        self.saw_cancel = threading.Event()
+        self.closed = False
+        self.release = release or threading.Event()
+
+    def requires_load(self, profile):
+        return False
+
+    def complete(self, request, profile, token=None):
+        self.started.set()
+        end = time.time() + 15
+        while time.time() < end and not self.release.is_set():
+            if token is not None and token.is_cancelled:
+                self.saw_cancel.set()
+                raise PlatformError(ErrorCode.CANCELLED)
+            time.sleep(0.01)
+        return ChatResult(model_identity="token-only", content="pong",
+                          finish_reason=FinishReason.STOP,
+                          tool_calls=[], usage=ChatUsage(1, 1, 2))
+
+    def cancel(self, job_id):
+        pass    # deliberately noncooperative at the provider API
+
+    def close(self):
+        self.closed = True
+
+
+class _StateAtSignalLLM(_TokenOnlyLLM):
+    """Installs an observer on the private job token that records the
+    ACTIVE job's ledger state at the moment the signal fires - the point
+    where the old bridge cancelled the token before the locked cancel
+    path had marked CANCEL_REQUESTED."""
+
+    provider_id = "token-only"
+
+    def __init__(self, sup):
+        super().__init__()
+        self._sup = sup
+        self.state_at_signal = None
+
+    def complete(self, request, profile, token=None):
+        if token is not None:
+            def probe():
+                with self._sup._lock:
+                    jobs = [j for j in self._sup._active.values()
+                            if j.state == JobState.ACTIVE
+                            or j.state == JobState.CANCEL_REQUESTED]
+                    self.state_at_signal = (
+                        jobs[0].state if jobs else None)
+            token.observe(probe)
+        return super().complete(request, profile, token=token)
+
+
+class _SpontaneousCancelLLM(_TokenOnlyLLM):
+    """Returns CANCELLED of its own accord while the job record is still
+    ACTIVE - no cancel request anywhere."""
+
+    provider_id = "token-only"
+
+    def complete(self, request, profile, token=None):
+        self.started.set()
+        raise PlatformError(ErrorCode.CANCELLED)
+
+
+class _FastLLM(_TokenOnlyLLM):
+    """Returns immediately - exercises finish-before-timer ordering."""
+
+    provider_id = "token-only"
+
+    def complete(self, request, profile, token=None):
+        self.started.set()
+        return ChatResult(model_identity="token-only", content="pong",
+                          finish_reason=FinishReason.STOP,
+                          tool_calls=[], usage=ChatUsage(1, 1, 2))
+
+
+class _UncooperativeLLM(_TokenOnlyLLM):
+    """Ignores the private token entirely and blocks until the fixture
+    releases it; provider.cancel() is a no-op."""
+
+    provider_id = "token-only"
+
+    def complete(self, request, profile, token=None):
+        self.started.set()
+        end = time.time() + 15
+        while time.time() < end and not self.release.is_set():
+            time.sleep(0.01)
+        return ChatResult(model_identity="token-only", content="pong",
+                          finish_reason=FinishReason.STOP,
+                          tool_calls=[], usage=ChatUsage(1, 1, 2))
+
+
+class TestCancellationLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _sup(self, provider=None, source=None):
+        sup = make_supervisor(self.tmp.name, source)
+        self.addCleanup(sup.shutdown)
+        provider = provider or _TokenOnlyLLM()
+        sup.register_model(
+            ModelProfile(alias="m", provider_id="token-only",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=provider)
+        return sup, provider
+
+    def _req(self, alias="m"):
+        return ChatRequest(model=alias, messages=[
+            ChatMessage(role=ChatRole.USER, parts=["hi"])],
+            max_output_tokens=32, has_explicit_output_limit=True)
+
+    def _submit(self, sup, token=None):
+        try:
+            return sup.submit_llm(LocalConsumers.MODEL, self._req(),
+                                  cancellation=token)
+        except PlatformError as e:
+            return e
+
+    def _active_job(self, sup):
+        for _ in range(200):
+            jobs = sup.list_jobs()
+            active = [j for j in jobs
+                      if j.state == JobState.ACTIVE]
+            if active:
+                return active[0]
+            time.sleep(0.02)
+        self.fail("no active job")
+
+    def test_job_cancel_uses_private_token_and_frees_slot(self):
+        sup, provider = self._sup()
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        job = self._active_job(sup)
+        sup.cancel_job(LocalConsumers.ADMINISTRATION, job.id)
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertIsInstance(box["r"], PlatformError)
+        self.assertEqual(box["r"].code, ErrorCode.CANCELLED)
+        self.assertTrue(provider.saw_cancel.is_set())
+        # Slot freed: the next submission dispatches and completes.
+        provider.release.set()
+        result = self._submit(sup)
+        self.assertEqual(result.content, "pong")
+        self.assertEqual(sup._job_cancellations, {})
+
+    def test_deadline_signals_private_token(self):
+        sup, provider = self._sup()
+        box = {}
+        with unittest.mock.patch.object(
+                PlatformLimits, "INFERENCE_DEADLINE_SECONDS", 0.3):
+            t = threading.Thread(target=lambda: box.setdefault(
+                "r", self._submit(sup)), daemon=True)
+            t.start()
+            t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertIsInstance(box["r"], PlatformError)
+        self.assertEqual(box["r"].code, ErrorCode.DEADLINE_EXCEEDED)
+        # The deadline cancels the private token; the provider observes
+        # it on its own loop, so allow it a moment.
+        self.assertTrue(provider.saw_cancel.wait(3))
+
+    def test_deny_recheck_signals_private_token(self):
+        src = FakeSource()
+        sup, provider = self._sup(_TokenOnlyLLM(), src)
+        box = {}
+        with unittest.mock.patch.object(
+                PlatformLimits, "DENY_RECHECK_SECONDS", 0.2):
+            t = threading.Thread(target=lambda: box.setdefault(
+                "r", self._submit(sup)), daemon=True)
+            t.start()
+            self.assertTrue(provider.started.wait(3))
+            src.push(pressure=resources.MemoryPressureLevel.CRITICAL)
+            t.join(6)
+        self.assertFalse(t.is_alive())
+        self.assertIsInstance(box["r"], PlatformError)
+        self.assertIn(box["r"].code,
+                      (ErrorCode.CANCELLED, ErrorCode.RESOURCE_DENIED))
+        self.assertTrue(provider.saw_cancel.is_set())
+
+    def test_sibling_unaffected_parent_cancel_cancels_both(self):
+        # Two jobs share a caller token (the parent). Cancelling one job
+        # must not cancel the parent or sibling; cancelling the parent
+        # must cancel both children.
+        sup, provider = self._sup()
+        parent = CancellationToken()
+        boxes = [{}, {}]
+        threads = [
+            threading.Thread(target=lambda i=i: boxes[i].setdefault(
+                "r", self._submit(sup, parent)), daemon=True)
+            for i in range(2)]
+        for t in threads:
+            t.start()
+        job1 = self._active_job(sup)
+        sup.cancel_job(LocalConsumers.MODEL, job1.id)
+        # The active child ends cancelled; the sibling dispatches next
+        # and stays blocked inside the provider; the parent token is
+        # untouched by the single-child cancellation.
+        deadline = time.time() + 5
+        while time.time() < deadline and not any("r" in b for b in boxes):
+            time.sleep(0.02)
+        self.assertTrue(any("r" in b for b in boxes))
+        self.assertFalse(parent.is_cancelled)
+        parent.cancel()
+        for t in threads:
+            t.join(6)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        for b in boxes:
+            self.assertIsInstance(b["r"], PlatformError)
+            self.assertEqual(b["r"].code, ErrorCode.CANCELLED)
+
+    def test_shutdown_cancels_jobs_and_closes_provider(self):
+        sup, provider = self._sup()
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        self.assertTrue(provider.started.wait(3))
+        sup.shutdown()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertIsInstance(box["r"], PlatformError)
+        self.assertTrue(provider.closed)
+        # Post-shutdown dispatch is refused, not queued.
+        with self.assertRaises(PlatformError) as cm:
+            sup.submit_llm(LocalConsumers.MODEL, self._req())
+        self.assertEqual(cm.exception.code, ErrorCode.CANCELLED)
+        # Idempotent.
+        sup.shutdown()
+
+    def test_shutdown_releases_root_lock(self):
+        sup, _provider = self._sup()
+        sup.shutdown()
+        sup._root.acquire_lock()   # would block/fail if still held
+        sup._root.release_lock()
+
+    def test_parent_cancel_marks_requested_before_token_fires(self):
+        # Ordering regression: the parent-token bridge must run the locked
+        # cancel path first so the ledger shows CANCEL_REQUESTED (not
+        # ACTIVE) at the moment the private token fires; the worker's
+        # CANCELLED return then resolves to a durable CANCELLED record.
+        sup = make_supervisor(self.tmp.name)
+        self.addCleanup(sup.shutdown)
+        provider = _StateAtSignalLLM(sup)
+        sup.register_model(
+            ModelProfile(alias="m", provider_id="token-only",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=provider)
+        parent = CancellationToken()
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup, parent)), daemon=True)
+        t.start()
+        job = self._active_job(sup)
+        # Wait for the worker to install its private-token observer so the
+        # ordering assertion is deterministic.
+        self.assertTrue(provider.started.wait(3))
+        parent.cancel()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(provider.state_at_signal,
+                         JobState.CANCEL_REQUESTED)
+        self.assertIsInstance(box["r"], PlatformError)
+        self.assertEqual(box["r"].code, ErrorCode.CANCELLED)
+        record = sup.job_record(job.id)
+        self.assertEqual(record.state, JobState.CANCELLED)
+        self.assertTrue(record.provider_finished)
+        self.assertFalse(sup._inference_blocked)
+        self.assertEqual(sup._job_cancellations, {})
+
+    def test_provider_spontaneous_cancelled_ends_cancelled(self):
+        sup = make_supervisor(self.tmp.name)
+        self.addCleanup(sup.shutdown)
+        provider = _SpontaneousCancelLLM()
+        sup.register_model(
+            ModelProfile(alias="m", provider_id="token-only",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=provider)
+        result = self._submit(sup)
+        self.assertIsInstance(result, PlatformError)
+        self.assertEqual(result.code, ErrorCode.CANCELLED)
+        records = [j for j in sup.list_jobs()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].state, JobState.CANCELLED)
+        self.assertTrue(records[0].provider_finished)
+
+
+class TestJobTimerLifecycle(unittest.TestCase):
+    """Owned deadline/grace timers: created per job, cancelled on every
+    terminal outcome, popped by their own callbacks, swept at shutdown."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _sup(self, provider=None):
+        sup = make_supervisor(self.tmp.name)
+        self.addCleanup(sup.shutdown)
+        provider = provider or _TokenOnlyLLM()
+        sup.register_model(
+            ModelProfile(alias="m", provider_id="token-only",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=provider)
+        return sup, provider
+
+    def _req(self):
+        return ChatRequest(model="m", messages=[
+            ChatMessage(role=ChatRole.USER, parts=["hi"])],
+            max_output_tokens=32, has_explicit_output_limit=True)
+
+    def _submit(self, sup, token=None):
+        try:
+            return sup.submit_llm(LocalConsumers.MODEL, self._req(),
+                                  cancellation=token)
+        except PlatformError as e:
+            return e
+
+    def _active_job(self, sup):
+        for _ in range(200):
+            active = [j for j in sup.list_jobs()
+                      if j.state == JobState.ACTIVE]
+            if active:
+                return active[0]
+            time.sleep(0.02)
+        self.fail("no active job")
+
+    def _owned_timer_threads(self):
+        return [t for t in threading.enumerate()
+                if (t.name.startswith("oap-deadline-")
+                    or t.name.startswith("oap-grace-"))
+                and t.is_alive()]
+
+    def _assert_no_owned_timers(self, sup):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if (not sup._job_deadline_timers
+                    and not sup._job_grace_timers
+                    and not self._owned_timer_threads()):
+                return
+            time.sleep(0.02)
+        self.assertEqual(sup._job_deadline_timers, {})
+        self.assertEqual(sup._job_grace_timers, {})
+        self.assertEqual(self._owned_timer_threads(), [])
+
+    def test_fast_completions_leave_no_timers(self):
+        sup, _ = self._sup(provider=_FastLLM())
+        for _ in range(10):
+            result = self._submit(sup)
+            self.assertEqual(result.content, "pong")
+        self._assert_no_owned_timers(sup)
+
+    def test_confirmed_cancel_clears_deadline_and_grace(self):
+        sup, provider = self._sup()
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        job = self._active_job(sup)
+        # list_jobs reads the store without the lock; the ACTIVE row can
+        # persist a moment before _launch registers the timer - wait for
+        # the owned handle itself rather than racing it.
+        deadline = time.time() + 3
+        while (job.id not in sup._job_deadline_timers
+               and time.time() < deadline):
+            time.sleep(0.01)
+        self.assertIn(job.id, sup._job_deadline_timers)
+        sup.cancel_job(LocalConsumers.ADMINISTRATION, job.id)
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(box["r"].code, ErrorCode.CANCELLED)
+        self.assertTrue(provider.saw_cancel.is_set())
+        provider.release.set()
+        self._assert_no_owned_timers(sup)
+
+    def test_short_deadline_fires_and_cleans_handles(self):
+        sup, provider = self._sup()
+        box = {}
+        with unittest.mock.patch.object(
+                PlatformLimits, "INFERENCE_DEADLINE_SECONDS", 0.3):
+            t = threading.Thread(target=lambda: box.setdefault(
+                "r", self._submit(sup)), daemon=True)
+            t.start()
+            t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(box["r"].code, ErrorCode.DEADLINE_EXCEEDED)
+            self.assertTrue(provider.saw_cancel.wait(3))
+        provider.release.set()
+        self._assert_no_owned_timers(sup)
+
+    def test_uncooperative_cancel_holds_slot_then_cleans(self):
+        sup, provider = self._sup(provider=_UncooperativeLLM())
+        box = {}
+        with unittest.mock.patch.object(
+                PlatformLimits, "CANCELLATION_GRACE_SECONDS", 0.3):
+            t = threading.Thread(target=lambda: box.setdefault(
+                "r", self._submit(sup)), daemon=True)
+            t.start()
+            job = self._active_job(sup)
+            sup.cancel_job(LocalConsumers.ADMINISTRATION, job.id)
+            t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(box["r"].code,
+                             ErrorCode.CANCELLATION_UNCONFIRMED)
+            # Provider never answered: slot stays occupied, ledger stays
+            # unconfirmed - never falsely upgraded to CANCELLED.
+            self.assertTrue(sup._inference_blocked)
+            record = sup.job_record(job.id)
+            self.assertEqual(record.state,
+                             JobState.CANCELLATION_UNCONFIRMED)
+            provider.release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and sup._inference_blocked:
+                time.sleep(0.02)
+            self.assertFalse(sup._inference_blocked)
+        self._assert_no_owned_timers(sup)
+        # Slot really freed: a new job runs to completion.
+        result = self._submit(sup)
+        self.assertEqual(result.content, "pong")
+
+    def test_shutdown_leaves_no_owned_timers(self):
+        sup, provider = self._sup()
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        self.assertTrue(provider.started.wait(3))
+        sup.shutdown()
+        t.join(5)
+        provider.release.set()
+        self._assert_no_owned_timers(sup)
+
+    def test_shutdown_noncooperative_resumes_unconfirmed(self):
+        # Shutdown must not strand the caller: grace timers stay live
+        # through the bounded worker wait, and any still-unconfirmed
+        # request is resumed via the normal expiry path before storage
+        # closes - while the provider keeps its slot until it finishes.
+        sup, provider = self._sup(provider=_UncooperativeLLM())
+        box = {}
+        with unittest.mock.patch.object(
+                PlatformLimits, "CANCELLATION_GRACE_SECONDS", 0.3):
+            t = threading.Thread(target=lambda: box.setdefault(
+                "r", self._submit(sup)), daemon=True)
+            t.start()
+            self.assertTrue(provider.started.wait(3))
+            sup.shutdown()
+            t.join(1)
+            self.assertFalse(t.is_alive())
+            self.assertIsInstance(box["r"], PlatformError)
+            self.assertEqual(box["r"].code,
+                             ErrorCode.CANCELLATION_UNCONFIRMED)
+            # Slot still held - never falsely confirmed or released.
+            self.assertTrue(sup._inference_blocked)
+            self.assertTrue(any(
+                j.state == JobState.CANCELLATION_UNCONFIRMED
+                for j in sup._active.values()))
+            provider.release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and sup._active:
+                time.sleep(0.02)
+        self.assertEqual(sup._active, {})
+        self.assertEqual(sup._job_deadline_timers, {})
+        self.assertEqual(sup._job_grace_timers, {})
+        self.assertEqual(self._owned_timer_threads(), [])
 
 
 class TestACP(unittest.TestCase):

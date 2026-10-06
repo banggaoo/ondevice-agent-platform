@@ -132,6 +132,34 @@ web research:
 - System SQLite (`$SDK/usr/include/sqlite3.h`, `libsqlite3.tbd`) is linked via
   the package's `CSQLite` system-library target; no third-party dependency.
 
+## Installed-package API inspection (2026-10-07)
+
+Primary checks against the pinned libraries actually installed in the
+managed provider environment (`vllm-mlx==0.5.0`, `mlx-lm==0.32.0`,
+`mlx-vlm==0.7.6`) — installed-package source inspection, not a fresh
+remote documentation fetch. Stable reference URLs for the same
+libraries: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm),
+[mlx-lm](https://github.com/ml-explore/mlx-lm),
+[vllm-mlx](https://github.com/waybarrios/vllm-mlx).
+
+- `mlx_vlm.generate.dispatch.stream_generate(model, processor, prompt,
+  image=None, **kwargs)`; kwargs flow into `generate_step`
+  (`temperature`, `top_p`, `seed` accepted). `prompt_utils
+  .apply_chat_template` preserves per-message explicit image/image_url
+  markers and accepts `num_images`.
+- `mlx_vlm.utils.process_image` calls `load_image` **only** for `str`
+  inputs; other objects pass through unconverted. `utils.load_image`
+  accepts `BytesIO` and PIL (RGB + EXIF normalization) and rejects raw
+  bytes — the installed evidence behind the vision ABI fix (decode via
+  `load_image` before `stream_generate`).
+- `mlx_lm.stream_generate` takes a `Sampler` (`sample_utils
+  .make_sampler(temp=, top_p=)`), not `temperature`/`top_p` kwargs.
+- Python stdlib references used by the HTTP providers and transport:
+  [`http.client`](https://docs.python.org/3/library/http.client.html)
+  (fixed connections the cancel observer can `shutdown()`+`close()`) and
+  [`socket.shutdown`](https://docs.python.org/3/library/socket.html#socket.socket.shutdown)
+  (waking a `recv` blocked in another thread; `close()` alone does not).
+
 ## MLX runtime dependency verification (2026-10-04)
 
 Pinned for the owned open-weight route; verified against upstream tags and
