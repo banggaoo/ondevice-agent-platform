@@ -15,6 +15,9 @@ _OWNED_NAMES = {
     "config.json", "registry.json", "state.sqlite3",
     "state.sqlite3-wal", "state.sqlite3-shm",
     "lock.fd", "daemon.json", "sessions", "models",
+    # macOS Finder metadata - not user content; a Finder visit must not
+    # brick an existing root. (Swift ownedNames lacks it; parity fix TODO.)
+    ".DS_Store",
 }
 
 

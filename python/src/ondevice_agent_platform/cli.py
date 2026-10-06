@@ -225,8 +225,9 @@ def cmd_model_pull(args) -> int:
     manifest = store.pull(source, artifact_file=artifact_file,
                           progress=_progress(source.repo))
     files = manifest.get("files", {})
+    total = sum(f.get("size") or 0 for f in files)
     print(f"installed {len(files)} file(s), "
-          f"{manifest.get('bytes', 0) / 1e9:.2f} GB -> "
+          f"{total / 1e9:.2f} GB -> "
           f"{store.directory(source, artifact_file)}")
     return 0
 
