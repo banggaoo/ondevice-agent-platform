@@ -981,11 +981,11 @@ prefix cache, confirmed through both real consumers);
 qwen2.5-coder-7b-vllm was removed from the registry and its artifact
 deleted - its chat template emits tool calls inside a text
 `<response>{{...}}</response>` envelope that no consumer can dispatch,
-so it fails the agent contract regardless of speed. A utility route
-qwen3-1.7b-vllm (mlx-community/Qwen3-1.7B-4bit, 0.98 GB, true
-Qwen3ForCausalLM - native cache) covers small calls (titles,
-summarization, classification); first load deferred ~90s behind the
-resident 9B at warn-level (correct: loads freeze at warning, in-flight
-finishes), warm turns ~1.2s. llama.cpp
+so it fails the agent contract regardless of speed. A
+qwen3-1.7b-vllm utility route was trialled (0.98 GB, warm turns ~1.2s)
+then removed at user direction - "we only use 3.8". The three 9B
+routes cover distinct runtimes: vllm-mlx (primary, cached+tools),
+mlx (same artifact, zero marginal disk, fallback when vllm-mlx is
+absent), llamacpp/GGUF (mandatory Windows/Linux route). llama.cpp
 remains the cross-platform route; this policy change is macOS-
 observed but the warn/defer semantics apply on every OS.
