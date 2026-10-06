@@ -925,3 +925,57 @@ prefix caching/continuous batching/OpenAI+Anthropic APIs are real;
 "SHA-256 image hashing 28x", `vllm.entrypoints` serving, and
 `sudo sysctl wired_mem_alloc_limit` requirements are not - the real
 entry is `vllm-mlx serve <model> --local-files-only`.
+
+vllm-mlx productionization + consumer validation (2026-10-06):
+the provider now builds the symlink overlay itself (weights linked
+from the verified store, config.json patched to the CausalLM arch
+with VLM marker keys stripped - zero bytes copied), passes
+`--enable-prefix-cache` + `--served-model-name`, and calls the
+server with `stream: true` internally because the trie prompt cache
+only engages on the streaming path; SSE deltas are aggregated into
+a normal ChatResult for callers.
+
+Three governance bugs found and fixed by live benchmarking on this
+16 GB host: (1) provider `_Server.stop()` could take ~8s, longer
+than the 5s cancellation grace - jobs landed `cancellation_
+unconfirmed` and latched `_inference_blocked`; stop now terminates
+inside grace in both vllm-mlx and llamacpp providers. (2) A deny
+verdict cancelled in-flight jobs before shedding resident caches -
+the cheapest relief ran last, and the job whose own load tipped the
+host was killed by it. Order is now: evict non-serving residents ->
+settle -> re-sample -> cancel only on persistent deny
+(`DENY_RECHECK_SECONDS = 3.0`). Providers track per-alias serving
+counts (`evict_not_inflight`) so a container mid-request is never
+shed. (3) Memory WARNING mapped to deny_and_cancel, but the kernel
+warn boundary (memorystatus_level <= 30) is a reclaim notice, not
+the emergency floor - on a 16 GB host ANY useful resident model
+(4-5 GB) idles at ~25-30, so the flagship workload was structurally
+unadmissible: loads died at recheck and idle residents were shed
+~1s after each turn, destroying the prefix cache between calls.
+WARNING now maps to DEFER_LOAD semantics (new loads freeze,
+in-flight finishes, residents keep serving); CRITICAL (<= 8,
+swap-storm floor) keeps deny_and_cancel. Verified live: a resident
+qwen3.8-9b-vllm server held through level oscillation 27-50 and
+served warm-cache turns while the host sat at warning.
+
+Measured coding-agent comparison through governed /v1 (same bench:
+~5.4-5.9K-token repo context + tool schemas, cold load, repeat
+prefix turn, 350-token codegen): qwen2.5-coder-7b-vllm (official
+mlx-community conversion, Qwen2ForCausalLM - no overlay needed)
+cold 8.0s, big-prefix turn 90.9s, same-prefix repeat 3.4s (~27x),
+codegen 4/4 signals, ~12 tok/s - but answered in text instead of
+emitting the read_file tool call on the agent prompt.
+qwen3.8-9b-vllm (overlay-routed) cold 16.2s, big-prefix turn 92.9s,
+same-prefix repeat 6.7s (~14x), codegen 3/4, ~12 tok/s - emitted a
+correct read_file(src/mod_7.py) tool call. Consumer validation:
+ARTEMIS real ModelFactory->ChatOpenAI path against /v1 returned
+invoke + bind_tools results with correctly parsed tool_calls;
+OpenCode `run --model ondevice/qwen3.8-9b-vllm` completed its
+title+build agent calls through governed streaming (cold-context
+turn 106s, same-session follow-up 6.1s - real-consumer prefix
+cache reuse ~17x). Selection: keep both routes; qwen3.8-9b-vllm
+is the verified tool-calling agent default on this host,
+qwen2.5-coder-7b-vllm the lighter/faster alternative (noting it
+skipped the tool call in this single-sample probe). llama.cpp
+remains the cross-platform route; this policy change is macOS-
+observed but the warn/defer semantics apply on every OS.

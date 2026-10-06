@@ -90,6 +90,7 @@ class PlatformSupervisor:
         self._next_consumer_index = 0
         self._inference_blocked = False
         self._shutting_down = False
+        self._deny_recheck_pending = False
         self._latest_snapshot = resources.ResourceSnapshot.unknown()
 
     # -- lifecycle ---------------------------------------------------------
@@ -730,16 +731,48 @@ class PlatformSupervisor:
             self._latest_snapshot = snapshot
             if resources.evaluate(snapshot, time.time()) == \
                     resources.ResourceVerdict.DENY_AND_CANCEL:
-                self.cancel_children_for_resource_denial()
-                # Host needs memory back: shed resident weight caches.
+                # Shed unserving residents first - cheapest relief.
+                # Cancelling in-flight work on a transient dip punishes
+                # the request whose own allocation tipped the host; the
+                # recheck cancels only if pressure persists.
                 for provider in self._llm_providers.values():
                     if isinstance(provider, ModelCacheEvicting):
-                        provider.evict_resident()
+                        provider.evict_not_inflight()
+                self._schedule_deny_recheck_locked()
             else:
                 cutoff = time.time() - PlatformLimits.MODEL_IDLE_SECONDS
                 for provider in self._llm_providers.values():
                     if isinstance(provider, ModelCacheEvicting):
                         provider.evict_idle(cutoff)
+            self._dispatch_locked()
+
+    def _schedule_deny_recheck_locked(self) -> None:
+        if self._deny_recheck_pending or self._shutting_down:
+            return
+        self._deny_recheck_pending = True
+        timer = threading.Timer(PlatformLimits.DENY_RECHECK_SECONDS,
+                                self._deny_recheck)
+        timer.daemon = True
+        timer.start()
+
+    def _deny_recheck(self) -> None:
+        try:
+            snapshot = self._source.current_snapshot()
+        except Exception:
+            snapshot = None
+        with self._lock:
+            self._deny_recheck_pending = False
+            if self._shutting_down:
+                return
+            if snapshot is not None:
+                self._latest_snapshot = snapshot
+            if resources.evaluate(snapshot or self._latest_snapshot,
+                                  time.time()) == \
+                    resources.ResourceVerdict.DENY_AND_CANCEL:
+                self.cancel_children_for_resource_denial()
+                for provider in self._llm_providers.values():
+                    if isinstance(provider, ModelCacheEvicting):
+                        provider.evict_resident()
             self._dispatch_locked()
 
     def harness_context(self, principal: Principal, parent_id: str,

@@ -87,10 +87,15 @@ def evaluate(snapshot: ResourceSnapshot, now: float) -> ResourceVerdict:
             or snapshot.low_power_mode is None):
         return ResourceVerdict.DENY_AND_CANCEL
     if (snapshot.thermal in (ThermalLevel.SERIOUS, ThermalLevel.CRITICAL)
-            or snapshot.memory_pressure in (MemoryPressureLevel.WARNING,
-                                            MemoryPressureLevel.CRITICAL)):
+            or snapshot.memory_pressure == MemoryPressureLevel.CRITICAL):
         return ResourceVerdict.DENY_AND_CANCEL
-    if snapshot.thermal == ThermalLevel.FAIR or snapshot.low_power_mode:
+    # Memory WARNING (kernel warn boundary, e.g. macOS level <= 30) freezes
+    # new loads but lets in-flight work finish and keeps residents: the
+    # boundary is a reclaim notice, not the emergency floor. A resident
+    # model legitimately holds a loaded host at warning; only CRITICAL
+    # (swap-storm floor) sheds everything.
+    if (snapshot.thermal == ThermalLevel.FAIR or snapshot.low_power_mode
+            or snapshot.memory_pressure == MemoryPressureLevel.WARNING):
         return ResourceVerdict.DEFER_LOAD
     return ResourceVerdict.ADMIT
 

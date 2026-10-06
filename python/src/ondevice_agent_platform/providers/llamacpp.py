@@ -62,10 +62,12 @@ class _Server:
         return self.proc.poll() is None
 
     def stop(self) -> None:
+        # Inside the supervisor's 5s cancellation grace, or the job lands
+        # cancellation_unconfirmed and blocks daemon-wide inference.
         if self.proc.poll() is None:
             try:
                 self.proc.terminate()
-                self.proc.wait(timeout=5)
+                self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
 
@@ -79,6 +81,7 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         self._servers: dict[str, _Server] = {}
         self._lock = threading.Lock()
         self._epochs: dict[str, int] = {}
+        self._serving: dict[str, int] = {}
         self._profiles: list = []
 
     # -- readiness ---------------------------------------------------------
@@ -115,14 +118,32 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             s.stop()
         return len(servers)
 
+    def evict_not_inflight(self) -> int:
+        with self._lock:
+            targets = [a for a in self._servers if not self._serving.get(a)]
+            for a in targets:
+                self._epochs[a] = self._epochs.get(a, 0) + 1
+                self._servers.pop(a).stop()
+        return len(targets)
+
     def evict_idle(self, older_than: float) -> int:
         with self._lock:
             idle = [a for a, s in self._servers.items()
-                    if s.last_used < older_than]
+                    if s.last_used < older_than and not self._serving.get(a)]
             for a in idle:
                 self._epochs[a] = self._epochs.get(a, 0) + 1
                 self._servers.pop(a).stop()
         return len(idle)
+
+    def _serving_add(self, alias: str) -> None:
+        self._serving[alias] = self._serving.get(alias, 0) + 1
+
+    def _serving_drop(self, alias: str) -> None:
+        n = self._serving.get(alias, 0)
+        if n <= 1:
+            self._serving.pop(alias, None)
+        else:
+            self._serving[alias] = n - 1
 
     # -- inference -----------------------------------------------------------
     def _server_for(self, profile, token=None):
@@ -176,43 +197,52 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         return server
 
     def complete(self, request, profile, token=None):
+        # Mark serving intent before selecting the server so a deny
+        # eviction can never take a container this call is about to use.
         with self._lock:
-            server = self._servers.get(profile.alias)
-        if server is None:
-            server = self._server_for(profile, token)
-        if not server.healthy():
-            with self._lock:
-                self._servers.pop(profile.alias, None)
-            server = self._server_for(profile, token)
-        server.last_used = time.time()
-        if token is not None and token.is_cancelled:
-            raise PlatformError(ErrorCode.CANCELLED)
-        body = self._wire_request(request, profile)
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{server.port}/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
-        # Cancellation can abort the in-flight read: the token's observer
-        # closes the response so a cancel never waits out the socket.
-        inflight = []
-        observer = (token.observe(lambda: [r.close() for r in inflight])
-                    if token is not None else None)
+            self._serving_add(profile.alias)
         try:
-            with urllib.request.urlopen(req, timeout=300) as r:
-                inflight.append(r)
-                payload = json.loads(r.read())
-        except Exception as e:
+            with self._lock:
+                server = self._servers.get(profile.alias)
+            if server is None:
+                server = self._server_for(profile, token)
+            if not server.healthy():
+                with self._lock:
+                    self._servers.pop(profile.alias, None)
+                server = self._server_for(profile, token)
+            server.last_used = time.time()
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
-            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                f"llama-server call failed: {e}")
+            body = self._wire_request(request, profile)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.port}/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"})
+            # Cancellation can abort the in-flight read: the token's
+            # observer closes the response so a cancel never waits out
+            # the socket.
+            inflight = []
+            observer = (token.observe(lambda: [r.close() for r in inflight])
+                        if token is not None else None)
+            try:
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    inflight.append(r)
+                    payload = json.loads(r.read())
+            except Exception as e:
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    f"llama-server call failed: {e}")
+            finally:
+                if token is not None and observer is not None:
+                    token.remove_observer(observer)
+            if token is not None and token.is_cancelled:
+                raise PlatformError(ErrorCode.CANCELLED)
+            server.last_used = time.time()
+            return self._wire_result(payload, request.model)
         finally:
-            if token is not None and observer is not None:
-                token.remove_observer(observer)
-        if token is not None and token.is_cancelled:
-            raise PlatformError(ErrorCode.CANCELLED)
-        server.last_used = time.time()
-        return self._wire_result(payload, request.model)
+            with self._lock:
+                self._serving_drop(profile.alias)
 
     def cancel(self, job_id: str) -> None:
         # llama-server has no cooperative cancel for a finished socket call;

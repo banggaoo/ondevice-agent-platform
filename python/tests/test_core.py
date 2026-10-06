@@ -131,7 +131,9 @@ class TestCatalog(unittest.TestCase):
              "outputSchema": {"label": "string", "confidence": "number"},
              "linear": {"features": ["x"], "labels": ["a"],
                         "weights": [[1.0]]}}]}
-        merged = catalog.merged_registry(existing, [catalog.ENTRIES[2]])
+        entry = next(e for e in catalog.ENTRIES
+                     if e.alias == "qwen3.8-9b-gguf")
+        merged = catalog.merged_registry(existing, [entry])
         aliases = [m["alias"] for m in merged["models"]]
         self.assertIn("mine", aliases)
         self.assertIn("qwen3.8-9b-gguf", aliases)
@@ -212,10 +214,18 @@ class TestResources(unittest.TestCase):
             resources.MemoryPressureLevel.NORMAL), time.time())
         self.assertEqual(v, resources.ResourceVerdict.ADMIT)
 
-    def test_warning_denies(self):
+    def test_warning_defers_loads(self):
+        # Memory warning freezes new loads but does not cancel in-flight
+        # work or shed residents; only CRITICAL denies outright.
         v = resources.evaluate(self.snap(
             resources.ThermalLevel.NOMINAL,
             resources.MemoryPressureLevel.WARNING), time.time())
+        self.assertEqual(v, resources.ResourceVerdict.DEFER_LOAD)
+
+    def test_critical_denies(self):
+        v = resources.evaluate(self.snap(
+            resources.ThermalLevel.NOMINAL,
+            resources.MemoryPressureLevel.CRITICAL), time.time())
         self.assertEqual(v, resources.ResourceVerdict.DENY_AND_CANCEL)
 
     def test_fair_defers_load(self):

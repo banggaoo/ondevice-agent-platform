@@ -48,6 +48,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         self._store = store
         self._containers: dict[str, _Container] = {}
         self._epochs: dict[str, int] = {}
+        self._serving: dict[str, int] = {}
         self._profiles: list = []
         self._lock = threading.Lock()
 
@@ -78,14 +79,33 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 self._epochs[alias] += 1
         return count
 
+    def evict_not_inflight(self) -> int:
+        with self._lock:
+            targets = [a for a in self._containers
+                       if not self._serving.get(a)]
+            for a in targets:
+                self._epochs[a] = self._epochs.get(a, 0) + 1
+                del self._containers[a]
+        return len(targets)
+
     def evict_idle(self, older_than: float) -> int:
         with self._lock:
             idle = [a for a, c in self._containers.items()
-                    if c.last_used < older_than]
+                    if c.last_used < older_than and not self._serving.get(a)]
             for a in idle:
                 self._epochs[a] = self._epochs.get(a, 0) + 1
                 del self._containers[a]
         return len(idle)
+
+    def _serving_add(self, alias: str) -> None:
+        self._serving[alias] = self._serving.get(alias, 0) + 1
+
+    def _serving_drop(self, alias: str) -> None:
+        n = self._serving.get(alias, 0)
+        if n <= 1:
+            self._serving.pop(alias, None)
+        else:
+            self._serving[alias] = n - 1
 
     def cancel(self, job_id: str) -> None:
         # Cooperative cancellation rides the job's CancellationToken, which
@@ -126,23 +146,31 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "mlx-lm not installed")
         with self._lock:
-            container = self._containers.get(profile.alias)
-        if container is None:
-            container = self._container_for(profile)
-        flag = threading.Event()
-        observer = (token.observe(flag.set)
-                    if token is not None else None)
+            self._serving_add(profile.alias)
         try:
-            container.last_used = time.time()
-            if token is not None and token.is_cancelled:
-                raise PlatformError(ErrorCode.CANCELLED)
-            if container.vlm:
-                return self._complete_vlm(container, request, profile, flag)
-            return self._complete_text(container, request, profile, flag)
+            with self._lock:
+                container = self._containers.get(profile.alias)
+            if container is None:
+                container = self._container_for(profile)
+            flag = threading.Event()
+            observer = (token.observe(flag.set)
+                        if token is not None else None)
+            try:
+                container.last_used = time.time()
+                if token is not None and token.is_cancelled:
+                    raise PlatformError(ErrorCode.CANCELLED)
+                if container.vlm:
+                    return self._complete_vlm(container, request, profile,
+                                              flag)
+                return self._complete_text(container, request, profile,
+                                           flag)
+            finally:
+                if token is not None and observer is not None:
+                    token.remove_observer(observer)
+                container.last_used = time.time()
         finally:
-            if token is not None and observer is not None:
-                token.remove_observer(observer)
-            container.last_used = time.time()
+            with self._lock:
+                self._serving_drop(profile.alias)
 
     def _messages_payload(self, request, profile) -> list[dict]:
         messages = []

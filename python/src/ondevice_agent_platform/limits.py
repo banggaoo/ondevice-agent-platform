@@ -17,6 +17,11 @@ class PlatformLimits:
     CANCELLATION_GRACE_SECONDS = 5.0
     RESOURCE_SAMPLE_SECONDS = 1.0
     RESOURCE_MAX_AGE_SECONDS = 5.0
+    # After a deny verdict sheds resident caches, wait this long for the OS
+    # to reflect the freed memory, then re-sample; jobs are cancelled only
+    # if pressure persists. Keeps the load that tipped the host from being
+    # killed by its own footprint while still bounding the emergency delay.
+    DENY_RECHECK_SECONDS = 3.0
     # A loaded model container unused for this long is released so its
     # memory returns to the host; the next request reloads on demand.
     MODEL_IDLE_SECONDS = 600.0

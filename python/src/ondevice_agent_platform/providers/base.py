@@ -45,9 +45,15 @@ class MLPredictor:
 
 class ModelCacheEvicting:
     """Optional weight-cache shedding: deny_and_cancel sheds resident
-    containers; snapshots trim containers idle past MODEL_IDLE_SECONDS."""
+    containers; snapshots trim containers idle past MODEL_IDLE_SECONDS.
+    Containers serving an in-flight request are never idle: deny verdicts
+    shed only unserving residents, then re-check; a persistent deny still
+    cancels jobs and sheds everything via evict_resident."""
 
     def evict_resident(self) -> int:
+        return 0
+
+    def evict_not_inflight(self) -> int:
         return 0
 
     def evict_idle(self, older_than: float) -> int:

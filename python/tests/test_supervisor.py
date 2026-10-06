@@ -86,6 +86,21 @@ class FakeLLM(LLMProvider):
         self._cancel.set()
 
 
+class FakeEvictingLLM(FakeLLM, ModelCacheEvicting):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.resident_evictions = 0
+        self.not_inflight_evictions = 0
+
+    def evict_resident(self):
+        self.resident_evictions += 1
+        return 0
+
+    def evict_not_inflight(self):
+        self.not_inflight_evictions += 1
+        return 0
+
+
 class FakeML(MLPredictor):
     provider_id = "fake-ml"
 
@@ -158,7 +173,7 @@ class TestSupervisor(unittest.TestCase):
         src = FakeSource()
         sup = make_supervisor(self.tmp.name, src)
         self.addCleanup(sup.shutdown)
-        provider = FakeLLM(delay=3.0)
+        provider = FakeLLM(delay=30.0)
         sup.register_model(self.llm_profile(), provider=provider)
         box = {}
         t = threading.Thread(target=lambda: box.setdefault(
@@ -166,10 +181,51 @@ class TestSupervisor(unittest.TestCase):
         t.start()
         time.sleep(0.3)   # job active
         src.push(pressure=resources.MemoryPressureLevel.CRITICAL)
-        t.join(5)
+        t.join(PlatformLimits.DENY_RECHECK_SECONDS + 5)
         self.assertIsInstance(box.get("r"), PlatformError)
         self.assertIn(box["r"].code, (ErrorCode.CANCELLED,
                                       ErrorCode.RESOURCE_DENIED))
+
+    def test_transient_deny_spares_inflight(self):
+        # A deny snapshot sheds unserving residents first; when pressure
+        # recovers before the recheck, the in-flight job completes.
+        src = FakeSource()
+        sup = make_supervisor(self.tmp.name, src)
+        self.addCleanup(sup.shutdown)
+        provider = FakeEvictingLLM(delay=3.0)
+        sup.register_model(self.llm_profile(), provider=provider)
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        time.sleep(0.3)
+        src.push(pressure=resources.MemoryPressureLevel.CRITICAL)
+        time.sleep(0.5)
+        src.push(pressure=resources.MemoryPressureLevel.NORMAL)
+        t.join(6)
+        self.assertEqual(getattr(box.get("r"), "content", None), "pong")
+        self.assertGreaterEqual(provider.not_inflight_evictions, 1)
+        self.assertEqual(provider.resident_evictions, 0)
+
+    def test_persistent_deny_still_cancels(self):
+        # If pressure persists past the recheck, jobs are cancelled and
+        # even serving residents are shed.
+        src = FakeSource()
+        sup = make_supervisor(self.tmp.name, src)
+        self.addCleanup(sup.shutdown)
+        provider = FakeEvictingLLM(delay=30.0)
+        sup.register_model(self.llm_profile(), provider=provider)
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", self._submit(sup)), daemon=True)
+        t.start()
+        time.sleep(0.3)
+        src.push(pressure=resources.MemoryPressureLevel.CRITICAL)
+        t.join(PlatformLimits.DENY_RECHECK_SECONDS + 6)
+        self.assertIsInstance(box.get("r"), PlatformError)
+        self.assertIn(box["r"].code, (ErrorCode.CANCELLED,
+                                      ErrorCode.RESOURCE_DENIED))
+        self.assertGreaterEqual(provider.resident_evictions, 1)
 
     def _submit(self, sup):
         try:
