@@ -34,7 +34,10 @@ surface.
 - Model aliases verified on this host (registry, not re-derived here):
   `qwen3.8-9b-vllm` (primary text/agent/coding route, `vllm-mlx` 0.5.0),
   `qwen3.8-9b` (direct `mlx` route sharing the same artifact),
-  `qwen-vl` (`mlx-vlm` 0.7.6, `Qwen3-VL-2B-Instruct-4bit` vision). GGUF
+  `qwen-vl` (`mlx-vlm` 0.7.6, `Qwen3-VL-2B-Instruct-4bit` vision), and
+  `gemma4-e4b` (`mlx-vlm` 0.7.6 `gemma4` arch,
+  `mlx-community/gemma-4-e4b-it-4bit` @ `475b9088`, added 2026-10-08:
+  text turn + real image turn verified on the installed daemon). GGUF
   catalog entries are Windows/Linux-scoped; no `llama-server` auto-install
   exists anywhere.
 

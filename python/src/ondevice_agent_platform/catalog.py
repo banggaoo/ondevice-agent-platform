@@ -91,6 +91,21 @@ ENTRIES: tuple[CatalogModel, ...] = (
                                    fmt="mlx",
                                    min_free_bytes=2_500_000_000)),
     CatalogModel(
+        alias="gemma4-e4b",
+        summary="vision + text (Gemma 4 E4B IT, image/audio-capable -"
+                " audio not served by this platform)",
+        provider=MLX_PROVIDER_ID,
+        purposes=("vision", "reasoning"),
+        capabilities=("text", "vision"),
+        max_output_tokens=2048,
+        approx_bytes=5_200_000_000,
+        source=ModelSource(
+            repo="mlx-community/gemma-4-e4b-it-4bit",
+            revision="475b9088d29754a3379866cf5aeb6b41acd313c2"),
+        requires=RouteRequirements(os=("macOS",), accelerator="metal",
+                                   fmt="mlx",
+                                   min_free_bytes=6_000_000_000)),
+    CatalogModel(
         alias="qwen3.8-9b-gguf",
         summary="text reasoning, coding - Windows/Linux route "
                 "(Qwen3.8-9B-Distill Q4_K_M GGUF)",

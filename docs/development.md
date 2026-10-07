@@ -1086,3 +1086,21 @@ provider_finished), and buffered-SSE finish/usage/`[DONE]` passed. One
 bounded coexistence observation only - not capacity or headroom
 evidence. See docs/production-readiness.md for the consolidated tested
 envelope and limitations.
+
+## Gemma 4 E4B route (2026-10-08)
+
+`gemma4-e4b` joined the catalog at user request (D57):
+`mlx-community/gemma-4-e4b-it-4bit` pinned `475b9088...`, ~5.2 GB,
+`capabilities=("text","vision")` on the mlx provider - it rides the same
+`mlx-vlm` path as `qwen-vl` (the installed 0.7.6 already ships the
+`gemma4` architecture). First pull hit ENOSPC at ~90% (host disk was at
+4.5 GB free); reclaiming the superseded `/tmp/oap-vllm-venv` scratch env
+and test temp dirs freed ~1.8 GB and the pull completed (10 files,
+5.18 GB). Verified live on the installed daemon: text turn `PONG`
+(usage 17/3/20) and a synthetic-image turn `Red` (usage 281/2/283),
+both finish `stop`, admission `admit` at normal memory pressure while
+resident. Upstream the model also accepts audio - the platform has no
+audio surface, so only text and image turns are served. Full suite:
+227 tests OK under the managed >=3.11 interpreter (the Xcode 3.9
+interpreter is below the declared floor and cannot run the install
+tests).
