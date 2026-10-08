@@ -109,6 +109,14 @@ with `strict: true` is enforced only on the `vllm-mlx` route - the
 guidance-only mlx/llamacpp/Apple routes refuse `strict=True` and
 forced tool choices explicitly rather than silently degrading.
 
+**Lineup note (2026-10-08):** the `qwen3.8-9b-vllm` route verified above
+was removed at user request; ARTEMIS's default and fallback now bind
+`qwen3.8-9b`, the same weights served by `mlx-lm` directly. Text, tool,
+tool-result, and vision turns are unaffected, but no declared route on
+this host enforces `strict: true` JSON - `with_structured_output`
+strict requests now meet an explicit `invalid_request` refusal rather
+than enforced output.
+
 **Residual - not qualified:** the optional `planner_validation` and
 `validator_pixel_safety_net` routes still default to Google in the
 inspected source (a frozen audit finding); they were not invoked by

@@ -31,15 +31,15 @@ surface.
 - Source independence: verified from an empty working directory with
   `PYTHONPATH` unset — `ondevice_agent_platform.__file__` resolves inside
   managed-env `site-packages`, not the checkout.
-- Model aliases verified on this host (registry, not re-derived here):
-  `qwen3.8-9b-vllm` (primary text/agent/coding route, `vllm-mlx` 0.5.0),
-  `qwen3.8-9b` (direct `mlx` route sharing the same artifact),
-  `qwen-vl` (`mlx-vlm` 0.7.6, `Qwen3-VL-2B-Instruct-4bit` vision), and
-  `gemma4-e4b` (`mlx-vlm` 0.7.6 `gemma4` arch,
-  `mlx-community/gemma-4-e4b-it-4bit` @ `475b9088`, added 2026-10-08:
-  text turn + real image turn verified on the installed daemon). GGUF
-  catalog entries are Windows/Linux-scoped; no `llama-server` auto-install
-  exists anywhere.
+- Model aliases on this host (registry): `qwen3.8-9b` (primary
+  text/agent/coding route, `mlx-lm` 0.32.0), `qwen-vl` (`mlx-vlm` 0.7.6,
+  `Qwen3-VL-2B-Instruct-4bit` vision), and `gemma4-e4b` (`mlx-vlm` 0.7.6
+  `gemma4` arch, `mlx-community/gemma-4-e4b-it-4bit` @ `475b9088`).
+  The `qwen3.8-9b-vllm` route (`vllm-mlx` 0.5.0, same 9B artifact) was
+  verified on 2026-10-07 and removed at user request on 2026-10-08 -
+  that verification record below is historical. GGUF catalog entries
+  are Windows/Linux-scoped; no `llama-server` auto-install exists
+  anywhere.
 
 ## Verification record
 
@@ -133,7 +133,9 @@ separate facts, not one run.
 - **Strict JSON only on the enforcing route.** `json_schema.strict` is
   forwarded on `vllm-mlx`; guidance-only routes (mlx, llamacpp, Apple)
   explicitly refuse `strict=True` and forced tool choices rather than
-  pretending enforcement.
+  pretending enforcement. **No declared route on this host enforces
+  strict JSON** - the `qwen3.8-9b-vllm` route was removed 2026-10-08;
+  `vllm-mlx` remains a supported provider type if a route is re-added.
 - **ARTEMIS full local-only mobile workflows are not qualified.** The
   optional `planner_validation` and `validator_pixel_safety_net` routes
   still default to Google in the inspected source; they were not invoked,

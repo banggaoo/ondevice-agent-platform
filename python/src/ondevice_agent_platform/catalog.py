@@ -62,21 +62,6 @@ ENTRIES: tuple[CatalogModel, ...] = (
                                    fmt="mlx",
                                    min_free_bytes=6_000_000_000)),
     CatalogModel(
-        alias="qwen3.8-9b-vllm",
-        summary="text reasoning, coding, tool-capable - batched + prefix"
-                "-cached route (Qwen3.8-9B-Distill via vllm-mlx)",
-        provider=VLLMMLX_PROVIDER_ID,
-        purposes=("reasoning", "coding", "runtime-explanation"),
-        capabilities=("text",),
-        max_output_tokens=4096,
-        approx_bytes=5_400_000_000,
-        source=ModelSource(
-            repo="nvythong/Qwen3.8-9B-Distill-mlx-4Bit",
-            revision="e827c31fbd588828f43180a87ab34415a6d8a4bf"),
-        requires=RouteRequirements(os=("macOS",), accelerator="metal",
-                                   fmt="mlx",
-                                   min_free_bytes=7_000_000_000)),
-    CatalogModel(
         alias="qwen-vl",
         summary="vision + text (Qwen3-VL-2B-Instruct)",
         provider=MLX_PROVIDER_ID,

@@ -183,7 +183,7 @@ the client configuration is needed - the daemon keeps its own state.
 
    (Installed console script; from a checkout, `bin/ondevice-agent-platform
    serve --port 8080` works the same.) Verify readiness: `GET /v1/models`
-   lists `qwen3.8-9b-vllm`, `qwen3.8-9b`, and `qwen-vl`, and
+   lists `qwen3.8-9b`, `qwen-vl`, and `gemma4-e4b`, and
    `GET /api/status` reports `admission: admit` (a
    `deny_and_cancel`/`defer_load` verdict is the host's real
    resource state, not a config problem - see the resource notes below).
@@ -203,8 +203,8 @@ the client configuration is needed - the daemon keeps its own state.
            "apiKey": "local"
          },
          "models": {
-           "qwen3.8-9b-vllm": {
-             "name": "Qwen3.8 9B (MLX, prefix-cached)",
+           "qwen3.8-9b": {
+             "name": "Qwen3.8 9B Distill 4bit (MLX)",
              "limit": {
                "context": 32768,
                "output": 4096
@@ -213,8 +213,8 @@ the client configuration is needed - the daemon keeps its own state.
          }
        }
      },
-     "model": "ondevice/qwen3.8-9b-vllm",
-     "small_model": "ondevice/qwen3.8-9b-vllm"
+     "model": "ondevice/qwen3.8-9b",
+     "small_model": "ondevice/qwen3.8-9b"
    }
    ```
 
@@ -229,13 +229,16 @@ the client configuration is needed - the daemon keeps its own state.
    files for this endpoint.
 
 3. Use it: `opencode` (TUI), `opencode run "..."`, or
-   `opencode run -m ondevice/qwen3.8-9b-vllm "..."`.
+   `opencode run -m ondevice/qwen3.8-9b "..."`.
 
 Notes and limits:
 
-- `qwen3.8-9b-vllm` is the agent/coding route (structured tool calls and
-  prefix cache); `qwen3.8-9b` is the direct mlx route sharing the same
-  artifact; `qwen-vl` serves image turns. An optional Apple Foundation
+- `qwen3.8-9b` is the agent/coding route - the same weights the removed
+  `qwen3.8-9b-vllm` route served, via `mlx-lm` directly. Tool calls are
+  still forwarded and parsed back from the model's text envelope, but
+  there is no prefix cache and no strict-JSON enforcement (the strict
+  path lived only on the vllm route, removed 2026-10-08). `qwen-vl` and
+  `gemma4-e4b` serve image turns. An optional Apple Foundation
   Models route can serve plain text only (it refuses `tools` and cannot
   drive OpenCode's tool agent loop) and is not installed by default in a
   source-independent install - the `oap-apple-bridge` helper must be
@@ -255,6 +258,11 @@ Notes and limits:
   expected in non-interactive runs.
 
 ## Live verification on the installed Python platform (2026-10-07)
+
+**Lineup note (2026-10-08):** this probe ran against the since-removed
+`qwen3.8-9b-vllm` route. The current default `ondevice/qwen3.8-9b`
+serves the same weights through `mlx-lm`; the wire surface is unchanged
+but there is no prefix cache and no strict-JSON enforcement.
 
 Stock OpenCode `1.18.34` was exercised against the updated installed
 daemon using a sanitized copy of the ondevice provider selection

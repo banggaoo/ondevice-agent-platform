@@ -1104,3 +1104,17 @@ audio surface, so only text and image turns are served. Full suite:
 227 tests OK under the managed >=3.11 interpreter (the Xcode 3.9
 interpreter is below the declared floor and cannot run the install
 tests).
+
+## qwen3.8-9b-vllm route removed (2026-10-08)
+
+User-requested removal (D58): the vllm-mlx serving route was dropped
+from the registry and catalog. The shared 4.7 GB artifact stays - it
+still serves `qwen3.8-9b` via mlx-lm. Consumer defaults repointed:
+OpenCode `model`/`small_model` and ARTEMIS `default`/`fallback` now
+bind `qwen3.8-9b`. Trade-offs accepted with the removal: no prefix
+cache, no strict-JSON route on this host (strict requests get an
+explicit invalid_request refusal), tool calls arrive via the provider's
+text-envelope parse instead of upstream-structured fields. `vllm-mlx`
+stays in the managed-env pins and remains a supported provider type.
+Verified live: `/v1/models` lists `gemma4-e4b`, `qwen-vl`, `qwen3.8-9b`;
+a real turn on `qwen3.8-9b` completes with true usage.
