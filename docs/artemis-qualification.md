@@ -117,6 +117,18 @@ this host enforces `strict: true` JSON - `with_structured_output`
 strict requests now meet an explicit `invalid_request` refusal rather
 than enforced output.
 
+**Vision routing (2026-10-09, D60):** `operator`, `object_detector`,
+`video_analyzer`, and `explorer` primaries now bind `vision-hybrid` -
+the deterministic composite that answers confident extraction prompts
+through Apple Vision OCR (`oap-vision-bridge`, native, no model call)
+and escalates everything else to `qwen-vl` (semantic turns carry the
+OCR text as context). Each node's fallback stays `qwen-vl`. Live
+verification on the installed daemon: extraction turns return the OCR
+text with no token usage; semantic and no-text turns return real VLM
+answers (`"Red"`, `"black"`). The coordinate-grid contract for
+`object_detector` is unchanged - grounding turns escalate to the same
+`qwen-vl` weights, only with extra OCR context.
+
 **Residual - not qualified:** the optional `planner_validation` and
 `validator_pixel_safety_net` routes still default to Google in the
 inspected source (a frozen audit finding); they were not invoked by

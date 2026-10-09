@@ -1130,3 +1130,54 @@ live registry and the catalog to give agent turns the same headroom
 the 9B route had. Verified live on the installed daemon: `gemma4-e4b`
 text turn `PONG` (usage 17/3/20, stop), admission `admit` at normal
 pressure.
+
+## vision-hybrid composite route (2026-10-09)
+
+User request (D60): "if ondevice agent platform doesnt have
+vision-hybrid satelites, make one, use apple vision for ocr first, if
+need vlm for sure use qwen3-vl-2b". No hybrid/satellite abstraction
+existed - built one.
+
+- `Sources/VisionBridge/main.swift` + `oap-vision-bridge` product:
+  macOS-only stdio helper wrapping `VNRecognizeTextRequest`
+  (`.accurate`, language correction). One JSON line in
+  `{"image":"<base64>"}`, one out `{"lines":[{text,confidence}]}`. Same
+  wire discipline as `oap-apple-bridge` (availableData chunking,
+  one-in-one-out).
+- `providers/vision_hybrid.py` (`vision-hybrid` provider id): the
+  deterministic tiering. Registry entries declare `delegate: <alias>`
+  instead of `source` (parse changes in registry.py; composite chains
+  refused at wiring; llamacpp-style `file` keys remain provider-bound).
+  Policy: no images -> delegate; OCR empty/low-confidence (<0.55) ->
+  delegate unchanged; OCR confident + extraction-intent prompt ->
+  direct OCR answer (no model call, usage null); OCR confident +
+  semantic prompt -> delegate with the OCR text injected as a leading
+  system message. Intent is verb-form matching ("read", "say",
+  "extract", ...) - noun keywords provably misfired live ("what color
+  are the letters" returned the OCR text before the fix).
+- Bridge discovery mirrors provider conventions: `OAP_VISION_BRIDGE` ->
+  PATH -> repo `.build/{debug,release}` -> `<providers_dir>` ->
+  `<providers_dir>/oap-env/bin` (the managed-env location, needed
+  because the installed package's repo-relative lookup resolves into
+  site-packages). A missing bridge degrades honestly to the VLM tier.
+- Provider surfaces delegate truthfully: `requires_load`/
+  `artifact_ready`/`evict_resident` forward to the bound VLM;
+  `has_ready_artifact` feeds `ownedOpenWeight` category; validate
+  refuses strict JSON and forced tool choice like the other
+  guidance-only routes.
+- Registry: `vision-hybrid` alias declared with `delegate: qwen-vl`,
+  `capabilities: [text, vision]`. ARTEMIS `operator`,
+  `object_detector`, `video_analyzer`, `explorer` primaries repointed
+  to `vision-hybrid`; `qwen-vl` remains each node's fallback.
+- Verified live on the installed daemon: OCR tier `"TOTAL"` (~0.3 s,
+  no usage) for "read the text" and "what does it say"; VLM tier
+  `"Red"` (usage 83/2/85) on a no-text image and `"black"` on a
+  semantic question over a text image (escalated with OCR context).
+  Python suite 242/242 OK.
+
+Also fixed in passing: `.build/` deletion during the 2026-10-08 disk
+cleanup had silently broken `oap-apple-bridge` discovery (the apple
+cancel-lifecycle test failed); both bridges were rebuilt via `swiftc`
+and copied into `oap-env/bin`. A stale `test_gguf_offered_only_where_needed`
+assertion that still expected the removed `qwen3.8-9b-vllm` catalog
+entry was updated to match D58.

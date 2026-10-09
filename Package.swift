@@ -12,6 +12,9 @@ let package = Package(
         /// macOS-only stdio bridge the Python core uses for the Apple
         /// Foundation Models route (the one API with no Python binding).
         .executable(name: "oap-apple-bridge", targets: ["AppleBridge"]),
+        /// macOS-only stdio helper the Python vision-hybrid route uses
+        /// for Apple Vision OCR (VNRecognizeTextRequest).
+        .executable(name: "oap-vision-bridge", targets: ["VisionBridge"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.31.4"),
@@ -52,6 +55,13 @@ let package = Package(
             name: "AppleBridge",
             dependencies: [],
             path: "Sources/AppleBridge"
+        ),
+        /// macOS-only: one JSON OCR request per stdin line, one JSON
+        /// result per stdout line; vision-hybrid subprocesses into it.
+        .executableTarget(
+            name: "VisionBridge",
+            dependencies: [],
+            path: "Sources/VisionBridge"
         ),
         .target(
             name: "PlatformTestSupport",

@@ -24,7 +24,8 @@ from .profiles import (AgentProfile, CategoryStatus, ConsumerScope, Grant,
                        LocalConsumers, ModelKind, ModelProfile, Principal)
 from .providers.base import (ModelCacheEvicting, ProviderReadiness)
 from .registry import (APPLE_PROVIDER_ID, MLX_PROVIDER_ID,
-                       LLAMACPP_PROVIDER_ID, VLLMMLX_PROVIDER_ID)
+                       LLAMACPP_PROVIDER_ID, VLLMMLX_PROVIDER_ID,
+                       VISIONHYBRID_PROVIDER_ID)
 from . import resources
 from .state import JobKind, JobRecord, JobState, StateStore
 
@@ -330,12 +331,13 @@ class PlatformSupervisor:
     def _open_weight_category(self) -> CategoryStatus:
         providers = [self._llm_providers.get(pid) for pid in
                      (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID,
-                      VLLMMLX_PROVIDER_ID)]
+                      VLLMMLX_PROVIDER_ID, VISIONHYBRID_PROVIDER_ID)]
         if not any(providers):
             return (CategoryStatus.OBSERVING
                     if any(p.provider_id in (MLX_PROVIDER_ID,
                                              LLAMACPP_PROVIDER_ID,
-                                             VLLMMLX_PROVIDER_ID)
+                                             VLLMMLX_PROVIDER_ID,
+                                             VISIONHYBRID_PROVIDER_ID)
                            for p in self._model_profiles.values())
                     else CategoryStatus.NOT_CONFIGURED)
         ready = any(isinstance(p, ProviderReadiness) and p.has_ready_artifact

@@ -15,10 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ondevice_agent_platform.cancellation import CancellationToken
 from ondevice_agent_platform.chat import (ChatImage, ChatMessage,
-                                          ChatRequest, ChatRole,
-                                          ChatToolCall, ChatToolSpec,
-                                          FinishReason, NamedToolChoice,
-                                          ResponseFormat, ToolChoice)
+                                          ChatRequest, ChatResult,
+                                          ChatRole, ChatToolCall,
+                                          ChatToolSpec, FinishReason,
+                                          NamedToolChoice, ResponseFormat,
+                                          ToolChoice)
 from ondevice_agent_platform.errors import ErrorCode, PlatformError
 from ondevice_agent_platform.profiles import (ModelKind, ModelProfile,
                                               ModelSource)
@@ -631,6 +632,128 @@ class TestResponseUsage(unittest.TestCase):
         self.assertEqual(body["usage"],
                          {"prompt_tokens": 3, "completion_tokens": 1,
                           "total_tokens": 4})
+
+
+class _FakeDelegate:
+    """Records escalations; answers with a canned result."""
+    provider_id = "fake-delegate"
+
+    def __init__(self, ready=True, requires_load=False):
+        self.calls: list[ChatRequest] = []
+        self._ready = ready
+        self._requires_load = requires_load
+
+    def artifact_ready(self, profile):
+        return self._ready
+
+    def requires_load(self, profile):
+        return self._requires_load
+
+    def complete(self, request, profile, token=None):
+        self.calls.append(request)
+        return ChatResult(model_identity=profile.alias, content="VLM",
+                          finish_reason=FinishReason.STOP, usage=None)
+
+
+class TestVisionHybrid(unittest.TestCase):
+    """The deterministic OCR-first / VLM-fallback policy."""
+
+    def _hybrid(self, ocr=None, delegate=None):
+        from ondevice_agent_platform.providers.vision_hybrid import (
+            VisionHybridProvider)
+        dep = delegate or _FakeDelegate()
+        hybrid = VisionHybridProvider(ocr=ocr)
+        profile = _profile("vision-hybrid", capabilities=("text", "vision"),
+                           provider_id="vision-hybrid")
+        dprofile = _profile("qwen-vl", capabilities=("text", "vision"))
+        hybrid.bind(profile.alias, dep, dprofile)
+        return hybrid, dep, profile
+
+    def _image_request(self, text="read the text"):
+        return _request(messages=[ChatMessage(
+            role=ChatRole.USER, parts=[text],
+            images=[ChatImage(data=b"pngbytes", media_type="image/png")])])
+
+    def test_ocr_direct_when_extraction_and_confident(self):
+        hybrid, dep, profile = self._hybrid(
+            ocr=lambda _b: [("Total $12.34", 0.97)])
+        result = hybrid.complete(self._image_request(), profile)
+        self.assertEqual(result.content, "Total $12.34")
+        self.assertEqual(result.finish_reason, FinishReason.STOP)
+        self.assertIsNone(result.usage)   # no tokens consumed
+        self.assertEqual(dep.calls, [])   # VLM never invoked
+
+    def test_low_confidence_escalates_plain(self):
+        hybrid, dep, profile = self._hybrid(
+            ocr=lambda _b: [("garbled", 0.20)])
+        result = hybrid.complete(self._image_request(), profile)
+        self.assertEqual(result.content, "VLM")
+        # Untrustworthy OCR must not reach the VLM as context.
+        self.assertEqual(dep.calls[0].messages[0].role, ChatRole.USER)
+
+    def test_empty_ocr_escalates_plain(self):
+        hybrid, dep, profile = self._hybrid(ocr=lambda _b: [])
+        hybrid.complete(self._image_request(), profile)
+        self.assertEqual(len(dep.calls), 1)
+        self.assertEqual(dep.calls[0].messages[0].role, ChatRole.USER)
+
+    def test_semantic_prompt_escalates_with_ocr_context(self):
+        hybrid, dep, profile = self._hybrid(
+            ocr=lambda _b: [("SALE 50%", 0.99)])
+        request = self._image_request("what color are the walls")
+        hybrid.complete(request, profile)
+        self.assertEqual(len(dep.calls), 1)
+        escalated = dep.calls[0]
+        self.assertEqual(escalated.messages[0].role, ChatRole.SYSTEM)
+        self.assertIn("SALE 50%", escalated.messages[0].combined_text)
+        # The original user turn (image intact) follows the context.
+        self.assertTrue(escalated.messages[1].images)
+
+    def test_no_images_passthrough(self):
+        hybrid, dep, profile = self._hybrid()
+        hybrid.complete(_request(), profile)
+        self.assertEqual(len(dep.calls), 1)
+
+    def test_bridge_absent_escalates(self):
+        # ocr=None -> real bridge lookup; patch it missing.
+        from ondevice_agent_platform.providers import vision_hybrid
+        hybrid, dep, profile = self._hybrid(ocr=None)
+        with mock.patch.object(vision_hybrid, "_vision_bridge",
+                               return_value=None):
+            result = hybrid.complete(self._image_request(), profile)
+        self.assertEqual(result.content, "VLM")
+        self.assertEqual(len(dep.calls), 1)
+
+    def test_unbound_alias_unavailable(self):
+        from ondevice_agent_platform.providers.vision_hybrid import (
+            VisionHybridProvider)
+        hybrid = VisionHybridProvider()
+        raises(ErrorCode.PROVIDER_UNAVAILABLE, hybrid.complete,
+               self._image_request(),
+               _profile("ghost", provider_id="vision-hybrid"))
+
+    def test_validate_refuses_strict(self):
+        hybrid, _dep, profile = self._hybrid()
+        rf = ResponseFormat(kind="json_schema",
+                            schema={"type": "object"}, strict=True)
+        raises(ErrorCode.INVALID_REQUEST, hybrid.validate,
+               _request(response_format=rf), profile)
+
+    def test_validate_refuses_forced_tool(self):
+        hybrid, _dep, profile = self._hybrid()
+        raises(ErrorCode.INVALID_REQUEST, hybrid.validate,
+               _request(tool_choice=NamedToolChoice(name="x")), profile)
+
+    def test_requires_load_delegates(self):
+        hybrid, _dep, profile = self._hybrid(
+            delegate=_FakeDelegate(requires_load=True))
+        self.assertTrue(hybrid.requires_load(profile))
+
+    def test_readiness_reports_delegate(self):
+        hybrid, _dep, profile = self._hybrid(
+            delegate=_FakeDelegate(ready=False))
+        self.assertFalse(hybrid.has_ready_artifact)
+        self.assertIs(hybrid.artifact_ready(profile), False)
 
 
 if __name__ == "__main__":

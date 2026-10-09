@@ -17,12 +17,13 @@ _TOP_KEYS = {"schemaVersion", "models"}
 _MODEL_KEYS = {
     "alias", "kind", "task", "provider", "purposes", "capabilities",
     "inputSchema", "outputSchema", "maxInputBytes", "maxOutputTokens",
-    "linear", "source",
+    "linear", "source", "delegate",
 }
 
 MLX_PROVIDER_ID = "mlx"
 LLAMACPP_PROVIDER_ID = "llamacpp"
 VLLMMLX_PROVIDER_ID = "vllm-mlx"
+VISIONHYBRID_PROVIDER_ID = "vision-hybrid"
 APPLE_PROVIDER_ID = "apple-foundation-models"
 LINEAR_PROVIDER_ID = "builtin.linear"
 
@@ -32,6 +33,7 @@ class RegistryEntry:
     profile: ModelProfile
     linear: "LinearSpec | None" = None
     artifact_file: str | None = None
+    delegate: str | None = None
 
 
 @dataclass
@@ -141,36 +143,59 @@ def _finite(value) -> float:
 def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
     provider = obj.get("provider")
     if provider not in (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID,
-                        VLLMMLX_PROVIDER_ID):
+                        VLLMMLX_PROVIDER_ID, VISIONHYBRID_PROVIDER_ID):
         raise PlatformError(ErrorCode.INVALID_REQUEST,
                             "unknown llm provider")
     for key in ("inputSchema", "outputSchema", "linear"):
         if key in obj:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "schemas/linear are typed-ml only")
-    source_obj = obj.get("source")
-    if not isinstance(source_obj, dict):
+    delegate = obj.get("delegate")
+    if delegate is not None and (not isinstance(delegate, str)
+                                 or not delegate):
         raise PlatformError(ErrorCode.INVALID_REQUEST,
-                            "llm models require source")
-    for key in source_obj:
-        if key not in ("repo", "revision", "file"):
+                            "delegate must be an alias string")
+    artifact_file = None
+    source = None
+    if provider == VISIONHYBRID_PROVIDER_ID:
+        # Composite route: no weights of its own; `delegate` names the
+        # VLM alias it escalates to when OCR cannot answer.
+        if delegate is None:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                "unknown source key")
-    repo, revision = source_obj.get("repo"), source_obj.get("revision")
-    if (not isinstance(repo, str) or not isinstance(revision, str)
-            or not is_valid_repo(repo) or not is_valid_revision(revision)):
-        raise PlatformError(ErrorCode.INVALID_REQUEST,
-                            "source repo/revision malformed")
-    artifact_file = source_obj.get("file")
-    if artifact_file is not None:
-        if (not isinstance(artifact_file, str) or not artifact_file
-                or "/" in artifact_file or "\\" in artifact_file
-                or ".." in artifact_file or artifact_file.startswith(".")):
+                                "vision-hybrid requires delegate")
+        if "source" in obj:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                "source file malformed")
-        if provider != LLAMACPP_PROVIDER_ID:
+                                "vision-hybrid holds no artifact source")
+    else:
+        if delegate is not None:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                "source file is a llamacpp-only key")
+                                "delegate is a vision-hybrid-only key")
+        source_obj = obj.get("source")
+        if not isinstance(source_obj, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "llm models require source")
+        for key in source_obj:
+            if key not in ("repo", "revision", "file"):
+                raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                    "unknown source key")
+        repo, revision = source_obj.get("repo"), source_obj.get("revision")
+        if (not isinstance(repo, str) or not isinstance(revision, str)
+                or not is_valid_repo(repo)
+                or not is_valid_revision(revision)):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "source repo/revision malformed")
+        source = ModelSource(repo=repo, revision=revision)
+        artifact_file = source_obj.get("file")
+        if artifact_file is not None:
+            if (not isinstance(artifact_file, str) or not artifact_file
+                    or "/" in artifact_file or "\\" in artifact_file
+                    or ".." in artifact_file
+                    or artifact_file.startswith(".")):
+                raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                    "source file malformed")
+            if provider != LLAMACPP_PROVIDER_ID:
+                raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                    "source file is a llamacpp-only key")
     task = obj.get("task", "chat")
     if task != "chat":
         raise PlatformError(ErrorCode.INVALID_REQUEST,
@@ -192,8 +217,8 @@ def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
         alias=alias, provider_id=provider, kind=ModelKind.LLM, task=task,
         purposes=tuple(purposes), capabilities=tuple(capabilities),
         max_input_bytes=max_input, max_output_tokens=max_out,
-        source=ModelSource(repo=repo, revision=revision)),
-        artifact_file=artifact_file)
+        source=source),
+        artifact_file=artifact_file, delegate=delegate)
 
 
 def _parse_ml(obj: dict, alias: str) -> RegistryEntry:

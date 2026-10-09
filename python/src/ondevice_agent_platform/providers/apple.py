@@ -26,7 +26,7 @@ from .base import LLMProvider
 APPLE_MODEL_ALIAS = "apple-foundation-model"
 
 
-def _bridge_binary() -> str | None:
+def _bridge_binary(providers_dir: str | None = None) -> str | None:
     override = os.environ.get("OAP_APPLE_BRIDGE")
     if override and os.path.isfile(override) and os.access(override, os.X_OK):
         return override
@@ -34,12 +34,19 @@ def _bridge_binary() -> str | None:
         found = shutil.which(name)
         if found:
             return found
-    # Repo-relative built product: <repo>/.build/debug/oap-apple-bridge.
+    # Repo-relative built product: <repo>/.build/debug/oap-apple-bridge -
+    # valid only when the package runs from a source checkout.
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-    for candidate in (
-            os.path.join(repo, ".build", "debug", "oap-apple-bridge"),
-            os.path.join(repo, ".build", "release", "oap-apple-bridge")):
+    candidates = [
+        os.path.join(repo, ".build", "debug", "oap-apple-bridge"),
+        os.path.join(repo, ".build", "release", "oap-apple-bridge")]
+    if providers_dir:
+        candidates += [
+            os.path.join(providers_dir, "oap-apple-bridge"),
+            os.path.join(providers_dir, "oap-env", "bin",
+                         "oap-apple-bridge")]
+    for candidate in candidates:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
@@ -50,13 +57,14 @@ class AppleFoundationProvider(LLMProvider):
     and defer_load never holds this route."""
     provider_id = APPLE_PROVIDER_ID
 
-    def __init__(self) -> None:
+    def __init__(self, providers_dir: str | None = None) -> None:
         # _lock owns the _proc reference only. _io_lock serializes the
         # stdin/stdout exchange; _kill must never take either while it
         # holds them - aborting a blocking readline is the whole point.
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._providers_dir = providers_dir
 
     @staticmethod
     def available_on_host() -> bool:
@@ -66,7 +74,7 @@ class AppleFoundationProvider(LLMProvider):
         return False   # system-managed; never loads platform weights
 
     def _ensure(self):
-        binary = _bridge_binary()
+        binary = _bridge_binary(self._providers_dir)
         if binary is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "apple bridge helper not built")

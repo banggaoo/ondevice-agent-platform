@@ -194,6 +194,34 @@ class TestRegistry(unittest.TestCase):
         raises(ErrorCode.INVALID_REQUEST, parse_registry,
                {"schemaVersion": 1, "models": [bad]})
 
+    def test_vision_hybrid_valid(self):
+        entry = {"alias": "vision-hybrid", "kind": "llm",
+                 "provider": "vision-hybrid", "task": "chat",
+                 "capabilities": ["text", "vision"],
+                 "delegate": "qwen-vl"}
+        entries = parse_registry({"schemaVersion": 1, "models": [entry]})
+        self.assertEqual(entries[0].delegate, "qwen-vl")
+        self.assertIsNone(entries[0].profile.source)
+
+    def test_vision_hybrid_requires_delegate(self):
+        entry = {"alias": "vision-hybrid", "kind": "llm",
+                 "provider": "vision-hybrid", "task": "chat"}
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [entry]})
+
+    def test_vision_hybrid_rejects_source(self):
+        entry = {"alias": "vision-hybrid", "kind": "llm",
+                 "provider": "vision-hybrid", "task": "chat",
+                 "delegate": "qwen-vl",
+                 "source": {"repo": "o/r", "revision": "abc1234"}}
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [entry]})
+
+    def test_delegate_is_hybrid_only(self):
+        bad = dict(self.LLM, delegate="qwen-vl")
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
     def test_linear_valid(self):
         entries = parse_registry({"schemaVersion": 1, "models": [{
             "alias": "clf", "kind": "ml", "provider": "builtin.linear",
@@ -254,7 +282,6 @@ class TestCatalog(unittest.TestCase):
         eligible = {e.alias: ok for e, ok, _
                     in catalog.available_entries(mac)}
         self.assertTrue(eligible["qwen3.8-9b"])
-        self.assertTrue(eligible["qwen3.8-9b-vllm"])
         self.assertFalse(eligible["qwen3.8-9b-gguf"])
         for osname in ("windows", "linux"):
             host = HostInfo(os=osname, arch="x86_64", has_metal=False,

@@ -33,13 +33,17 @@ surface.
   managed-env `site-packages`, not the checkout.
 - Model aliases on this host (registry): `qwen3.8-9b` (primary
   text/agent/coding route, `mlx-lm` 0.32.0), `qwen-vl` (`mlx-vlm` 0.7.6,
-  `Qwen3-VL-2B-Instruct-4bit` vision), and `gemma4-e4b` (`mlx-vlm` 0.7.6
-  `gemma4` arch, `mlx-community/gemma-4-e4b-it-4bit` @ `475b9088`).
+  `Qwen3-VL-2B-Instruct-4bit` vision), `gemma4-e4b` (`mlx-vlm` 0.7.6
+  `gemma4` arch, `mlx-community/gemma-4-e4b-it-4bit` @ `475b9088`), and
+  `vision-hybrid` (deterministic composite: Apple Vision OCR via
+  `oap-vision-bridge` first, `qwen-vl` as its `delegate` VLM - verified
+  2026-10-09 on the installed daemon, both tiers live).
   The `qwen3.8-9b-vllm` route (`vllm-mlx` 0.5.0, same 9B artifact) was
   verified on 2026-10-07 and removed at user request on 2026-10-08 -
   that verification record below is historical. GGUF catalog entries
   are Windows/Linux-scoped; no `llama-server` auto-install exists
-  anywhere.
+  anywhere. The OCR tier is macOS-only; elsewhere the composite
+  degrades to its VLM delegate.
 
 ## Verification record
 

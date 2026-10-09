@@ -25,7 +25,8 @@ from .profiles import ModelKind, ModelProfile, ModelSource
 from .providers.linear import LinearPredictor
 from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
                        LLAMACPP_PROVIDER_ID, MLX_PROVIDER_ID,
-                       VLLMMLX_PROVIDER_ID, parse_registry)
+                       VLLMMLX_PROVIDER_ID, VISIONHYBRID_PROVIDER_ID,
+                       parse_registry)
 from .runtime_root import RuntimeRoot
 from .server import PlatformHTTPServer
 from .supervisor import PlatformSupervisor
@@ -84,6 +85,12 @@ def _build_supervisor(root: RuntimeRoot, args):
             providers.setdefault(VLLMMLX_PROVIDER_ID, VllmMlxProvider(
                 store, providers_dir=root.providers_path))
             provider = providers[VLLMMLX_PROVIDER_ID]
+        elif profile.provider_id == VISIONHYBRID_PROVIDER_ID:
+            from .providers.vision_hybrid import VisionHybridProvider
+            providers.setdefault(VISIONHYBRID_PROVIDER_ID,
+                                 VisionHybridProvider(
+                                     providers_dir=root.providers_path))
+            provider = providers[VISIONHYBRID_PROVIDER_ID]
         elif profile.provider_id == LLAMACPP_PROVIDER_ID:
             if entry.artifact_file:
                 artifact_files[profile.alias] = entry.artifact_file
@@ -102,12 +109,29 @@ def _build_supervisor(root: RuntimeRoot, args):
 
     if getattr(args, "enable_apple_model", False):
         from .providers.apple import AppleFoundationProvider
-        apple = AppleFoundationProvider()
+        apple = AppleFoundationProvider(providers_dir=root.providers_path)
         providers[APPLE_PROVIDER_ID] = apple
         supervisor.register_model(ModelProfile(
             alias="apple-foundation-model", provider_id=APPLE_PROVIDER_ID,
             kind=ModelKind.LLM, task="chat", capabilities=("text",),
             max_output_tokens=8192), provider=apple)
+
+    # Composite routes bind their delegate after all providers exist.
+    hybrid = providers.get(VISIONHYBRID_PROVIDER_ID)
+    if hybrid is not None:
+        by_alias = {e.profile.alias: e for e in entries}
+        for e in entries:
+            if e.profile.provider_id != VISIONHYBRID_PROVIDER_ID:
+                continue
+            target = by_alias.get(e.delegate or "")
+            dep = (providers.get(target.profile.provider_id)
+                   if target is not None else None)
+            if target is None or dep is None \
+                    or target.profile.provider_id == VISIONHYBRID_PROVIDER_ID:
+                raise PlatformError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"vision-hybrid delegate not declared: {e.delegate}")
+            hybrid.bind(e.profile.alias, dep, target.profile)
 
     # Readiness surfaces: providers see the LLM profiles they may serve.
     llm_profiles = [e.profile for e in entries
@@ -260,8 +284,13 @@ def _provider_missing(root: RuntimeRoot) -> dict[str, str]:
         out[MLX_PROVIDER_ID] = "requires Metal (Apple Silicon)"
     if _llama(pd) is None:
         out[LLAMACPP_PROVIDER_ID] = "llama-server"
-    if _bridge_binary() is None:
+    if _bridge_binary(pd) is None:
         out[APPLE_PROVIDER_ID] = "oap-apple-bridge"
+    from .providers.vision_hybrid import _vision_bridge
+    if _host_supports_mlx() and _vision_bridge(pd) is None:
+        # Optional tier: the route still serves through its VLM delegate.
+        out[VISIONHYBRID_PROVIDER_ID] = \
+            "oap-vision-bridge (OCR tier; VLM fallback serves)"
     return out
 
 
@@ -852,7 +881,7 @@ def cmd_provider_list(args) -> int:
     missing = _provider_missing(root)
     for pid in (VLLMMLX_PROVIDER_ID, MLX_PROVIDER_ID,
                 LLAMACPP_PROVIDER_ID, APPLE_PROVIDER_ID,
-                LINEAR_PROVIDER_ID):
+                VISIONHYBRID_PROVIDER_ID, LINEAR_PROVIDER_ID):
         print(f"{pid:16} "
               + ("ok" if pid not in missing
                  else f"missing: {missing[pid]}"))
