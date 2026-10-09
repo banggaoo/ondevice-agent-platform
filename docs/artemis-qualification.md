@@ -127,17 +127,17 @@ refusals - use `json_mode` or auto tool choice. `gemma4-e4b`'s own
 tool-call markup is parsed into real `tool_calls` (added this date
 after live evidence showed calls leaking as raw text).
 
-**Vision routing (2026-10-09, D60):** `operator`, `object_detector`,
-`video_analyzer`, and `explorer` primaries now bind `vision-hybrid` -
-the deterministic composite that answers confident extraction prompts
-through Apple Vision OCR (`oap-vision-bridge`, native, no model call)
-and escalates everything else to `qwen-vl` (semantic turns carry the
-OCR text as context). Each node's fallback stays `qwen-vl`. Live
-verification on the installed daemon: extraction turns return the OCR
-text with no token usage; semantic and no-text turns return real VLM
-answers (`"Red"`, `"black"`). The coordinate-grid contract for
-`object_detector` is unchanged - grounding turns escalate to the same
-`qwen-vl` weights, only with extra OCR context.
+**Vision routing (2026-10-09, D60, amended same day):** `operator`,
+`object_detector`, `video_analyzer`, and `explorer` primaries bind
+`gemma4-e4b` (semantic/grounding) with `qwen-vl` as each node's
+fallback; `vision-hybrid` is reserved as the OCR-only route - Apple
+Vision answers confident extraction turns natively, `qwen-vl` remains
+its delegate for the rest. User direction: "vision-hybrid is only for
+ocr, others should gemma". Live verification: gemma grounding on
+synthetic input returned plausible coordinates (`250, 500` vs true
+`203, 687`) - real-UI grid conformance is unverified; `qwen-vl` stays
+the verified-grid fallback. OCR-tier behavior verified live earlier
+(`"TOTAL"` no-usage direct answers; `"Red"`/`"black"` escalations).
 
 **Residual - not qualified:** the optional `planner_validation` and
 `validator_pixel_safety_net` routes still default to Google in the
