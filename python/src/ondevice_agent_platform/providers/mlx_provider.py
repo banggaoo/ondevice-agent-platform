@@ -389,9 +389,39 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                         arguments=_json.loads(match.group(2))))
                 except _json.JSONDecodeError:
                     pass
+            if not calls:
+                # Gemma's template emits its own markup: the tool_call
+                # tag pair, "call:", the name, and brace args whose
+                # string values are wrapped in its quote tokens.
+                _OPEN = r'\x3c\x7ctool_call\x3e'
+                _CLOSE = r'\x3ctool_call\x7c\x3e'
+                _Q = r'\x3c\x7c"\x7c\x3e'
+                for match in re.finditer(
+                        _OPEN + r'call:(\w+)\s*\{(.*?)\}' + _CLOSE,
+                        text, re.DOTALL):
+                    args = {}
+                    for am in re.finditer(
+                            r'(\w+)\s*:\s*(?:' + _Q + r'(.*?)' + _Q
+                            + r'|"([^"]*)"|([^,}]+))',
+                            match.group(2), re.DOTALL):
+                        if am.group(2) is not None:
+                            args[am.group(1)] = am.group(2)
+                        elif am.group(3) is not None:
+                            args[am.group(1)] = am.group(3)
+                        else:
+                            raw = am.group(4).strip()
+                            try:
+                                args[am.group(1)] = _json.loads(raw)
+                            except _json.JSONDecodeError:
+                                args[am.group(1)] = raw
+                    calls.append(ChatToolCall(name=match.group(1),
+                                              arguments=args))
             if calls:
                 content = re.sub(r'<think>.*?</think>', '', text,
-                                 flags=re.DOTALL).strip()
+                                 flags=re.DOTALL)
+                content = re.sub(
+                    r'\x3c\x7ctool_call\x3e.*?\x3ctool_call\x7c\x3e',
+                    '', content, flags=re.DOTALL).strip()
         if calls:
             reason = FinishReason.TOOL_CALLS
         elif finish == "length":

@@ -404,6 +404,25 @@ class TestMlxVlmPath(unittest.TestCase):
                          "read_file")
         self.assertEqual(sent[2]["tool_call_id"], "c1")
 
+    def test_gemma_tool_call_markup_parsed(self):
+        # gemma4 emits its own markup (tool_call tags + quote tokens)
+        # rather than the JSON envelope; the envelope parser must lift
+        # it into ChatToolCall or consumers see undispatchable text.
+        lt, gt, bar, q = chr(60), chr(62), chr(124), chr(34)
+        text = (lt + bar + "tool_call" + gt + "call:read_file{path:"
+                + lt + bar + q + bar + gt + "fixture.txt"
+                + lt + bar + q + bar + gt + "}"
+                + lt + "tool_call" + bar + gt)
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.finish_reason, FinishReason.TOOL_CALLS)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "read_file")
+        self.assertEqual(result.tool_calls[0].arguments,
+                         {"path": "fixture.txt"})
+        self.assertEqual(result.content, "")
+
 
 class TestMlxTextPath(unittest.TestCase):
     def test_sampler_params_and_result(self):

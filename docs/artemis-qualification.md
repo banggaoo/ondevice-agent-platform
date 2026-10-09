@@ -117,6 +117,16 @@ this host enforces `strict: true` JSON - `with_structured_output`
 strict requests now meet an explicit `invalid_request` refusal rather
 than enforced output.
 
+**Run record (2026-10-09):** probe rerun on the new bindings -
+`direct`/`vision`/`agent` all passed. `gemma4-e4b` serves the agent
+shape: auto tool loops (parsed tool calls, `tool_calls` finish),
+tool-result turns, and `with_structured_output(method="json_mode")`.
+Boundaries on this lineup: `tool_choice="required"` and default
+(function-call-forced) `with_structured_output` meet `invalid_request`
+refusals - use `json_mode` or auto tool choice. `gemma4-e4b`'s own
+tool-call markup is parsed into real `tool_calls` (added this date
+after live evidence showed calls leaking as raw text).
+
 **Vision routing (2026-10-09, D60):** `operator`, `object_detector`,
 `video_analyzer`, and `explorer` primaries now bind `vision-hybrid` -
 the deterministic composite that answers confident extraction prompts

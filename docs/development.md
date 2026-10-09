@@ -1181,3 +1181,38 @@ cancel-lifecycle test failed); both bridges were rebuilt via `swiftc`
 and copied into `oap-env/bin`. A stale `test_gguf_offered_only_where_needed`
 assertion that still expected the removed `qwen3.8-9b-vllm` catalog
 entry was updated to match D58.
+
+## ARTEMIS run on gemma4-e4b + vision-hybrid (2026-10-09)
+
+User request: "run artemis with using gemma, vision-htbrid". The
+production probe (real `ModelFactory`/`_resolve_endpoint`/`ChatOpenAI`
+paths, loopback-only) ran three modes against the installed daemon:
+
+- direct (`planner` -> `gemma4-e4b`, invoke on `qwen3.8-9b`): passed.
+- vision (`operator` -> `vision-hybrid`, red PNG): passed - escalated
+  to `qwen-vl` with real usage, `stop`.
+- agent (`planner` -> `gemma4-e4b`): text + `bind_tools` auto tool loop
+  + tool-result turn + `with_structured_output(method="json_mode")`:
+  all passed with real usage.
+
+Two defects surfaced and were handled:
+
+1. `bind_tools` on `gemma4-e4b` returned `tool_calls: []` while the
+   content carried Gemma's own markup (`tool_call` tags + literal quote
+   tokens) - the provider's envelope parser only recognized the
+   Qwen-style `{"name","arguments"}` JSON. A deterministic Gemma-format
+   parser was added to `MLXProvider._result` (tag pair + `call:` name +
+   brace args; string args unwrapped, scalars JSON-parsed; markup
+   stripped from content). Verified: `read_file{"path":"fixture.txt"}`
+   parses to a real `ChatToolCall`, `finish_reason: tool_calls`, and
+   the follow-up tool-result turn answers correctly.
+2. `tool_choice="required"` / default `with_structured_output` get
+   truthful `invalid_request` refusals - forced tool choice is not
+   guaranteed on any guidance-only route post-D58. `json_mode` works;
+   documented in the ARTEMIS qualification.
+
+Transient evidence: the first agent-mode run hit `provider_unavailable`
+during `gemma4-e4b`'s cold load colliding with resident `qwen-vl` and
+memory pressure; the route served cleanly once loaded (5.6s turn).
+
+Suite: 243/243 Python tests.
