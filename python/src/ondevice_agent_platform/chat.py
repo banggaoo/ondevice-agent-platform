@@ -154,6 +154,10 @@ class ChatResult:
     finish_reason: FinishReason
     usage: ChatUsage | None = None
     tool_calls: list[ChatToolCall] = field(default_factory=list)
+    # Additive, non-OpenAI fields merged into the completion body (e.g.
+    # vision-hybrid's structured OCR observations). Clients that don't
+    # know them ignore them.
+    extra: dict | None = None
 
 
 # ---------------------------------------------------------------------------

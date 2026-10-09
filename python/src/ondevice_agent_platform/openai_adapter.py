@@ -408,6 +408,8 @@ def chat_response(result, requested_model: str) -> dict:
     usage = _usage_object(result.usage)
     if usage is not None:
         body["usage"] = usage
+    if result.extra:
+        body.update(result.extra)
     return body
 
 

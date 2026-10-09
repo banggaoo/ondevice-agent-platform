@@ -171,11 +171,18 @@ class VisionHybridProvider(LLMProvider, ModelCacheEvicting,
             if confidence >= _OCR_CONFIDENCE_FLOOR:
                 if self._extraction_intent(request):
                     # Deterministic tier-one answer: extracted text, no
-                    # model call, no fabricated token usage.
+                    # model call, no fabricated token usage. Structured
+                    # observations (text/confidence/position) ride along
+                    # for callers that need boxes, e.g. ARTEMIS OCR.
                     return ChatResult(model_identity=request.model,
                                       content=text,
                                       finish_reason=FinishReason.STOP,
-                                      tool_calls=[], usage=None)
+                                      tool_calls=[], usage=None,
+                                      extra={"oap_ocr": [
+                                          {"text": t,
+                                           "confidence": c,
+                                           "position": p}
+                                          for t, c, p in ocr]})
                 # Trustworthy OCR but the question is not extraction:
                 # the VLM answers with the OCR text as context.
                 return dep.complete(
@@ -186,8 +193,8 @@ class VisionHybridProvider(LLMProvider, ModelCacheEvicting,
 
     @staticmethod
     def _render(ocr) -> tuple[str, float]:
-        texts = [t for t, _c in ocr]
-        confidence = sum(c for _t, c in ocr) / max(len(ocr), 1)
+        texts = [t for t, _c, _p in ocr]
+        confidence = sum(c for _t, c, _p in ocr) / max(len(ocr), 1)
         return "\n".join(texts), confidence
 
     @staticmethod
@@ -209,14 +216,15 @@ class VisionHybridProvider(LLMProvider, ModelCacheEvicting,
     # -- apple vision tier ----------------------------------------------------
 
     def _run_ocr(self, images, token) -> list | None:
-        """[(text, confidence)] across all images, or None when the tier
-        is unavailable/failed - callers escalate, they never invent."""
+        """[(text, confidence, position)] across all images, or None when
+        the tier is unavailable/failed - callers escalate, they never
+        invent. position is the bridge's pixel vertices or None."""
         if self._ocr is not None:
             out = []
             for img in images:
-                lines = self._ocr(img.data)
-                if lines:
-                    out.extend(lines)
+                for item in self._ocr(img.data) or []:
+                    t, c, *rest = item
+                    out.append((t, c, rest[0] if rest else None))
             return out or None
         if _vision_bridge(self._providers_dir) is None:
             return None
@@ -252,7 +260,8 @@ class VisionHybridProvider(LLMProvider, ModelCacheEvicting,
                             c = obs.get("confidence")
                             if isinstance(t, str) and t.strip() \
                                     and isinstance(c, (int, float)):
-                                out.append((t, float(c)))
+                                out.append((t, float(c),
+                                            obs.get("position")))
             except PlatformError:
                 raise
             except (OSError, ValueError):

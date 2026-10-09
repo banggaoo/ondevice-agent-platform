@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Vision
 
 /// oap-vision-bridge: native OCR helper for the Python vision-hybrid
@@ -8,7 +9,8 @@ import Vision
 /// python/src/ondevice_agent_platform/providers/vision_hybrid.py):
 ///
 ///   in : {"image":"<base64 image bytes>"}
-///   out: {"lines":[{"text":"...","confidence":0.98}]}
+///   out: {"lines":[{"text":"...","confidence":0.98,
+///                   "position":[{"x":..,"y":..} x4 pixel TL,TR,BR,BL]}]}
 ///        or {"error":"...","code":"invalid_request|provider_unavailable"}
 ///
 /// One line in, one line out; the Python provider serializes calls on
@@ -38,6 +40,27 @@ func handle(_ payload: [String: Any]) throws -> [String: Any] {
         throw BridgeError(code: "invalid_request",
                           message: "image required (base64)")
     }
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [String: Any],
+          let width = (props[kCGImagePropertyPixelWidth as String]
+            as? NSNumber)?.doubleValue,
+          let height = (props[kCGImagePropertyPixelHeight as String]
+            as? NSNumber)?.doubleValue else {
+        throw BridgeError(code: "invalid_request",
+                          message: "image dimensions not decodable")
+    }
+    // Vision bounding boxes are normalized with a bottom-left origin;
+    // emit pixel-space vertices in boundingPoly order TL,TR,BR,BL.
+    func vertices(_ box: CGRect) -> [[String: Int]] {
+        let x0 = Int((box.origin.x * width).rounded())
+        let x1 = Int(((box.origin.x + box.size.width) * width).rounded())
+        let top = Int(((1.0 - box.origin.y - box.size.height)
+            * height).rounded())
+        let bot = Int(((1.0 - box.origin.y) * height).rounded())
+        return [["x": x0, "y": top], ["x": x1, "y": top],
+                ["x": x1, "y": bot], ["x": x0, "y": bot]]
+    }
     var lines: [[String: Any]] = []
     let request = VNRecognizeTextRequest { request, _ in
         for observation in
@@ -45,7 +68,8 @@ func handle(_ payload: [String: Any]) throws -> [String: Any] {
             guard let candidate = observation.topCandidates(1).first,
                   !candidate.string.isEmpty else { continue }
             lines.append(["text": candidate.string,
-                          "confidence": Double(candidate.confidence)])
+                          "confidence": Double(candidate.confidence),
+                          "position": vertices(observation.boundingBox)])
         }
     }
     request.recognitionLevel = .accurate

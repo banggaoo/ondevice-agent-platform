@@ -139,6 +139,22 @@ synthetic input returned plausible coordinates (`250, 500` vs true
 the verified-grid fallback. OCR-tier behavior verified live earlier
 (`"TOTAL"` no-usage direct answers; `"Red"`/`"black"` escalations).
 
+**ARTEMIS OCR tool path (2026-10-09, verified):** `perform_ocr` gained a
+`platform` provider (`ARTEMIS_OCR_PROVIDER=platform`; in `auto` it sits
+between the native Apple Vision worker and Google). It POSTs the
+`vision-hybrid` route with an extraction prompt; direct Apple Vision
+answers now carry the additive `oap_ocr` response field -
+`{text, confidence, position}` with pixel vertices in boundingPoly
+order (TL,TR,BR,BL), emitted by `oap-vision-bridge`. Verified live:
+`run_ocr_core` on a 320x80 `"TOTAL"` image returned
+`[{"text":"TOTAL","coordinates":[446,475]}]` (matches ~[447,475]
+expected), `usage: null` (no model call); a no-text image escalated to
+`qwen-vl`, produced no `oap_ocr`, and the tool reported "No text
+detected on the screen." - escalated answers yield empty OCR rather
+than fabricated coordinates. Default `auto` still prefers ARTEMIS's
+own Apple Vision worker (per-observation CJK revision tuning); pin
+`ARTEMIS_OCR_PROVIDER=platform` to route OCR through the platform.
+
 **Residual - not qualified:** the optional `planner_validation` and
 `validator_pixel_safety_net` routes still default to Google in the
 inspected source (a frozen audit finding); they were not invoked by

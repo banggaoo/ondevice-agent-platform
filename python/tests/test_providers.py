@@ -702,6 +702,30 @@ class TestVisionHybrid(unittest.TestCase):
         self.assertIsNone(result.usage)   # no tokens consumed
         self.assertEqual(dep.calls, [])   # VLM never invoked
 
+    def test_ocr_direct_carries_structured_observations(self):
+        # The additive oap_ocr field feeds callers that need positions
+        # (ARTEMIS's OCR tool contract: text + pixel vertices).
+        pos = [{"x": 0, "y": 8}, {"x": 286, "y": 8},
+               {"x": 286, "y": 68}, {"x": 0, "y": 68}]
+        hybrid, dep, profile = self._hybrid(
+            ocr=lambda _b: [("TOTAL", 1.0, pos)])
+        result = hybrid.complete(self._image_request(), profile)
+        self.assertEqual(result.extra["oap_ocr"],
+                         [{"text": "TOTAL", "confidence": 1.0,
+                           "position": pos}])
+        # Injected two-tuples (no position) normalize to position None.
+        hybrid2, _d, profile2 = self._hybrid(
+            ocr=lambda _b: [("X", 0.9)])
+        res2 = hybrid2.complete(self._image_request(), profile2)
+        self.assertIsNone(res2.extra["oap_ocr"][0]["position"])
+
+    def test_escalated_answers_carry_no_ocr_field(self):
+        # A VLM semantic answer has no positional OCR data - callers must
+        # not mistake generated text for grounded boxes.
+        hybrid, dep, profile = self._hybrid(ocr=lambda _b: [])
+        result = hybrid.complete(self._image_request(), profile)
+        self.assertIsNone(result.extra)
+
     def test_low_confidence_escalates_plain(self):
         hybrid, dep, profile = self._hybrid(
             ocr=lambda _b: [("garbled", 0.20)])
