@@ -1118,3 +1118,15 @@ text-envelope parse instead of upstream-structured fields. `vllm-mlx`
 stays in the managed-env pins and remains a supported provider type.
 Verified live: `/v1/models` lists `gemma4-e4b`, `qwen-vl`, `qwen3.8-9b`;
 a real turn on `qwen3.8-9b` completes with true usage.
+
+## ARTEMIS rebinding to gemma4-e4b (2026-10-08)
+
+User direction (D59): ARTEMIS `default` now binds `gemma4-e4b` with
+`qwen3.8-9b` as fallback; the vision/OCR nodes (`operator`,
+`object_detector`, `video_analyzer`, `explorer`) stay on `qwen-vl` -
+the OCR stack is Apple Vision (native, code-side) plus Qwen3-VL-2B.
+The gemma4-e4b `maxOutputTokens` cap was raised 2048->4096 in both the
+live registry and the catalog to give agent turns the same headroom
+the 9B route had. Verified live on the installed daemon: `gemma4-e4b`
+text turn `PONG` (usage 17/3/20, stop), admission `admit` at normal
+pressure.
