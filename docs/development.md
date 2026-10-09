@@ -1216,3 +1216,14 @@ during `gemma4-e4b`'s cold load colliding with resident `qwen-vl` and
 memory pressure; the route served cleanly once loaded (5.6s turn).
 
 Suite: 243/243 Python tests.
+
+## thinking pinned off on mlx routes (2026-10-09)
+
+User direction: "thinking should disabled". The gemma4 template gates
+reasoning on `enable_thinking` (off by default); the provider now
+passes `enable_thinking=False` explicitly on both the mlx-lm and
+mlx-vlm template applications - deterministic, documented, and safe
+against template defaults (qwen3 templates honor the same flag; their
+`<think>` strip stays as a safety net). Verified live: `gemma4-e4b`
+vision (`"Red"`), text (`391` direct, no reasoning preamble), and
+`qwen3.8-9b` (`PONG`) - the kwarg is accepted harmlessly everywhere.

@@ -260,10 +260,12 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     def _complete_text(self, container, request, profile, flag) -> ChatResult:
         lm = _import_mlx_lm()
         tokenizer = container.processor
+        # Thinking stays explicitly off: reasoning blocks are not part of
+        # this platform's serving contract (and would burn output tokens).
         prompt = tokenizer.apply_chat_template(
             self._messages_payload(request, profile),
             tokenize=False, add_generation_prompt=True,
-            tools=self._tool_schemas(request))
+            tools=self._tool_schemas(request), enable_thinking=False)
         text, prompt_tokens, completion_tokens = "", 0, 0
         finish = None
         # mlx-lm >=0.29 moved sampling to a Sampler callable; temperature/
@@ -337,7 +339,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         # (RGB + EXIF normalization) before handing images to stream_generate.
         images = [load_image(BytesIO(img.data))
                   for m in request.messages for img in m.images]
-        kwargs: dict = {}
+        kwargs: dict = {"enable_thinking": False}
         tools = self._tool_schemas(request)
         if tools is not None:
             kwargs["tools"] = tools
