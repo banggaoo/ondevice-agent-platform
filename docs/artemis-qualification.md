@@ -139,21 +139,22 @@ synthetic input returned plausible coordinates (`250, 500` vs true
 the verified-grid fallback. OCR-tier behavior verified live earlier
 (`"TOTAL"` no-usage direct answers; `"Red"`/`"black"` escalations).
 
-**ARTEMIS OCR tool path (2026-10-09, verified):** `perform_ocr` gained a
-`platform` provider (`ARTEMIS_OCR_PROVIDER=platform`; in `auto` it sits
-between the native Apple Vision worker and Google). It POSTs the
-`vision-hybrid` route with an extraction prompt; direct Apple Vision
-answers now carry the additive `oap_ocr` response field -
-`{text, confidence, position}` with pixel vertices in boundingPoly
-order (TL,TR,BR,BL), emitted by `oap-vision-bridge`. Verified live:
-`run_ocr_core` on a 320x80 `"TOTAL"` image returned
-`[{"text":"TOTAL","coordinates":[446,475]}]` (matches ~[447,475]
-expected), `usage: null` (no model call); a no-text image escalated to
-`qwen-vl`, produced no `oap_ocr`, and the tool reported "No text
-detected on the screen." - escalated answers yield empty OCR rather
-than fabricated coordinates. Default `auto` still prefers ARTEMIS's
-own Apple Vision worker (per-observation CJK revision tuning); pin
-`ARTEMIS_OCR_PROVIDER=platform` to route OCR through the platform.
+**OCR serving contract (2026-10-09, verified):** the platform's
+`vision-hybrid` route serves position-bearing OCR to consumers.
+`oap-vision-bridge` emits pixel vertices in boundingPoly order
+(TL,TR,BR,BL), and direct Apple Vision answers carry the additive
+`oap_ocr` response field - `{text, confidence, position}` per
+observation. Escalated VLM answers carry no `oap_ocr`, so consumers
+degrade honestly instead of receiving fabricated coordinates. Verified
+through ARTEMIS's real `perform_ocr`/`run_ocr_core` path against a
+consumer-side platform provider: a 320x80 `"TOTAL"` image returned
+`[{"text":"TOTAL","coordinates":[446,475]}]` (normalized 0-1000,
+~[447,475] expected), `usage: null`; a no-text image escalated to
+`qwen-vl` and the tool reported "No text detected on the screen." The
+ARTEMIS-side provider shim was reverted per user direction - ARTEMIS
+stays unmodified and consumes the platform through its existing
+config; the `oap_ocr` contract remains served for any OCR caller that
+wants positions.
 
 **Residual - not qualified:** the optional `planner_validation` and
 `validator_pixel_safety_net` routes still default to Google in the
