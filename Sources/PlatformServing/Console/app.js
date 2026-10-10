@@ -160,6 +160,9 @@ function renderOverview(s) {
   const active = counts.activeInference || 0;
   const pending = counts.pendingInference || 0;
   setText("slots", active + pending);
+  if (counts.inferenceCapacity != null) {
+    setText("slots-total", counts.inferenceCapacity);
+  }
   const cats = s.categories || {};
   setText("cat-apple", cats.appleFoundationModels);
   setText("cat-owned", cats.ownedOpenWeight);
@@ -181,6 +184,8 @@ function renderModels(registry) {
         ` · ${p.task || "?"}` +
         (p.purposes && p.purposes.length ? ` · ${p.purposes.join("/")}` : "") +
         ` · cap ${p.maxOutputTokens == null ? "?" : p.maxOutputTokens}` +
+        (p.imageMaxSoftTokens != null
+          ? ` · img tokens ${p.imageMaxSoftTokens}` : "") +
         ` · ${source}` +
         ` · provider ${p.providerRegistered ? "registered" : "unregistered"}` +
         ` · ${artifactReadyLabel(p.artifactReady)}`;
@@ -208,7 +213,11 @@ function renderModels(registry) {
 
 function jobTime(epoch) {
   if (typeof epoch !== "number") return "-";
-  return new Date(epoch * 1000).toLocaleTimeString();
+  const d = new Date(epoch * 1000);
+  if (d.toDateString() === new Date().toDateString()) {
+    return d.toLocaleTimeString();
+  }
+  return d.toLocaleDateString() + " " + d.toLocaleTimeString();
 }
 
 function renderJobs(jobs) {
@@ -278,6 +287,7 @@ function renderChatMeta() {
     show("chat-unavailable");
     setText("chat-model", "none");
     setText("chat-harness", "none");
+    setText("chat-status", "");
     $("chat-input").disabled = true;
     $("chat-send").disabled = true;
     $("chat-stop").hidden = true;
@@ -368,36 +378,54 @@ function initChat() {
     chatEntry("chat-question", text);
     sendOperatorPrompt(text);
   });
+  $("chat-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      $("chat-form").requestSubmit();
+    }
+  });
   $("chat-stop").addEventListener("click", stopOperatorPrompt);
 }
 
 /* ---- refresh ---- */
 
 /* All three reads must succeed before rendering: a partial success must
- * not erase previously displayed registry/jobs data or the warning. */
+ * not erase previously displayed registry/jobs data or the warning.
+ * The event stream ticks every 2s; a slow daemon must not stack fetches,
+ * so a refresh already in flight is not duplicated. */
+let refreshInFlight = false;
 async function refreshStatus() {
-  const [status, registry, jobs] = await Promise.all([
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    const [status, registry, jobs] = await Promise.all([
     consoleGet("/api/status"), consoleGet("/api/registry"), consoleGet("/api/jobs"),
-  ]);
-  if (status.status !== 200 || !status.body
-      || registry.status !== 200 || !registry.body
-      || jobs.status !== 200 || !jobs.body) {
-    show("offline");
-    return;
+    ]);
+    if (status.status !== 200 || !status.body
+        || registry.status !== 200 || !registry.body
+        || jobs.status !== 200 || !jobs.body) {
+      show("offline");
+      return;
+    }
+    hide("offline");
+    state.data = { status: status.body, registry: registry.body, jobs: jobs.body };
+    state.operator = detectOperator(registry.body);
+    renderOverview(status.body);
+    renderModels(registry.body);
+    renderJobs(jobs.body.jobs || []);
+    renderChatMeta();
+  } finally {
+    refreshInFlight = false;
   }
-  hide("offline");
-  state.data = { status: status.body, registry: registry.body, jobs: jobs.body };
-  state.operator = detectOperator(registry.body);
-  renderOverview(status.body);
-  renderModels(registry.body);
-  renderJobs(jobs.body.jobs || []);
-  renderChatMeta();
 }
 
-/* Event stream: one delayed, controlled reconnect through a fresh session
- * per failure. The retry budget resets only on a delivered status frame -
- * a bare open is not proof of health - and stale sources or a pending
- * timer can never schedule a parallel reconnect. No rapid loop. */
+/* Event stream: delayed, controlled reconnects through a fresh session
+ * per failure, with exponential backoff capped at 30s. The delay ladder
+ * resets only on a delivered status frame - a bare open is not proof of
+ * health - and stale sources or a pending timer can never schedule a
+ * parallel reconnect. A daemon restart or dropped network therefore
+ * recovers instead of leaving the console dead until reload; the minimum
+ * delay keeps the loop slow. */
 function startEvents() {
   if (state.reconnectTimer) {
     clearTimeout(state.reconnectTimer);
@@ -414,12 +442,13 @@ function startEvents() {
   source.onerror = () => {
     if (source !== state.events || state.reconnectTimer) return;
     source.close();
-    if (state.eventReconnects >= 1) { show("offline"); return; }
+    if (state.eventReconnects >= 2) show("offline");
+    const delay = Math.min(30000, 1000 * (1 << state.eventReconnects));
     state.eventReconnects += 1;
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
       if (state.events === source) reconnectEvents();
-    }, 1000);
+    }, delay);
   };
 }
 

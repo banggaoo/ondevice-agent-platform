@@ -266,6 +266,8 @@ class PlatformSupervisor:
                     "activeInference": len(self._active),
                     "pendingInference": len(self._pending),
                     "inferenceBlocked": self._inference_blocked,
+                    "inferenceCapacity": (PlatformLimits.ACTIVE_INFERENCE
+                                          + PlatformLimits.PENDING_INFERENCE),
                 },
                 "models": self._model_summaries_locked(),
                 "jobs": {
@@ -308,6 +310,7 @@ class PlatformSupervisor:
                 "maxOutputTokens": min(
                     PlatformLimits.OUTPUT_TOKENS,
                     profile.max_output_tokens or PlatformLimits.OUTPUT_TOKENS),
+                "imageMaxSoftTokens": profile.image_max_soft_tokens,
                 "source": ({"repo": profile.source.repo,
                             "revision": profile.source.revision}
                            if profile.source else None),
