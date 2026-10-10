@@ -227,7 +227,13 @@ function renderJobs(jobs) {
     const tr = document.createElement("tr");
     for (const key of ["id", "kind", "consumer", "state"]) {
       const td = document.createElement("td");
-      td.textContent = job[key];
+      if (key === "kind" && job.detail) {
+        td.textContent = job.detail;
+      } else if (key === "state" && job.progress != null) {
+        td.textContent = `${job.state} ${Math.round(job.progress * 100)}%`;
+      } else {
+        td.textContent = job[key];
+      }
       tr.appendChild(td);
     }
     const parent = document.createElement("td");
@@ -258,6 +264,136 @@ async function cancelJob(id) {
     await bootstrapSession();
   }
   await refreshStatus();
+}
+
+/* ---- installs: catalog models + Operator ---- */
+
+/* Mutations are retried only for session loss: the re-bootstrap fixes the
+ * next click; the failed action itself is never replayed automatically. */
+async function modelMutation(path, body) {
+  const result = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (result.status === 401 || result.status === 403) {
+    await bootstrapSession();
+  }
+  if (result.status !== 200) {
+    const err = result.body && result.body.error;
+    const msg = (err && typeof err === "object" && err.message) ||
+      `request failed (status ${result.status || "unreachable"})`;
+    setText("catalog-status", msg);
+    show("catalog-status");
+  } else {
+    hide("catalog-status");
+  }
+  await refreshStatus();
+}
+
+function pullJobFor(alias, jobs) {
+  return jobs.find((j) => j.kind === "admin" && j.detail === `pull ${alias}`
+    && ["active", "cancel_requested", "queued"].includes(j.state));
+}
+
+function actionButton(label, fn) {
+  const b = document.createElement("button");
+  b.className = "rowbtn";
+  b.textContent = label;
+  b.addEventListener("click", fn);
+  return b;
+}
+
+function renderCatalog(cat, registry, jobs) {
+  $("env-missing").hidden = !cat || cat.providerEnvInstalled !== false;
+  const ul = $("catalog-list");
+  ul.textContent = "";
+  const entries = (cat && cat.entries) || [];
+  const profiles = (registry.modelProfiles || []);
+  const shown = new Set();
+  for (const e of entries.slice(0, 50)) {
+    shown.add(e.alias);
+    const li = document.createElement("li");
+    li.className = "modelrow";
+    const size = e.approxBytes ? ` ~${(e.approxBytes / 1e9).toFixed(1)} GB`
+      : "";
+    const job = pullJobFor(e.alias, jobs);
+    let status;
+    if (job) {
+      status = `pulling ${Math.round((job.progress || 0) * 100)}%`;
+    } else if (e.ready) {
+      status = "installed";
+    } else if (e.declared) {
+      status = "declared";
+    } else if (e.eligible) {
+      status = "available";
+    } else {
+      status = e.reason || "not eligible";
+    }
+    li.textContent = `${e.alias} — ${e.summary || ""} · ${e.provider}${size}`
+      + ` · ${status}`;
+    if (!job && e.eligible !== false) {
+      if (!e.ready) {
+        li.appendChild(actionButton(e.declared ? "pull" : "install",
+          () => modelMutation("/api/console/models/pull",
+                              { alias: e.alias })));
+      }
+      if (e.ready) {
+        li.appendChild(actionButton("remove",
+          () => modelMutation("/api/console/models/remove",
+                              { alias: e.alias })));
+      }
+    }
+    ul.appendChild(li);
+  }
+  /* Declared profiles outside the catalog (composite routes like
+   * vision-hybrid) still list, status-only. */
+  for (const p of profiles) {
+    if (shown.has(p.alias)) continue;
+    const li = document.createElement("li");
+    li.className = "modelrow";
+    li.textContent = `${p.alias} — ${p.provider || "?"} · declared · `
+      + artifactReadyLabel(p.artifactReady);
+    ul.appendChild(li);
+  }
+}
+
+function renderOperator(registry) {
+  const op = (registry.agentProfiles || []).find((a) => a.id === "operator");
+  const models = (registry.modelProfiles || [])
+    .filter((p) => p.kind === "llm" &&
+      ["mlx", "llamacpp", "apple-foundation-models"].includes(p.provider));
+  const sel = $("op-model");
+  const want = models.map((p) => p.alias).join("|");
+  if (sel.dataset.models !== want) {
+    sel.dataset.models = want;
+    sel.textContent = "";
+    for (const p of models) {
+      const opt = document.createElement("option");
+      opt.value = p.alias;
+      opt.textContent = p.alias + (p.artifactReady ? "" : " (not pulled)");
+      sel.appendChild(opt);
+    }
+  }
+  if (op && op.model && sel.dataset.models.includes(op.model)) {
+    sel.value = op.model;
+  }
+  setText("op-state", op ? `enabled - bound to ${op.model || "?"}`
+                         : "not enabled");
+  $("op-enable").disabled = models.length === 0;
+  $("op-disable").disabled = !op;
+}
+
+function initOperator() {
+  $("op-enable").addEventListener("click", () => {
+    const model = $("op-model").value;
+    if (model) {
+      modelMutation("/api/console/operator", { model });
+    }
+  });
+  $("op-disable").addEventListener("click", () => {
+    modelMutation("/api/console/operator", { enabled: false });
+  });
 }
 
 /* ---- Operator chat ---- */
@@ -398,21 +534,26 @@ async function refreshStatus() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const [status, registry, jobs] = await Promise.all([
-    consoleGet("/api/status"), consoleGet("/api/registry"), consoleGet("/api/jobs"),
+    const [status, registry, jobs, catalog] = await Promise.all([
+      consoleGet("/api/status"), consoleGet("/api/registry"),
+      consoleGet("/api/jobs"), consoleGet("/api/catalog"),
     ]);
     if (status.status !== 200 || !status.body
         || registry.status !== 200 || !registry.body
-        || jobs.status !== 200 || !jobs.body) {
+        || jobs.status !== 200 || !jobs.body
+        || catalog.status !== 200 || !catalog.body) {
       show("offline");
       return;
     }
     hide("offline");
-    state.data = { status: status.body, registry: registry.body, jobs: jobs.body };
+    state.data = { status: status.body, registry: registry.body,
+                   jobs: jobs.body, catalog: catalog.body };
     state.operator = detectOperator(registry.body);
     renderOverview(status.body);
     renderModels(registry.body);
     renderJobs(jobs.body.jobs || []);
+    renderCatalog(catalog.body, registry.body, jobs.body.jobs || []);
+    renderOperator(registry.body);
     renderChatMeta();
   } finally {
     refreshInFlight = false;
@@ -465,6 +606,7 @@ async function start() {
     hide("connstate");
     switchView();
     initChat();
+    initOperator();
     startEvents();
     await refreshStatus();
   } else {

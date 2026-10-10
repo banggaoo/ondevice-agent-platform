@@ -96,6 +96,7 @@ class Router:
         self._acp = acp
         self._sessions = sessions
         self._bridge = bridge
+        self._op_principal = None
         self._static_dir = static_dir
         self._expected_port: int | None = None   # set by the bound server
         self._consumer_windows: dict[str, list[float]] = {}
@@ -202,6 +203,14 @@ class Router:
             return self._admin_json(req, self._s.registry_snapshot)
         if method == "GET" and path == "/api/jobs":
             return self._admin_jobs(req)
+        if method == "GET" and path == "/api/catalog":
+            return self._admin_json(req, self._s.catalog_status)
+        if method == "POST" and path == "/api/console/models/pull":
+            return self._console_pull(req)
+        if method == "POST" and path == "/api/console/models/remove":
+            return self._console_remove(req)
+        if method == "POST" and path == "/api/console/operator":
+            return self._console_operator(req)
         if method == "POST" and path == "/api/console/operator/prompt":
             return self._operator_prompt(req)
         if method == "POST" and path == "/v1/chat/completions":
@@ -294,12 +303,68 @@ class Router:
     def _admin_jobs(self, req: _Request) -> _Response:
         def produce():
             jobs = self._s.list_jobs()
+            extras = self._s.admin_job_extras()
             return {"jobs": [{
                 "id": j.id, "kind": j.kind.value, "consumer": j.consumer_id,
                 "state": j.state.value, "parentId": j.parent_id,
                 "createdAt": j.created_at, "updatedAt": j.updated_at,
+                **(extras.get(j.id) or {}),
             } for j in jobs]}
         return self._admin_json(req, produce)
+
+    # -- console administration -------------------------------------------------
+
+    def _console_body_alias(self, req) -> str:
+        self._require_console_session(req, mutation=True)
+        self._consumer_rate_limit("console-admin")
+        try:
+            body = json.loads(req.body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise PlatformError(ErrorCode.MALFORMED_JSON)
+        alias = body.get("alias") if isinstance(body, dict) else None
+        if not isinstance(alias, str) or not alias:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "alias required")
+        return alias
+
+    def _console_pull(self, req: _Request) -> _Response:
+        alias = self._console_body_alias(req)
+        job = self._s.pull_model(LocalConsumers.ADMINISTRATION, alias)
+        return _Response.json({"jobId": job.id, "state": job.state.value})
+
+    def _console_remove(self, req: _Request) -> _Response:
+        alias = self._console_body_alias(req)
+        self._s.remove_model_artifacts(LocalConsumers.ADMINISTRATION, alias)
+        return _Response.json({"ok": True})
+
+    def _console_operator(self, req: _Request) -> _Response:
+        self._require_console_session(req, mutation=True)
+        self._consumer_rate_limit("console-admin")
+        try:
+            body = json.loads(req.body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise PlatformError(ErrorCode.MALFORMED_JSON)
+        enabled = (body.get("enabled", True)
+                   if isinstance(body, dict) else True)
+        if enabled is not True:
+            self._s.clear_operator()
+            self._bridge = None
+            return _Response.json({"enabled": False})
+        model = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(model, str) or not model:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "model required")
+        self._s.set_operator(model)
+        if self._bridge is None:
+            # The daemon was started without --enable-operator: wire the
+            # bridge lazily so console enable applies without a restart.
+            from .console_bridge import ConsoleOperatorBridge
+            if self._op_principal is None:
+                self._op_principal = (
+                    self._s.register_console_operator_consumer())
+            self._bridge = ConsoleOperatorBridge(
+                self._acp, self._s, self._sessions, self._op_principal)
+        return _Response.json({"enabled": True, "model": model})
 
     # -- job cancel ----------------------------------------------------------------
 

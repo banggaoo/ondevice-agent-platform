@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import webbrowser
 
 from . import catalog
 from .acp_facade import run_stdio_facade
@@ -541,6 +542,11 @@ def cmd_serve(args) -> int:
         root.write_daemon_marker(server.port)
         _eprint(f"ondevice-agent-platform serving on "
                 f"127.0.0.1:{server.port}")
+        if getattr(args, "open", False):
+            try:
+                webbrowser.open(f"http://127.0.0.1:{server.port}/")
+            except Exception:
+                pass   # a headless host still serves; the URL is printed
 
         stop = threading.Event()
 
@@ -948,15 +954,29 @@ def _link_executable(root: RuntimeRoot, bin_name: str) -> str:
 def cmd_install(args) -> int:
     """Install the platform: managed provider env (reused, never wiped),
     the package installed non-editably from --source, and an
-    ondevice-agent-platform executable linked into ~/.local/bin."""
+    ondevice-agent-platform executable linked into ~/.local/bin.
+    --serve chains into `serve --open` so setup finishes in the console."""
     root = _root_for(args)
     root.prepare()
     root.check_state_files()
     root.acquire_lock()
     try:
-        return _install_impl(root, args)
+        code = _install_impl(root, args)
     finally:
         root.release_lock()
+    if code == 0 and getattr(args, "serve", False):
+        print("starting the platform and opening the console - "
+              "Ctrl-C to stop")
+        serve_args = argparse.Namespace(
+            data_root=getattr(args, "data_root", None), port=8080,
+            enable_reference_agent=False, reference_echo_model=None,
+            enable_apple_model=False, enable_operator=False,
+            operator_model=None, open=True)
+        return cmd_serve(serve_args)
+    if code == 0:
+        print("run `ondevice-agent-platform serve --open` to open the "
+              "console and install models or the Operator")
+    return code
 
 
 def _root_needs_mlx(root: RuntimeRoot) -> bool:
@@ -1061,6 +1081,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--enable-apple-model", action="store_true")
     serve.add_argument("--enable-operator", action="store_true")
     serve.add_argument("--operator-model", default=None)
+    serve.add_argument("--open", action="store_true",
+                       help="open the console in the default browser")
     serve.set_defaults(func=cmd_serve)
 
     model = sub.add_parser("model", help="model store commands")
@@ -1108,6 +1130,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="path to the repo's python/ package directory "
                       "(containing pyproject.toml); defaults to the "
                       "checkout this CLI was launched from")
+    inst.add_argument("--serve", action="store_true",
+                      help="after install, start the daemon and open the "
+                      "console to finish setup (install models, Operator)")
     inst.set_defaults(func=cmd_install)
 
     acp = sub.add_parser("acp", help="ACP stdio facade")

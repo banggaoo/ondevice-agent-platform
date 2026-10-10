@@ -66,6 +66,8 @@ class AgentProfile:
 class Grant(enum.Enum):
     ADMIN_READ = "adminRead"
     ADMIN_STOP = "adminStop"
+    # Model/agent install and removal - the console's write grant.
+    ADMIN_MANAGE = "adminManage"
     LLM_INFER = "llmInfer"
     ML_PREDICT = "mlPredict"
     AGENT_RUN = "agentRun"
@@ -86,7 +88,7 @@ class ConsumerScope(enum.Enum):
         # administration.
         return {
             ConsumerScope.CONSOLE: frozenset({
-                Grant.ADMIN_READ, Grant.ADMIN_STOP,
+                Grant.ADMIN_READ, Grant.ADMIN_STOP, Grant.ADMIN_MANAGE,
                 Grant.AGENT_RUN, Grant.AGENT_STATUS_READ}),
             ConsumerScope.MODEL: frozenset({Grant.LLM_INFER, Grant.ML_PREDICT}),
             ConsumerScope.AGENT: frozenset({

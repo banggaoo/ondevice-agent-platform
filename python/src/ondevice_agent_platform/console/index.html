@@ -79,12 +79,35 @@
       <ul id="model-list" class="plain"></ul>
       <h3>Agents</h3>
       <ul id="agents" class="plain"></ul>
-      <p class="hint">Model artifacts are governed through the CLI, not this
-        console. Declare and fetch with
-        <code>ondevice-agent-platform model pull</code>, inspect with
-        <code>model list</code>, remove with
-        <code>model remove --alias ALIAS</code>. Nothing is downloaded at
-        inference time.</p>
+    </div>
+
+    <div class="card">
+      <h2>Install models</h2>
+      <p id="env-missing" class="error" role="status" hidden>
+        The provider runtime env is not installed. Run
+        <code>ondevice-agent-platform provider install</code> (or
+        <code>install --serve</code>) - env changes cannot be applied from
+        inside the running daemon.
+      </p>
+      <p id="catalog-status" class="error" role="status" hidden></p>
+      <ul id="catalog-list" class="plain"></ul>
+      <p class="hint">Pulls run governed: declared source + pinned
+        revision, staged download, verified manifest. Remove deletes
+        artifacts only - the registry declaration stays for re-pull.
+        Nothing is downloaded at inference time.</p>
+    </div>
+
+    <div class="card">
+      <h2>Operator</h2>
+      <p>Status <span id="op-state" class="mono">unknown</span></p>
+      <div class="oprow">
+        <label class="hint" for="op-model">Bound model</label>
+        <select id="op-model"></select>
+        <button type="button" id="op-enable">Enable</button>
+        <button type="button" id="op-disable">Disable</button>
+      </div>
+      <p class="hint">The Operator is read-only: explanation and
+        proposals, no execution authority. Chat lives on the Chat view.</p>
     </div>
   </section>
 

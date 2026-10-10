@@ -88,6 +88,28 @@ body {
 .plain { list-style: none; margin: 0.25rem 0; padding: 0; }
 .plain li { padding: 0.15rem 0; }
 
+.rowbtn {
+  padding: 0.15rem 0.65rem;
+  font-size: 0.78rem;
+  margin-left: 0.6rem;
+}
+
+.oprow {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+#op-model {
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
 button {
   background: var(--teal);
   color: var(--paper);

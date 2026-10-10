@@ -1249,3 +1249,59 @@ job `cancelled` (confirmed, `inferenceBlocked` stayed false); the
 immediately-following request joined the shared load/cache and answered
 `"OK"`. Previously this exact sequence latched `inferenceBlocked` and
 503'd until restart. Suite: 253/253.
+
+## Console administration: installs + runtime Operator (2026-10-10)
+
+User direction: "agent and model should install and uninstallable, using
+console, when install oap run console so user can setup env and install
+agent or model". The console Models view gained two cards: Install
+models (the host-filtered catalog with live declared/pulled state and
+install/remove buttons) and Operator (bind-model select + enable/disable).
+
+Design:
+
+- Pulls are administration, not inference: `JobKind.ADMIN` runs on its
+  own durable lane (`submit_admin`/`_admin_finished`), capped at
+  `PlatformLimits.ADMIN_CONCURRENT=2` and deduplicated by detail string.
+  It holds no inference slot and the `_inference_blocked` latch cannot
+  apply; jobs appear on `/api/jobs` with merged `detail`/`progress`
+  extras.
+- `modelstore.pull` gained `should_stop`: consulted between files and
+  between download chunks; abort raises CANCELLED and staging is always
+  cleaned by the existing `BaseException` path.
+- Console install on an undeclared alias is declare-then-pull:
+  `declare_catalog_model` merges the catalog entry into `registry.json`
+  through `merged_registry` (validated pre-persist), registers the
+  profile live, instantiates-or-reuses the provider (`_provider_for`
+  mirrors `_build_supervisor` wiring), and re-tracks llm profiles on
+  providers that support it - no restart needed.
+- Remove is artifacts-only, CLI-parity: the registry declaration stays
+  for re-pull; a pull in progress for the alias refuses with
+  CAPACITY_LIMITED.
+- Operator toggle: `set_operator`/`clear_operator` register/unregister
+  the runtime profile (`agents.unregister_runtime_operator` - bound
+  sessions keep their profile snapshot, new session/new calls no longer
+  see the agent) and persist `enableOperator`/`operatorModel` in
+  `config.json`, which `_apply_serve_config` already honors on the next
+  serve. The console bridge is created lazily when the daemon was not
+  started with `--enable-operator`.
+- Routes: `GET /api/catalog` (admin-read local route), `POST
+  /api/console/models/pull`, `POST /api/console/models/remove`, `POST
+  /api/console/operator` - all mutations behind the console session +
+  exact-Origin + CSRF guards, sharing the `console-admin` rate-limit
+  bucket.
+- CLI: `serve --open` opens the console in the default browser after
+  bind; `install --serve` chains into `serve --open` after the env
+  finishes, so a fresh `install --serve` is the whole setup path (env ->
+  daemon -> console, then pull models and enable the Operator from the
+  page). Provider env changes stay CLI-only: the running daemon holds
+  the root's lifetime lock, so the console surfaces env status
+  (`providerEnvInstalled`) but cannot install it itself.
+
+Live-verified on :8080 (2026-10-10): catalog route reports real
+declared/ready/eligible state; pull submitted as `admin` job, cancelled
+mid-download, resolved `cancelled` with staging cleaned and
+`inferenceBlocked` untouched; Operator enabled on `qwen3.8-9b`, answered
+a console question through the lazily-created ACP bridge, then disabled
+- profile and config cleared. Headless-Chrome render of the Models view
+shows both new cards correctly. Suite: 281/281 (+28 admin tests).

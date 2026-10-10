@@ -215,6 +215,15 @@ class AgentService:
             lambda: ReferenceEchoHarness(model_alias),
             ReferenceEchoHarness.id, ReferenceEchoHarness.version)
 
+    def unregister_runtime_operator(self) -> bool:
+        """Remove the optional runtime Operator profile. Existing ACP
+        sessions keep their bound profile snapshot; new session/new calls
+        no longer see the agent. Returns True when it was registered."""
+        with self._lock:
+            existed = self._profiles.pop("operator", None) is not None
+            self._versions.pop("operator", None)
+            return existed
+
     def register_runtime_operator(self, model_alias: str) -> None:
         self.register(
             AgentProfile(id="operator", version=1,

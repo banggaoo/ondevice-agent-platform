@@ -23,6 +23,9 @@ SCHEMA_VERSION = 1
 class JobKind(enum.Enum):
     LLM = "llm"
     ML = "ml"
+    # Governed administration work (model pulls): its own lane, never
+    # counted against inference slots or the inference-blocked latch.
+    ADMIN = "admin"
 
 
 class JobState(enum.Enum):
@@ -210,7 +213,8 @@ class StateStore:
     def _row_to_job(row) -> JobRecord:
         return JobRecord(
             id=row[0],
-            kind=JobKind(row[1]) if row[1] in ("llm", "ml") else JobKind.LLM,
+            kind=JobKind(row[1]) if row[1] in ("llm", "ml", "admin")
+            else JobKind.LLM,
             consumer_id=row[2], parent_id=row[3],
             state=JobState(row[4]) if row[4] in {s.value for s in JobState}
             else JobState.FAILED,

@@ -9,6 +9,7 @@ actually finishes.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -23,9 +24,10 @@ from .limits import PlatformLimits
 from .profiles import (AgentProfile, CategoryStatus, ConsumerScope, Grant,
                        LocalConsumers, ModelKind, ModelProfile, Principal)
 from .providers.base import (ModelCacheEvicting, ProviderReadiness)
+from .modelstore import ModelStore
 from .registry import (APPLE_PROVIDER_ID, MLX_PROVIDER_ID,
                        LLAMACPP_PROVIDER_ID, VLLMMLX_PROVIDER_ID,
-                       VISIONHYBRID_PROVIDER_ID)
+                       VISIONHYBRID_PROVIDER_ID, parse_registry)
 from . import resources
 from .state import JobKind, JobRecord, JobState, StateStore
 
@@ -97,6 +99,12 @@ class PlatformSupervisor:
         self._shutting_down = False
         self._deny_recheck_pending = False
         self._latest_snapshot = resources.ResourceSnapshot.unknown()
+        # Admin lane: governed installs (model pulls) run outside the
+        # inference queue - no slot, no blocked latch - but still as
+        # durable, cancellable jobs.
+        self._admin_jobs: dict[str, JobRecord] = {}
+        self._admin_detail: dict[str, str] = {}
+        self._admin_progress: dict[str, float] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -238,6 +246,265 @@ class PlatformSupervisor:
                                     "operator requires a local model route")
         self.agent_service.register_runtime_operator(model_alias)
 
+    # -- console administration ----------------------------------------------
+
+    def submit_admin(self, principal: Principal, detail: str,
+                     fn) -> JobRecord:
+        """Durable admin-lane work (governed installs). Runs on its own
+        thread, outside the inference queue: no inference slot is held and
+        the blocked latch cannot apply. `fn(token, progress)` gets the job
+        token and a 0..1 progress sink."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+        with self._lock:
+            if self._shutting_down:
+                raise PlatformError(ErrorCode.CANCELLED)
+            if len(self._admin_jobs) >= PlatformLimits.ADMIN_CONCURRENT:
+                raise PlatformError(ErrorCode.CAPACITY_LIMITED,
+                                    "administration busy")
+            live = {self._admin_detail[jid] for jid in self._admin_jobs}
+            if detail in live:
+                raise PlatformError(ErrorCode.CAPACITY_LIMITED,
+                                    f"already running: {detail}")
+            now = time.time()
+            self._job_sequence += 1
+            job = JobRecord(id=f"job-{self._job_sequence}",
+                            kind=JobKind.ADMIN, consumer_id=principal.id,
+                            parent_id=None, state=JobState.ACTIVE,
+                            created_at=now, updated_at=now)
+            token = CancellationToken()
+            self._job_tokens[job.id] = token
+            self._admin_jobs[job.id] = job
+            self._admin_detail[job.id] = detail
+        try:
+            self._store.insert_job(job)
+        except PlatformError:
+            with self._lock:
+                self._admin_jobs.pop(job.id, None)
+                self._admin_detail.pop(job.id, None)
+                self._job_tokens.pop(job.id, None)
+            raise PlatformError(ErrorCode.STORAGE_FAILURE)
+        def run() -> None:
+            try:
+                fn(token, lambda f: self._admin_progress_put(job.id, f))
+                self._admin_finished(job.id)
+            except PlatformError as e:
+                self._admin_finished(job.id, error=e)
+            except Exception as e:
+                self._admin_finished(job.id, error=PlatformError(
+                    ErrorCode.STORAGE_FAILURE,
+                    f"{type(e).__name__}: {e}"))
+
+        thread = threading.Thread(target=run, daemon=True,
+                                  name=f"oap-admin-{job.id}")
+        with self._lock:
+            if self._shutting_down:
+                token.cancel()
+            self._running_threads[job.id] = thread
+            self._increment(kind=job.kind)
+        thread.start()
+        return job
+
+    def _admin_progress_put(self, job_id: str, frac: float) -> None:
+        with self._lock:
+            if job_id in self._admin_jobs:
+                self._admin_progress[job_id] = round(
+                    max(0.0, min(1.0, frac)), 3)
+
+    def _admin_finished(self, job_id: str,
+                        error: PlatformError | None = None) -> None:
+        with self._lock:
+            job = self._admin_jobs.pop(job_id, None)
+            self._admin_progress.pop(job_id, None)
+            # Detail survives finish so History keeps "pull <alias>";
+            # bounded, dedup checks live jobs only.
+            while len(self._admin_detail) > 100:
+                self._admin_detail.pop(next(iter(self._admin_detail)))
+            if job is None:
+                return
+            if job.state == JobState.CANCEL_REQUESTED or (
+                    error is not None and error.code == ErrorCode.CANCELLED):
+                state = JobState.CANCELLED
+            elif error is not None:
+                state = JobState.FAILED
+            else:
+                state = JobState.COMPLETED
+            self._finish_terminal(job, state)
+            self._running_threads.pop(job_id, None)
+
+    def admin_job_extras(self) -> dict:
+        """Pull detail (persistent, bounded) + live progress merged onto
+        durable job records for /api/jobs."""
+        with self._lock:
+            return {jid: {"detail": detail,
+                          "progress": self._admin_progress.get(jid)}
+                    for jid, detail in self._admin_detail.items()}
+
+    def pull_model(self, principal: Principal, alias: str) -> JobRecord:
+        """Governed pull for a declared alias; undeclared catalog aliases
+        are declared first (console install = declare + pull)."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+        match = next((e for e in self._registry_entries()
+                      if e.profile.alias == alias), None)
+        if match is None:
+            self.declare_catalog_model(alias)
+            match = next((e for e in self._registry_entries()
+                          if e.profile.alias == alias), None)
+        if match is None or match.profile.source is None:
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"alias not declared: {alias}")
+        store = ModelStore(self._root)
+        source, artifact_file = match.profile.source, match.artifact_file
+
+        def work(token, progress):
+            store.pull(source, artifact_file=artifact_file,
+                       progress=progress,
+                       should_stop=lambda: token.is_cancelled)
+
+        return self.submit_admin(principal, f"pull {alias}", work)
+
+    def declare_catalog_model(self, alias: str) -> ModelProfile:
+        """Console install path: declare a host-eligible catalog entry
+        into registry.json and register it live so a pull can start
+        without a restart."""
+        from . import catalog
+        available = catalog.available_entries()
+        found = next(((e, ok, r) for e, ok, r in available
+                      if e.alias == alias), None)
+        if found is None:
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"unknown catalog alias: {alias}")
+        entry, eligible, reason = found
+        if not eligible:
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                f"{alias}: not eligible on this host ({reason})")
+        existing = (self._root.read_json(self._root.registry_path)
+                    if os.path.isfile(self._root.registry_path) else {})
+        existing = existing if isinstance(existing, dict) else {}
+        if any(m.get("alias") == alias
+               for m in existing.get("models", [])):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                f"already declared: {alias}")
+        merged = catalog.merged_registry(existing, [entry])
+        self._root.write_json(merged, self._root.registry_path)
+        declared = next(e for e in parse_registry(merged)
+                        if e.profile.alias == alias)
+        provider = self._provider_for(declared)
+        self.register_model(declared.profile, provider=provider)
+        with self._lock:
+            llm_profiles = [p for p in self._model_profiles.values()
+                            if p.kind == ModelKind.LLM]
+            providers = list(self._llm_providers.values())
+        for prov in providers:
+            track = getattr(prov, "track_profiles", None)
+            if callable(track):
+                track(llm_profiles)
+        return declared.profile
+
+    def _provider_for(self, entry):
+        """Instantiate-or-reuse the provider a declared entry needs,
+        mirroring _build_supervisor's provider wiring."""
+        pid = entry.profile.provider_id
+        with self._lock:
+            existing = self._llm_providers.get(pid)
+        if existing is not None:
+            return existing
+        store = ModelStore(self._root)
+        if pid == MLX_PROVIDER_ID:
+            from .providers.mlx_provider import MLXProvider
+            provider = MLXProvider(store)
+        elif pid == VLLMMLX_PROVIDER_ID:
+            from .providers.vllmmlx import VllmMlxProvider
+            provider = VllmMlxProvider(
+                store, providers_dir=self._root.providers_path)
+        elif pid == LLAMACPP_PROVIDER_ID:
+            from .providers.llamacpp import LlamaCppProvider
+            files = ({entry.profile.alias: entry.artifact_file}
+                     if entry.artifact_file else {})
+            provider = LlamaCppProvider(
+                store, artifact_files=files,
+                providers_dir=self._root.providers_path)
+        else:
+            return None
+        with self._lock:
+            self._llm_providers[pid] = provider
+        return provider
+
+    def remove_model_artifacts(self, principal: Principal,
+                               alias: str) -> None:
+        """Remove pulled artifacts for a declared alias; the registry
+        declaration stays, so the route can be re-pulled (CLI parity)."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+        with self._lock:
+            busy = any(d == f"pull {alias}"
+                       for d in self._admin_detail.values())
+        if busy:
+            raise PlatformError(ErrorCode.CAPACITY_LIMITED,
+                                f"pull in progress: {alias}")
+        entries = self._registry_entries()
+        match = next((e for e in entries if e.profile.alias == alias), None)
+        if match is None or match.profile.source is None:
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"alias not declared: {alias}")
+        ModelStore(self._root).remove(match.profile.source,
+                                      match.artifact_file)
+
+    def _registry_entries(self):
+        if not os.path.isfile(self._root.registry_path):
+            return []
+        payload = self._root.read_json(self._root.registry_path)
+        return parse_registry(payload) if payload else []
+
+    def catalog_status(self) -> dict:
+        """Installable catalog + declared/pulled state + provider env."""
+        from . import catalog
+        store = ModelStore(self._root)
+        declared = {e.profile.alias: e for e in self._registry_entries()}
+        entries = []
+        for e, eligible, reason in catalog.available_entries():
+            reg = declared.get(e.alias)
+            artifact_file = (reg.artifact_file if reg is not None
+                             else e.artifact_file)
+            entries.append({
+                "alias": e.alias, "provider": e.provider,
+                "summary": e.summary,
+                "purposes": list(e.purposes),
+                "capabilities": list(e.capabilities),
+                "approxBytes": e.approx_bytes,
+                "eligible": eligible, "reason": reason,
+                "declared": reg is not None,
+                "ready": (store.is_ready(e.source, artifact_file)
+                          if e.source else True)})
+        env_py = os.path.join(self._root.providers_path,
+                              "oap-env", "bin", "python")
+        return {"entries": entries,
+                "providerEnvInstalled": os.path.isfile(env_py)}
+
+    def set_operator(self, model_alias: str) -> None:
+        """Enable the runtime Operator on an alias, persisting the choice
+        so the next serve applies it without a flag."""
+        self.register_runtime_operator(model_alias)
+        config = self._read_config()
+        config["enableOperator"] = True
+        config["operatorModel"] = model_alias
+        self._root.write_json(config, self._root.config_path)
+
+    def clear_operator(self) -> None:
+        service = getattr(self, "agent_service", None)
+        if service is not None:
+            service.unregister_runtime_operator()
+        config = self._read_config()
+        config["enableOperator"] = False
+        config.pop("operatorModel", None)
+        self._root.write_json(config, self._root.config_path)
+
+    def unregister_runtime_operator(self) -> None:
+        self.clear_operator()
+
+    def _read_config(self) -> dict:
+        config = self._root.read_json(self._root.config_path)
+        return config if isinstance(config, dict) else {}
+
     # -- status ------------------------------------------------------------
 
     def status_snapshot(self) -> dict:
@@ -265,6 +532,7 @@ class PlatformSupervisor:
                 "counts": {
                     "activeInference": len(self._active),
                     "pendingInference": len(self._pending),
+                    "adminActive": len(self._admin_jobs),
                     "inferenceBlocked": self._inference_blocked,
                     "inferenceCapacity": (PlatformLimits.ACTIVE_INFERENCE
                                           + PlatformLimits.PENDING_INFERENCE),
@@ -679,6 +947,16 @@ class PlatformSupervisor:
             self._dispatch_locked()
 
     def _cancel_job_record(self, job_id: str, error: PlatformError) -> None:
+        admin = self._admin_jobs.get(job_id)
+        if admin is not None:
+            if admin.state == JobState.ACTIVE:
+                admin.state = JobState.CANCEL_REQUESTED
+                admin.updated_at = time.time()
+                self._persist(admin)
+                token = self._job_tokens.get(job_id)
+                if token is not None:
+                    token.cancel()
+            return
         for i, job in enumerate(self._pending):
             if job.id == job_id:
                 job = self._pending.pop(i)
@@ -772,6 +1050,8 @@ class PlatformSupervisor:
             for job in list(self._pending):
                 self._cancel_job_record(job.id, reason)
             for job in list(self._active.values()):
+                self._cancel_job_record(job.id, reason)
+            for job in list(self._admin_jobs.values()):
                 self._cancel_job_record(job.id, reason)
 
     def cancel_children_for_resource_denial(self) -> None:

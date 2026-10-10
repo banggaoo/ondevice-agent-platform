@@ -139,10 +139,12 @@ class ModelStore:
             shutil.rmtree(directory)
 
     def pull(self, source: ModelSource, artifact_file: str | None = None,
-             progress=None) -> dict:
+             progress=None, should_stop=None) -> dict:
         """Enumerate the repo tree, download each needed file into staging,
         verify size + sha256 (LFS pointer when the hub reports one), record
-        a manifest, then rename into place."""
+        a manifest, then rename into place. `should_stop` is consulted
+        between chunks and files; a true answer aborts the pull as
+        CANCELLED and cleans staging."""
         listing = self._list_files(source)
         if artifact_file:
             listing = [f for f in listing if f["name"] == artifact_file]
@@ -168,6 +170,8 @@ class ModelStore:
         manifest_files = []
         try:
             for info in listing:
+                if should_stop is not None and should_stop():
+                    raise PlatformError(ErrorCode.CANCELLED)
                 name = info["name"]
                 if not _safe_relative(name):
                     raise PlatformError(ErrorCode.STORAGE_FAILURE,
@@ -176,7 +180,7 @@ class ModelStore:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 sha = self._download(source, name, dest,
                                      info.get("oid"), info.get("size"),
-                                     report)
+                                     report, should_stop)
                 if info.get("size") is not None \
                         and os.path.getsize(dest) != info["size"]:
                     raise PlatformError(ErrorCode.STORAGE_FAILURE,
@@ -237,7 +241,8 @@ class ModelStore:
             return None
 
     def _download(self, source: ModelSource, name: str, dest: str,
-                  expected_oid, expected_size, progress) -> str:
+                  expected_oid, expected_size, progress,
+                  should_stop=None) -> str:
         url = f"{HF_RESOLVE}/{source.repo}/resolve/{source.revision}/{name}"
         req = urllib.request.Request(url, headers={"User-Agent": "oap/1.0"})
         digest = hashlib.sha256()
@@ -246,6 +251,8 @@ class ModelStore:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as r, \
                     open(dest, "wb") as out:
                 while True:
+                    if should_stop is not None and should_stop():
+                        raise PlatformError(ErrorCode.CANCELLED)
                     chunk = r.read(_CHUNK)
                     if not chunk:
                         break
