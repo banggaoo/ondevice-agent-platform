@@ -324,9 +324,13 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                     else m.role.value)
             msg: dict = {"role": role}
             if m.images:
+                # Image markers lead the turn: Gemma 4 grounds measurably
+                # worse when instructions precede the image (hallucinated
+                # points for absent elements) - image-first restores
+                # correct localization.
                 msg["content"] = (
-                    [{"type": "text", "text": t} for t in m.parts]
-                    + [{"type": "image"} for _ in m.images])
+                    [{"type": "image"} for _ in m.images]
+                    + [{"type": "text", "text": t} for t in m.parts])
             else:
                 msg["content"] = m.combined_text or None
             if m.tool_calls:

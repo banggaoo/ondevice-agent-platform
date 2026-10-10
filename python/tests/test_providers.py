@@ -110,14 +110,12 @@ class TestMLXValidate(unittest.TestCase):
         req = _request(presence_penalty=0.0, frequency_penalty=0.0)
         self.provider.validate(req, self.profile)
 
-    def test_forced_tool_choice_refused(self):
+    def test_forced_tool_choice_best_effort(self):
         req = _request(tools=[TOOL], tool_choice=ToolChoice.REQUIRED)
-        raises(ErrorCode.INVALID_REQUEST,
-               self.provider.validate, req, self.profile)
+        self.provider.validate(req, self.profile)
         req = _request(tools=[TOOL],
                        tool_choice=NamedToolChoice("read_file"))
-        raises(ErrorCode.INVALID_REQUEST,
-               self.provider.validate, req, self.profile)
+        self.provider.validate(req, self.profile)
 
     def test_auto_and_none_tool_choice_allowed(self):
         for choice in (ToolChoice.AUTO, ToolChoice.NONE, None):
@@ -269,8 +267,10 @@ class TestMlxVlmPath(unittest.TestCase):
         self.assertEqual([m["role"] for m in sent],
                          ["system", "user", "assistant", "user"])
         content = sent[1]["content"]
-        self.assertEqual(content[0], {"type": "text", "text": "first"})
-        self.assertEqual(content[1], {"type": "image"})
+        # Image markers lead the turn's content: Gemma 4's grounding
+        # degrades when instructions precede the image.
+        self.assertEqual(content[0], {"type": "image"})
+        self.assertEqual(content[1], {"type": "text", "text": "first"})
         self.assertEqual(captured["template_kwargs"]["num_images"], 1)
         self.assertTrue(
             captured["template_kwargs"]["add_generation_prompt"])
@@ -303,8 +303,8 @@ class TestMlxVlmPath(unittest.TestCase):
         self.assertEqual([i.raw for i in images], [_PNG, other])
         self.assertEqual(captured["load_image_inputs"], [_PNG, other])
         contents = [m["content"] for m in captured["template_messages"]]
-        self.assertEqual(contents[0][-1], {"type": "image"})
-        self.assertEqual(contents[2][-1], {"type": "image"})
+        self.assertEqual(contents[0][0], {"type": "image"})
+        self.assertEqual(contents[2][0], {"type": "image"})
         self.assertEqual(captured["template_kwargs"]["num_images"], 2)
 
     def test_sampling_and_seed_forwarded(self):
@@ -383,6 +383,17 @@ class TestMlxVlmPath(unittest.TestCase):
         tools = captured["template_kwargs"].get("tools")
         self.assertIsNotNone(tools)
         self.assertEqual(tools[0]["function"]["name"], "read_file")
+
+    def test_named_tool_choice_narrows_schemas(self):
+        provider = _installed_provider(vlm=True)
+        other = ChatToolSpec(name="write_file",
+                             parameters={"type": "object", "properties": {}})
+        req = _request(tools=[TOOL, other],
+                       tool_choice=NamedToolChoice("read_file"))
+        _, captured = self._complete(provider, req)
+        tools = captured["template_kwargs"].get("tools")
+        self.assertEqual([t["function"]["name"] for t in tools],
+                         ["read_file"])
 
     def test_tool_result_turn_preserved(self):
         provider = _installed_provider(vlm=True)

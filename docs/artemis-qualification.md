@@ -142,7 +142,16 @@ budget is 280 soft tokens (~224px), which crushed high-res
 screenshots to unreadable 224x224; 1120 is the model's designed
 maximum (posemb 10240 >= 1120*9 patches). Verified live: a
 2240x2240 dense-text image consumed 1109 prompt tokens and the
-model read the grid contents. OCR-tier behavior verified live earlier
+model read the grid contents. Same day: `_vlm_messages` now emits
+image markers before text parts - Gemma 4 grounding degraded
+measurably when instructions preceded the image (hallucinated
+points for absent elements, e.g. `[939, 211]` for a missing "App
+Store icon" instead of `[]`). Verified live post-fix: absent
+object -> `[]`, present object -> localized `[953, 611]` JSON.
+Note: a hand-edit to the pulled artifact's `processor_config.json`
+(14:19) broke manifest size validation -> `provider_unavailable`
+503s; the artifact was restored pristine and `imageMaxSoftTokens`
+is the sanctioned bump path. OCR-tier behavior verified live earlier
 (`"TOTAL"` no-usage direct answers; `"Red"`/`"black"` escalations).
 
 **OCR serving contract (2026-10-09, verified):** the platform's
