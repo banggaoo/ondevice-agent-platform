@@ -52,6 +52,15 @@ class _Container:
         self.last_used = time.time()
 
 
+class _Load:
+    """One in-flight container load: provider-owned, shared by waiters."""
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.thread = None
+        self.container = None
+        self.error = None
+
+
 class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     provider_id = MLX_PROVIDER_ID
 
@@ -60,6 +69,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         self._containers: dict[str, _Container] = {}
         self._epochs: dict[str, int] = {}
         self._serving: dict[str, int] = {}
+        self._loads: dict[str, _Load] = {}
         self._profiles: list = []
         self._lock = threading.Lock()
 
@@ -152,6 +162,51 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "strict json schema is not enforced by "
                                 "this provider")
 
+    def _ensure_container(self, profile, token):
+        """Return the resident container, joining or starting a
+        provider-owned load when needed.
+
+        The blocking model load runs on a dedicated daemon thread, not the
+        job's worker: a request whose caller disconnects mid-load stops
+        waiting immediately (a confirmable CANCELLED), while the load still
+        completes and caches the container for the next caller. Concurrent
+        callers for the same alias share one in-flight load.
+        """
+        with self._lock:
+            container = self._containers.get(profile.alias)
+            if container is not None:
+                return container
+            load = self._loads.get(profile.alias)
+            if load is None:
+                load = _Load()
+                self._loads[profile.alias] = load
+                load.thread = threading.Thread(
+                    target=self._load_worker, args=(profile, load),
+                    daemon=True, name=f"oap-mlx-load-{profile.alias}")
+                load.thread.start()
+        while not load.event.wait(0.25):
+            if token is not None and token.is_cancelled:
+                raise PlatformError(ErrorCode.CANCELLED)
+            if not load.thread.is_alive():
+                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                    "model load worker ended without result")
+        if token is not None and token.is_cancelled:
+            raise PlatformError(ErrorCode.CANCELLED)
+        if load.error is not None:
+            raise load.error
+        return load.container
+
+    def _load_worker(self, profile, load: "_Load") -> None:
+        try:
+            load.container = self._container_for(profile)
+        except Exception as exc:
+            load.error = exc
+        finally:
+            with self._lock:
+                if self._loads.get(profile.alias) is load:
+                    del self._loads[profile.alias]
+            load.event.set()
+
     def _container_for(self, profile):
         if profile.source is None or not self._store.is_ready(profile.source):
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
@@ -213,10 +268,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         with self._lock:
             self._serving_add(profile.alias)
         try:
-            with self._lock:
-                container = self._containers.get(profile.alias)
-            if container is None:
-                container = self._container_for(profile)
+            container = self._ensure_container(profile, token)
             flag = threading.Event()
             observer = (token.observe(flag.set)
                         if token is not None else None)

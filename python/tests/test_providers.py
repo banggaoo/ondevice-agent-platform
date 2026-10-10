@@ -496,6 +496,86 @@ class TestMlxTextPath(unittest.TestCase):
         self.assertEqual(result.finish_reason, FinishReason.STOP)
 
 
+class TestEnsureContainer(unittest.TestCase):
+    """Provider-owned deduplicated load: waiters share one in-flight load;
+    a cancelled waiter unwinds while the load still caches the result."""
+
+    def setUp(self):
+        self.provider = MLXProvider(_FakeStore())
+        self.profile = _profile()
+
+    def _fake_load(self, delay, calls):
+        container = mlx_provider._Container(
+            types.SimpleNamespace(), types.SimpleNamespace(), False)
+
+        def fake(profile):
+            calls.append(1)
+            time.sleep(delay)
+            self.provider._containers[profile.alias] = container
+            return container
+        self.provider._container_for = fake
+        return container
+
+    def test_waiters_share_one_load(self):
+        calls = []
+        container = self._fake_load(0.1, calls)
+        results = []
+        threads = [threading.Thread(
+            target=lambda: results.append(
+                self.provider._ensure_container(self.profile, None)))
+            for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(results[0], container)
+        self.assertIs(results[1], container)
+
+    def test_cancelled_waiter_unwinds_load_still_caches(self):
+        calls = []
+        container = self._fake_load(0.15, calls)
+        token = CancellationToken()
+        caught = []
+
+        def wait():
+            try:
+                self.provider._ensure_container(self.profile, token)
+            except PlatformError as e:
+                caught.append(e)
+
+        t = threading.Thread(target=wait)
+        t.start()
+        time.sleep(0.03)
+        token.cancel()
+        t.join(5)
+        self.assertEqual(len(caught), 1)
+        self.assertEqual(caught[0].code, ErrorCode.CANCELLED)
+        deadline = time.time() + 2
+        while ("m" not in self.provider._containers
+               and time.time() < deadline):
+            time.sleep(0.01)
+        self.assertIs(self.provider._containers["m"], container)
+        self.assertEqual(len(calls), 1)
+
+    def test_load_error_reaches_waiters(self):
+        def boom(profile):
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "model artifact not pulled")
+        self.provider._container_for = boom
+        raises(ErrorCode.PROVIDER_UNAVAILABLE,
+               self.provider._ensure_container, self.profile, None)
+
+    def test_cancelled_after_load_completes_still_refuses(self):
+        calls = []
+        self._fake_load(0.0, calls)
+        token = CancellationToken()
+        token.cancel()
+        raises(ErrorCode.CANCELLED,
+               self.provider._ensure_container, self.profile, token)
+
+
 class TestAppleValidate(unittest.TestCase):
     def setUp(self):
         self.provider = AppleFoundationProvider()

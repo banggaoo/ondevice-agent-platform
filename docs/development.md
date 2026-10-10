@@ -1227,3 +1227,25 @@ against template defaults (qwen3 templates honor the same flag; their
 `<think>` strip stays as a safety net). Verified live: `gemma4-e4b`
 vision (`"Red"`), text (`391` direct, no reasoning preamble), and
 `qwen3.8-9b` (`PONG`) - the kwarg is accepted harmlessly everywhere.
+
+## Provider-owned model loads (2026-10-10)
+
+Cold-load wart fixed: previously the blocking `vlm.load`/`lm.load` ran on
+the job's worker thread, so a client disconnect mid-load could not be
+confirmed - the job sat CANCELLATION_UNCONFIRMED and `_inference_blocked`
+refused all new submissions for the rest of the (40s+) load, and the
+completed load was then thrown away with the dead job.
+
+`MLXProvider._ensure_container` now runs the load on a provider-owned
+daemon thread (`_loads` per alias, deduplicated); job workers wait on the
+load's event and unwind on cancellation. A disconnect mid-load resolves
+CANCELLED immediately (confirmable - no latch), while the load still
+completes and caches the container for the next caller. Eviction-during-
+load stays guarded by the existing epoch check; a load thread that ends
+without a result reports provider_unavailable to its waiters.
+
+Verified live on :8080: disconnect 3s into a `gemma4-e4b` cold load ->
+job `cancelled` (confirmed, `inferenceBlocked` stayed false); the
+immediately-following request joined the shared load/cache and answered
+`"OK"`. Previously this exact sequence latched `inferenceBlocked` and
+503'd until restart. Suite: 253/253.
