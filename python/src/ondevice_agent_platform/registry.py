@@ -17,7 +17,7 @@ _TOP_KEYS = {"schemaVersion", "models"}
 _MODEL_KEYS = {
     "alias", "kind", "task", "provider", "purposes", "capabilities",
     "inputSchema", "outputSchema", "maxInputBytes", "maxOutputTokens",
-    "linear", "source", "delegate",
+    "imageMaxSoftTokens", "linear", "source", "delegate",
 }
 
 MLX_PROVIDER_ID = "mlx"
@@ -213,11 +213,20 @@ def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
         if not isinstance(max_out, int) or not (0 < max_out <= 32768):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "maxOutputTokens out of bounds")
+    img_tokens = obj.get("imageMaxSoftTokens")
+    if img_tokens is not None:
+        if not isinstance(img_tokens, int) or not (0 < img_tokens <= 8192):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "imageMaxSoftTokens out of bounds")
+        if "vision" not in capabilities:
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                "imageMaxSoftTokens requires vision capability")
     return RegistryEntry(profile=ModelProfile(
         alias=alias, provider_id=provider, kind=ModelKind.LLM, task=task,
         purposes=tuple(purposes), capabilities=tuple(capabilities),
         max_input_bytes=max_input, max_output_tokens=max_out,
-        source=source),
+        image_max_soft_tokens=img_tokens, source=source),
         artifact_file=artifact_file, delegate=delegate)
 
 

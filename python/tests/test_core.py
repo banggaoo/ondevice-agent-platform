@@ -222,6 +222,25 @@ class TestRegistry(unittest.TestCase):
         raises(ErrorCode.INVALID_REQUEST, parse_registry,
                {"schemaVersion": 1, "models": [bad]})
 
+    def test_image_max_soft_tokens_valid(self):
+        entry = dict(self.LLM, capabilities=["text", "vision"],
+                     imageMaxSoftTokens=1120)
+        entries = parse_registry({"schemaVersion": 1, "models": [entry]})
+        self.assertEqual(
+            entries[0].profile.image_max_soft_tokens, 1120)
+
+    def test_image_max_soft_tokens_requires_vision(self):
+        bad = dict(self.LLM, imageMaxSoftTokens=1120)
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
+    def test_image_max_soft_tokens_bounds(self):
+        for value in (0, -1, 8193, "1120"):
+            bad = dict(self.LLM, capabilities=["text", "vision"],
+                       imageMaxSoftTokens=value)
+            raises(ErrorCode.INVALID_REQUEST, parse_registry,
+                   {"schemaVersion": 1, "models": [bad]})
+
     def test_linear_valid(self):
         entries = parse_registry({"schemaVersion": 1, "models": [{
             "alias": "clf", "kind": "ml", "provider": "builtin.linear",

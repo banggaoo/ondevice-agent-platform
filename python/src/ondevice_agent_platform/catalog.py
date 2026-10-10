@@ -29,12 +29,13 @@ class CatalogModel:
     source: ModelSource
     requires: RouteRequirements
     artifact_file: str | None = None   # single-file GGUF selection
+    image_max_soft_tokens: int | None = None
 
     def registry_value(self) -> dict:
         source = {"repo": self.source.repo, "revision": self.source.revision}
         if self.artifact_file:
             source["file"] = self.artifact_file
-        return {
+        value = {
             "alias": self.alias,
             "kind": "llm",
             "provider": self.provider,
@@ -44,6 +45,9 @@ class CatalogModel:
             "maxOutputTokens": self.max_output_tokens,
             "source": source,
         }
+        if self.image_max_soft_tokens is not None:
+            value["imageMaxSoftTokens"] = self.image_max_soft_tokens
+        return value
 
 
 ENTRIES: tuple[CatalogModel, ...] = (
@@ -83,6 +87,11 @@ ENTRIES: tuple[CatalogModel, ...] = (
         purposes=("vision", "reasoning"),
         capabilities=("text", "vision"),
         max_output_tokens=4096,
+        # Gemma4's default image budget is 280 soft tokens (~224px);
+        # 1120 is the model's designed max (posemb 10240 >= 1120*9
+        # patches) - high-res screens keep detail instead of being
+        # crushed to 224x224.
+        image_max_soft_tokens=1120,
         approx_bytes=5_200_000_000,
         source=ModelSource(
             repo="mlx-community/gemma-4-e4b-it-4bit",

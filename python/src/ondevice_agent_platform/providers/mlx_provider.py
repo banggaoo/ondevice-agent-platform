@@ -143,10 +143,9 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 raise PlatformError(
                     ErrorCode.INVALID_REQUEST,
                     f"{name} is not expressible on the mlx route")
-        if isinstance(request.tool_choice, NamedToolChoice) \
-                or request.tool_choice == ToolChoice.REQUIRED:
-            raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                "forced tool choice is not guaranteed")
+        # Forced tool choice (REQUIRED / NamedToolChoice) is best-effort here:
+        # a named choice is enforced by forwarding only that tool's schema so
+        # the grammar can only name it; REQUIRED degrades to AUTO behaviour.
         rf = request.response_format
         if rf is not None and rf.strict is True:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
@@ -174,6 +173,24 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                     "mlx-vlm not installed")
             model, processor = vlm.load(path)
+            budget = profile.image_max_soft_tokens
+            if budget is not None:
+                # Raise the image token budget for processors that size
+                # images by soft-token patches (Gemma4's
+                # max_soft_tokens: 70/140/280/560/1120). The prompt's
+                # expansion strings must be rebuilt or the fallback path
+                # would expand <image> at the stale default.
+                ip = getattr(processor, "image_processor", None)
+                if ip is not None and hasattr(ip, "max_soft_tokens"):
+                    ip.max_soft_tokens = budget
+                if hasattr(processor, "image_seq_length"):
+                    processor.image_seq_length = budget
+                if all(hasattr(processor, a) for a in
+                        ("boi_token", "eoi_token", "image_token")):
+                    processor.full_image_sequence = (
+                        f"{processor.boi_token}"
+                        f"{processor.image_token * budget}"
+                        f"{processor.eoi_token}")
         else:
             lm = _import_mlx_lm()
             if lm is None:
@@ -248,14 +265,19 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
 
     def _tool_schemas(self, request) -> list | None:
         # tool_choice=none suppresses schema forwarding AND any parsed
-        # tool calls; validate() already refused forced choices.
+        # tool calls. A named choice forwards only that tool's schema so the
+        # model can only emit that function name.
         if not request.tools or request.tool_choice == ToolChoice.NONE:
             return None
+        tools = request.tools
+        if isinstance(request.tool_choice, NamedToolChoice):
+            tools = [t for t in request.tools
+                     if t.name == request.tool_choice.name]
         return [
             {"type": "function",
              "function": {"name": t.name, "description": t.description,
                           "parameters": t.parameters or {}}}
-            for t in request.tools]
+            for t in tools]
 
     def _complete_text(self, container, request, profile, flag) -> ChatResult:
         lm = _import_mlx_lm()
@@ -404,23 +426,39 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                     args = {}
                     for am in re.finditer(
                             r'(\w+)\s*:\s*(?:' + _Q + r'(.*?)' + _Q
-                            + r'|"([^"]*)"|([^,}]+))',
+                            + r'|"([^"]*)"|((?:[^,}]|,(?!\s*\w+\s*:))*))',
                             match.group(2), re.DOTALL):
+                        value = None
                         if am.group(2) is not None:
-                            args[am.group(1)] = am.group(2)
+                            value = am.group(2)
                         elif am.group(3) is not None:
-                            args[am.group(1)] = am.group(3)
+                            value = am.group(3)
                         else:
                             raw = am.group(4).strip()
+                            # Unquoted values may arrive wrapped in the
+                            # model's own |...| borders instead of the
+                            # quote tokens; drop the border chars.
+                            if raw.startswith("|") and raw.endswith("|"):
+                                raw = raw[1:-1].strip()
                             try:
-                                args[am.group(1)] = _json.loads(raw)
+                                value = _json.loads(raw)
                             except _json.JSONDecodeError:
-                                args[am.group(1)] = raw
+                                value = raw
+                        if isinstance(value, str):
+                            # Gemma writes check-line keywords as
+                            # "verify@end:"/"assert@end:"; align with the
+                            # declared "<kw>:" form.
+                            value = re.sub(r'\b(verify|assert)@end(?=:)',
+                                           r'\1', value)
+                        args[am.group(1)] = value
                     calls.append(ChatToolCall(name=match.group(1),
                                               arguments=args))
             if calls:
                 content = re.sub(r'<think>.*?</think>', '', text,
                                  flags=re.DOTALL)
+                content = re.sub(
+                    r'<\|channel>.*?<channel\|>', '', content,
+                    flags=re.DOTALL)
                 content = re.sub(
                     r'\x3c\x7ctool_call\x3e.*?\x3ctool_call\x7c\x3e',
                     '', content, flags=re.DOTALL).strip()

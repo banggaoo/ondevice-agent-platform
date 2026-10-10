@@ -43,6 +43,9 @@ class ModelProfile:
     capabilities: tuple = ()
     max_input_bytes: int | None = None
     max_output_tokens: int | None = None
+    # VLM image token budget (mlx-vlm soft-token cap, e.g. Gemma4's
+    # max_soft_tokens); None = the model's own default.
+    image_max_soft_tokens: int | None = None
     source: ModelSource | None = None
 
 

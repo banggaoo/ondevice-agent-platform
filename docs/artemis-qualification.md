@@ -136,7 +136,13 @@ its delegate for the rest. User direction: "vision-hybrid is only for
 ocr, others should gemma". Live verification: gemma grounding on
 synthetic input returned plausible coordinates (`250, 500` vs true
 `203, 687`) - real-UI grid conformance is unverified; `qwen-vl` stays
-the verified-grid fallback. OCR-tier behavior verified live earlier
+the verified-grid fallback. `gemma4-e4b` declares
+`imageMaxSoftTokens: 1120` (2026-10-09): Gemma4's default image
+budget is 280 soft tokens (~224px), which crushed high-res
+screenshots to unreadable 224x224; 1120 is the model's designed
+maximum (posemb 10240 >= 1120*9 patches). Verified live: a
+2240x2240 dense-text image consumed 1109 prompt tokens and the
+model read the grid contents. OCR-tier behavior verified live earlier
 (`"TOTAL"` no-usage direct answers; `"Red"`/`"black"` escalations).
 
 **OCR serving contract (2026-10-09, verified):** the platform's
