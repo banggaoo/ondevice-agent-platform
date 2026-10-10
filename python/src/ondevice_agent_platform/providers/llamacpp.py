@@ -189,6 +189,17 @@ class LlamaCppProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 self._servers.pop(a).stop()
         return len(idle)
 
+    def evict_alias(self, alias: str) -> bool:
+        """Artifact removal: drop the resident server and bump the epoch
+        so an in-flight spawn discards its result."""
+        with self._lock:
+            self._epochs[alias] = self._epochs.get(alias, 0) + 1
+            server = self._servers.pop(alias, None)
+        if server is not None:
+            server.stop()
+            return True
+        return False
+
     def _serving_add(self, alias: str) -> None:
         self._serving[alias] = self._serving.get(alias, 0) + 1
 

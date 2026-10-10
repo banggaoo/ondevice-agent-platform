@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from . import __version__
 from .agents import AgentStopReason, PromptBlock
 from .cancellation import CancellationToken
 from .errors import ErrorCode, PlatformError
@@ -192,7 +193,7 @@ class ACPService:
             },
             "authMethods": [],
             "agentInfo": {"name": "ondevice-agent-platform",
-                          "version": "0.2.0-py"},
+                          "version": f"{__version__}-py"},
         }
 
     def _session_new(self, conn: _Conn, params) -> dict:

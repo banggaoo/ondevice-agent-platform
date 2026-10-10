@@ -18,7 +18,7 @@ _TOP_KEYS = {
     "model", "messages", "stream", "stream_options", "max_tokens",
     "max_completion_tokens", "temperature", "top_p", "seed",
     "presence_penalty", "frequency_penalty", "response_format",
-    "tools", "tool_choice", "n", "stop",
+    "tools", "tool_choice", "n", "stop", "parallel_tool_calls",
 }
 _MESSAGE_KEYS = {"role", "content", "tool_calls", "tool_call_id"}
 _PART_KEYS = {"type", "text", "image_url"}
@@ -392,7 +392,7 @@ def chat_response(result, requested_model: str) -> dict:
     message: dict = {"role": "assistant", "content": result.content or None}
     if result.tool_calls:
         message["tool_calls"] = [
-            {"id": c.id or f"call_{i}", "type": "function",
+            {"id": c.id or f"call_{uuid.uuid4().hex[:24]}", "type": "function",
              "function": {"name": c.name,
                           "arguments": json.dumps(c.arguments)}}
             for i, c in enumerate(result.tool_calls)]
@@ -431,7 +431,8 @@ def stream_frames(result, requested_model: str,
         delta["content"] = result.content
     if result.tool_calls:
         delta["tool_calls"] = [
-            {"index": i, "id": c.id or f"call_{i}", "type": "function",
+            {"index": i, "id": c.id or f"call_{uuid.uuid4().hex[:24]}",
+             "type": "function",
              "function": {"name": c.name,
                           "arguments": json.dumps(c.arguments)}}
             for i, c in enumerate(result.tool_calls)]

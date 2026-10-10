@@ -200,6 +200,26 @@ class TestPullDeclareRemove(unittest.TestCase):
         _declare_fake(self.sup)
         self.sup.remove_model_artifacts(ADMIN, "fake-pull")
 
+    def test_remove_evicts_resident_container(self):
+        # A removed alias must not keep serving from a resident
+        # container: providers are asked to evict it.
+        _declare_fake(self.sup)
+        evicted = []
+
+        class Evicting(FakeLLM):
+            provider_id = "mlx"
+
+            def evict_alias(self, alias):
+                evicted.append(alias)
+                return True
+
+        self.sup.register_model(
+            ModelProfile(alias="fake-pull", provider_id="mlx",
+                         kind=ModelKind.LLM, task="chat"),
+            provider=Evicting())
+        self.sup.remove_model_artifacts(ADMIN, "fake-pull")
+        self.assertEqual(evicted, ["fake-pull"])
+
     def test_remove_unknown_alias(self):
         with self.assertRaises(PlatformError) as cm:
             self.sup.remove_model_artifacts(ADMIN, "no-such")

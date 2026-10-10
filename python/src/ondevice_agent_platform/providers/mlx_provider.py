@@ -124,6 +124,14 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                 del self._containers[a]
         return len(idle)
 
+    def evict_alias(self, alias: str) -> bool:
+        """Artifact removal: drop the resident container and bump the
+        epoch so any in-flight load discards its result. Requests already
+        holding the container finish on their own reference."""
+        with self._lock:
+            self._epochs[alias] = self._epochs.get(alias, 0) + 1
+            return self._containers.pop(alias, None) is not None
+
     def _serving_add(self, alias: str) -> None:
         self._serving[alias] = self._serving.get(alias, 0) + 1
 
@@ -509,6 +517,25 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                         args[am.group(1)] = value
                     calls.append(ChatToolCall(name=match.group(1),
                                               arguments=args))
+            if not calls:
+                # Hermes/Qwen-style markup: <tool_call> wraps
+                # <function=name> with <parameter=key>value</parameter>
+                # pairs (qwen chat templates emit this form).
+                for match in re.finditer(
+                        r'<tool_call>\s*<function=([\w.-]+)>'
+                        r'(.*?)</function>\s*</tool_call>',
+                        text, re.DOTALL):
+                    args = {}
+                    for pm in re.finditer(
+                            r'<parameter=([^>]+)>(.*?)</parameter>',
+                            match.group(2), re.DOTALL):
+                        raw = pm.group(2).strip()
+                        try:
+                            args[pm.group(1).strip()] = _json.loads(raw)
+                        except _json.JSONDecodeError:
+                            args[pm.group(1).strip()] = raw
+                    calls.append(ChatToolCall(name=match.group(1),
+                                              arguments=args))
             if calls:
                 content = re.sub(r'<think>.*?</think>', '', text,
                                  flags=re.DOTALL)
@@ -517,7 +544,10 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                     flags=re.DOTALL)
                 content = re.sub(
                     r'\x3c\x7ctool_call\x3e.*?\x3ctool_call\x7c\x3e',
-                    '', content, flags=re.DOTALL).strip()
+                    '', content, flags=re.DOTALL)
+                content = re.sub(
+                    r'<tool_call>.*?</tool_call>', '', content,
+                    flags=re.DOTALL).strip()
         if calls:
             reason = FinishReason.TOOL_CALLS
         elif finish == "length":

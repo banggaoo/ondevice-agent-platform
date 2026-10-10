@@ -8,9 +8,25 @@ version = "0.2.0"
 description = "Local-first, deterministic agent and model serving platform"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
+authors = [{ name = "James Bang" }]
+keywords = ["local-inference", "llm", "agent", "mlx", "on-device"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Repository = "https://github.com/banggaoo/ondevice-agent-platform"
 
 [project.optional-dependencies]
-mlx = ["mlx-lm>=0.28"]
+mlx = ["mlx-lm==0.32.0", "mlx-vlm==0.7.6"]
 
 [project.scripts]
 ondevice-agent-platform = "ondevice_agent_platform.cli:main"

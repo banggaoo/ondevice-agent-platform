@@ -28,7 +28,7 @@ from .modelstore import ModelStore
 from .registry import (APPLE_PROVIDER_ID, MLX_PROVIDER_ID,
                        LLAMACPP_PROVIDER_ID, VLLMMLX_PROVIDER_ID,
                        VISIONHYBRID_PROVIDER_ID, parse_registry)
-from . import resources
+from . import __version__, resources
 from .state import JobKind, JobRecord, JobState, StateStore
 
 
@@ -449,6 +449,15 @@ class PlatformSupervisor:
                                 f"alias not declared: {alias}")
         ModelStore(self._root).remove(match.profile.source,
                                       match.artifact_file)
+        # Delete first, then evict: the epoch bump lands after any
+        # in-flight load's captured epoch, so its result discards
+        # instead of caching a removed artifact's container.
+        with self._lock:
+            providers = list(self._llm_providers.values())
+        for prov in providers:
+            evict = getattr(prov, "evict_alias", None)
+            if callable(evict):
+                evict(alias)
 
     def _registry_entries(self):
         if not os.path.isfile(self._root.registry_path):
@@ -549,7 +558,7 @@ class PlatformSupervisor:
             snap = self._latest_snapshot
             verdict = resources.evaluate(snap, time.time())
             return {
-                "version": "0.2.0-py",
+                "version": f"{__version__}-py",
                 "resource": {
                     "thermal": snap.thermal.value,
                     "memoryPressure": snap.memory_pressure.value,

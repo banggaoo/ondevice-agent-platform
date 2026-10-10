@@ -434,6 +434,24 @@ class TestMlxVlmPath(unittest.TestCase):
                          {"path": "fixture.txt"})
         self.assertEqual(result.content, "")
 
+    def test_hermes_tool_call_markup_parsed(self):
+        # qwen chat templates emit Hermes markup: <tool_call> wrapping
+        # <function=name><parameter=k>v</parameter></function>; the
+        # parser must lift it or consumers see undispatchable XML.
+        text = ("<tool_call>\n<function=get_weather>\n"
+                "<parameter=city>\nSeoul\n</parameter>\n"
+                "<parameter=units>\"celsius\"</parameter>\n"
+                "</function>\n</tool_call>")
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.finish_reason, FinishReason.TOOL_CALLS)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "get_weather")
+        self.assertEqual(result.tool_calls[0].arguments,
+                         {"city": "Seoul", "units": "celsius"})
+        self.assertEqual(result.content, "")
+
 
 class TestMlxTextPath(unittest.TestCase):
     def test_sampler_params_and_result(self):
@@ -574,6 +592,16 @@ class TestEnsureContainer(unittest.TestCase):
         token.cancel()
         raises(ErrorCode.CANCELLED,
                self.provider._ensure_container, self.profile, token)
+
+    def test_evict_alias_drops_container_and_blocks_reuse(self):
+        calls = []
+        self._fake_load(0.0, calls)
+        self.provider._ensure_container(self.profile, None)
+        self.assertIn("m", self.provider._containers)
+        self.assertTrue(self.provider.evict_alias("m"))
+        self.assertNotIn("m", self.provider._containers)
+        self.assertFalse(self.provider.evict_alias("m"))
+        self.assertTrue(self.provider.requires_load(self.profile))
 
 
 class TestAppleValidate(unittest.TestCase):

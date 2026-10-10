@@ -1325,3 +1325,25 @@ mid-download, resolved `cancelled` with staging cleaned and
 a console question through the lazily-created ACP bridge, then disabled
 - profile and config cleared. Headless-Chrome render of the Models view
 shows both new cards correctly. Suite: 281/281 (+28 admin tests).
+
+Release-prep fixes (2026-10-10): real-use probes against the live
+daemon found two defects now fixed. (1) Hermes-style tool markup
+(`<tool_call><function=NAME><parameter=K>v</parameter></function>
+</tool_call>`, emitted by qwen3.8-9b's chat template) leaked through
+as plain assistant text; the MLX result parser now recognizes it,
+extracts the call into structured `tool_calls`, strips the markup
+from content, and reports `FinishReason.TOOL_CALLS`. (2) Artifact
+removal reported `artifactReady: false` but the provider's resident
+container kept serving inference from memory; supervisor removal now
+deletes artifacts then evicts the alias on all caching providers
+(MLX in-memory, llamacpp/vllm-mlx subprocess servers) - MLX eviction
+bumps the alias epoch so an in-flight shared load cannot repopulate
+the removed model. Release-hardening: `version` in status + ACP
+agentInfo now derives from `__version__` instead of a hardcoded
+string; pyproject gained authors/keywords/classifiers/urls and its
+`mlx` extra now matches the frozen pins. Live-verified on :8080:
+tool_calls return structured with `finish_reason: tool_calls`;
+post-remove request fails `provider_unavailable`; SIGKILLed in-flight
+job marks `interrupted` on restart; ACP stdio facade, console
+pull/cancel/remove/operator, daemon lock refusals all correct.
+Suite: 287/287.
