@@ -227,12 +227,40 @@ class TestPullDeclareRemove(unittest.TestCase):
     def test_catalog_status_shape(self):
         status = self.sup.catalog_status()
         self.assertIn("providerEnvInstalled", status)
+        self.assertIn("providerPinsReady", status)
+        self.assertFalse(status["providerEnvInstalled"])
+        self.assertFalse(status["providerPinsReady"])
         aliases = {e["alias"] for e in status["entries"]}
         for entry in catalog.ENTRIES:
             self.assertIn(entry.alias, aliases)
         for e in status["entries"]:
             self.assertIn(e["declared"], (True, False))
             self.assertIn(e["ready"], (True, False))
+
+    def test_install_provider_env_admin_job(self):
+        from ondevice_agent_platform import cli as platform_cli
+        calls = []
+        with mock.patch.object(platform_cli, "_ensure_provider_env",
+                               lambda root, install_pins:
+                               calls.append(install_pins)):
+            self.sup._env_probe = (time.time(), False)
+            job = self.sup.install_provider_env(ADMIN)
+            done = _wait_state(self.sup, job.id, {JobState.COMPLETED,
+                                                  JobState.FAILED})
+        self.assertEqual(done.state, JobState.COMPLETED)
+        self.assertEqual(calls, [True])
+        self.assertIsNone(self.sup._env_probe)
+
+    def test_install_provider_env_failure_marks_failed(self):
+        from ondevice_agent_platform import cli as platform_cli
+
+        def boom(root, install_pins):
+            raise PlatformError(ErrorCode.STORAGE_FAILURE, "pip failed")
+
+        with mock.patch.object(platform_cli, "_ensure_provider_env", boom):
+            job = self.sup.install_provider_env(ADMIN)
+            done = _wait_state(self.sup, job.id, {JobState.FAILED})
+        self.assertEqual(done.state, JobState.FAILED)
 
 
 class TestOperatorToggle(unittest.TestCase):
@@ -370,6 +398,17 @@ class TestAdminRoutes(unittest.TestCase):
         r = self._mutate("/api/console/models/remove",
                          {"alias": "fake-pull"})
         self.assertEqual(r.status, 200)
+
+    def test_provider_install_route(self):
+        from ondevice_agent_platform import cli as platform_cli
+        with mock.patch.object(platform_cli, "_ensure_provider_env",
+                               lambda root, install_pins: None):
+            r = self._mutate("/api/console/provider/install", {})
+        self.assertEqual(r.status, 200)
+        body = json.loads(r.read())
+        done = _wait_state(self.sup, body["jobId"],
+                           {JobState.COMPLETED, JobState.FAILED})
+        self.assertEqual(done.state, JobState.COMPLETED)
 
     def test_operator_enable_disable(self):
         r = self._mutate("/api/console/operator", {"model": "m2"})

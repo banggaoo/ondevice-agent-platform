@@ -105,6 +105,7 @@ class PlatformSupervisor:
         self._admin_jobs: dict[str, JobRecord] = {}
         self._admin_detail: dict[str, str] = {}
         self._admin_progress: dict[str, float] = {}
+        self._env_probe: tuple[float, bool] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -455,6 +456,42 @@ class PlatformSupervisor:
         payload = self._root.read_json(self._root.registry_path)
         return parse_registry(payload) if payload else []
 
+    def install_provider_env(self, principal: Principal) -> JobRecord:
+        """Daemon-side provider env setup: the identical governed path
+        as `provider install` (structural checks, frozen pins, probe
+        verification), run as an admin job since the daemon owns the
+        root's lifetime lock."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+
+        def work(token, progress):
+            from . import cli
+            cli._ensure_provider_env(self._root, install_pins=True)
+            with self._lock:
+                self._env_probe = None
+
+        return self.submit_admin(principal, "provider env install", work)
+
+    def _provider_env_state(self) -> tuple[bool, bool]:
+        """(env installed, provider pins ready). The pin check shells
+        the env interpreter's importlib.metadata - cached briefly and
+        invalidated by env installs."""
+        env_py = os.path.join(self._root.providers_path,
+                              "oap-env", "bin", "python")
+        if not os.path.isfile(env_py):
+            return (False, False)
+        with self._lock:
+            cached = self._env_probe
+        if cached is not None and time.time() - cached[0] < 10:
+            return (True, cached[1])
+        from . import cli
+        ready = False
+        probe = cli._probe_provider_env(env_py)
+        if probe is not None:
+            ready = not cli._missing_pins(probe.get("packages", {}))
+        with self._lock:
+            self._env_probe = (time.time(), ready)
+        return (True, ready)
+
     def catalog_status(self) -> dict:
         """Installable catalog + declared/pulled state + provider env."""
         from . import catalog
@@ -475,10 +512,10 @@ class PlatformSupervisor:
                 "declared": reg is not None,
                 "ready": (store.is_ready(e.source, artifact_file)
                           if e.source else True)})
-        env_py = os.path.join(self._root.providers_path,
-                              "oap-env", "bin", "python")
+        env_installed, pins_ready = self._provider_env_state()
         return {"entries": entries,
-                "providerEnvInstalled": os.path.isfile(env_py)}
+                "providerEnvInstalled": env_installed,
+                "providerPinsReady": pins_ready}
 
     def set_operator(self, model_alias: str) -> None:
         """Enable the runtime Operator on an alias, persisting the choice

@@ -84,17 +84,18 @@
     <div class="card">
       <h2>Install models</h2>
       <p id="env-missing" class="error" role="status" hidden>
-        The provider runtime env is not installed. Run
-        <code>ondevice-agent-platform provider install</code> (or
-        <code>install --serve</code>) - env changes cannot be applied from
-        inside the running daemon.
+        <span id="env-missing-text"></span>
+        <button type="button" id="env-install" class="rowbtn" hidden>
+          install provider runtime</button>
       </p>
       <p id="catalog-status" class="error" role="status" hidden></p>
       <ul id="catalog-list" class="plain"></ul>
       <p class="hint">Pulls run governed: declared source + pinned
         revision, staged download, verified manifest. Remove deletes
         artifacts only - the registry declaration stays for re-pull.
-        Nothing is downloaded at inference time.</p>
+        Nothing is downloaded at inference time. The provider runtime
+        install uses the same pinned env as
+        <code>provider install</code>.</p>
     </div>
 
     <div class="card">

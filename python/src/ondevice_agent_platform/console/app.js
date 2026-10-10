@@ -305,10 +305,35 @@ function actionButton(label, fn) {
 }
 
 function renderCatalog(cat, registry, jobs) {
-  $("env-missing").hidden = !cat || cat.providerEnvInstalled !== false;
+  const entries = (cat && cat.entries) || [];
+  /* The env banner only nags when an eligible catalog route actually
+   * needs the managed env (mlx/vllm-mlx); a Windows/Linux host whose
+   * catalog is llamacpp-only sees no false warning. */
+  const needsEnv = entries.some((e) => e.eligible
+    && (e.provider === "mlx" || e.provider === "vllm-mlx"));
+  const envJob = jobs.find((j) => j.kind === "admin"
+    && j.detail === "provider env install"
+    && ["active", "cancel_requested"].includes(j.state));
+  const envEl = $("env-missing");
+  if (envJob) {
+    envEl.hidden = false;
+    setText("env-missing-text",
+            "Installing provider runtime (mlx-lm, mlx-vlm, vllm-mlx)…");
+    $("env-install").hidden = true;
+  } else if (needsEnv && (!cat
+      || cat.providerEnvInstalled !== true
+      || cat.providerPinsReady !== true)) {
+    envEl.hidden = false;
+    setText("env-missing-text", cat && cat.providerEnvInstalled
+      ? "Provider runtime deps are missing (mlx-lm, mlx-vlm, vllm-mlx) - "
+        + "inference serves provider-unavailable until installed."
+      : "The provider runtime env is not installed.");
+    $("env-install").hidden = false;
+  } else {
+    envEl.hidden = true;
+  }
   const ul = $("catalog-list");
   ul.textContent = "";
-  const entries = (cat && cat.entries) || [];
   const profiles = (registry.modelProfiles || []);
   const shown = new Set();
   for (const e of entries.slice(0, 50)) {
@@ -385,6 +410,9 @@ function renderOperator(registry) {
 }
 
 function initOperator() {
+  $("env-install").addEventListener("click", () => {
+    modelMutation("/api/console/provider/install", {});
+  });
   $("op-enable").addEventListener("click", () => {
     const model = $("op-model").value;
     if (model) {

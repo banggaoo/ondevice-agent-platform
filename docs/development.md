@@ -1294,9 +1294,29 @@ Design:
   bind; `install --serve` chains into `serve --open` after the env
   finishes, so a fresh `install --serve` is the whole setup path (env ->
   daemon -> console, then pull models and enable the Operator from the
-  page). Provider env changes stay CLI-only: the running daemon holds
-  the root's lifetime lock, so the console surfaces env status
-  (`providerEnvInstalled`) but cannot install it itself.
+  page).
+- Provider env install runs daemon-side as the same admin lane:
+  `POST /api/console/provider/install` -> `install_provider_env` ->
+  `submit_admin("provider env install")` -> `cli._ensure_provider_env`
+  with the frozen pins - the identical governed path as `provider
+  install`, safe because the daemon already owns the root's lifetime
+  lock and provider packages load lazily. `/api/catalog` reports
+  `providerEnvInstalled` + `providerPinsReady` (a cached
+  importlib.metadata probe, invalidated by installs), and the console
+  banner offers the install only when an eligible catalog route needs
+  the env.
+
+Fresh-root verification (2026-10-10): `~/.ondevice-agent-platform`
+moved aside, `bin/ondevice-agent-platform install` rebuilt env +
+package + `~/.local/bin` script, `serve` booted empty with the
+first-run hint. Through the console API: `provider env install` admin
+job ran the real pinned pip install (vllm-mlx 0.5.0, mlx-lm 0.32.0,
+mlx-vlm 0.7.6 + deps) to `completed`; `pull qwen-vl` declared +
+downloaded 1.8 GB to `completed`; `/v1/chat/completions` answered
+`"READY"`; Operator enabled on `qwen-vl`, answered, disabled. Prior
+model artifacts were restored by file copy (manifest-verified, no
+re-download); a restart reconciled live registrations with the restored
+registry.json. Suite: 284/284.
 
 Live-verified on :8080 (2026-10-10): catalog route reports real
 declared/ready/eligible state; pull submitted as `admin` job, cancelled

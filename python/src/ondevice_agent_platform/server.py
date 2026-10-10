@@ -209,6 +209,8 @@ class Router:
             return self._console_pull(req)
         if method == "POST" and path == "/api/console/models/remove":
             return self._console_remove(req)
+        if method == "POST" and path == "/api/console/provider/install":
+            return self._console_provider_install(req)
         if method == "POST" and path == "/api/console/operator":
             return self._console_operator(req)
         if method == "POST" and path == "/api/console/operator/prompt":
@@ -336,6 +338,12 @@ class Router:
         alias = self._console_body_alias(req)
         self._s.remove_model_artifacts(LocalConsumers.ADMINISTRATION, alias)
         return _Response.json({"ok": True})
+
+    def _console_provider_install(self, req: _Request) -> _Response:
+        self._require_console_session(req, mutation=True)
+        self._consumer_rate_limit("console-admin")
+        job = self._s.install_provider_env(LocalConsumers.ADMINISTRATION)
+        return _Response.json({"jobId": job.id, "state": job.state.value})
 
     def _console_operator(self, req: _Request) -> _Response:
         self._require_console_session(req, mutation=True)
