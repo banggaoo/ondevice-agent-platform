@@ -1384,3 +1384,20 @@ preflights `context.model_ready(alias)` and emits an actionable
 provider-unavailable. `maxOutputTokens` is omitted from persisted
 agent specs when unset. `agent list` reports bound-model state offline
 via the registry + artifact manifest. Suite: 314 tests.
+
+Agent capability round (2026-10-17): ACP session/prompt now accepts
+image blocks (base64 + image/* mimeType) and embedded resource blocks
+(text content joins the prompt labelled by uri; image/* blobs map to
+image blocks; other blobs reject cleanly), and resource_link blocks
+render as markdown references instead of being silently dropped.
+Prompt-level image count/bytes match the chat caps before queueing;
+initialize advertises image + embeddedContext. Custom chat agents keep
+a bounded in-memory transcript per session (12 turns / 24 KiB, oldest
+trimmed) recorded only on completed turns - sessions are real
+conversations within a daemon lifetime; restart resumes the session
+with an empty transcript. The Operator stays stateless: its harness
+never reads history. Images never enter the transcript (text only).
+Live-verified on :8080: a vision-bound custom agent described a real
+base64 PNG ("The image is red."), and a remembered fact answered
+correctly in-turn while a fresh session had no memory. Suite: 321+
+tests.

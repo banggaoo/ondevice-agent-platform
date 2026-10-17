@@ -12,7 +12,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .chat import ChatMessage, ChatRequest, ChatRole, FinishReason
+from .chat import (ChatImage, ChatMessage, ChatRequest, ChatRole,
+                   FinishReason)
 from .errors import ErrorCode, PlatformError
 from .limits import PlatformLimits
 from .profiles import AgentProfile
@@ -35,9 +36,28 @@ class AgentEventKind(enum.Enum):
 
 @dataclass
 class PromptBlock:
-    kind: str                # "text" | "resource_link"
+    kind: str                # "text" | "resource_link" | "image"
     text: str = ""
     uri: str = ""
+    image: "ChatImage | None" = None
+
+
+def prompt_text(blocks) -> str:
+    """The text a text-consuming harness sends for a turn: text blocks
+    plus resource-link references rendered as markdown links (uris are
+    client-provided labels, never fetched)."""
+    parts = []
+    for b in blocks:
+        if b.kind == "text":
+            parts.append(b.text)
+        elif b.kind == "resource_link" and b.uri:
+            parts.append(f"[{b.text or b.uri}]({b.uri})")
+    return "\n".join(parts).strip()
+
+
+def prompt_images(blocks) -> list:
+    return [b.image for b in blocks
+            if b.kind == "image" and b.image is not None]
 
 
 @dataclass
@@ -48,6 +68,11 @@ class AgentSession:
     connection_id: str
     created_at: float
     prompt_active: bool = False
+    # Bounded in-memory turn transcript ({"role","text"}), trimmed to
+    # PlatformLimits.AGENT_SESSION_*; not persisted - a restarted daemon
+    # resumes the session with an empty transcript.
+    transcript: list = field(default_factory=list)
+    transcript_bytes: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +200,9 @@ class CustomChatHarness:
     """Owner-declared general chat agent: a named profile with its own
     system prompt bound to a declared model alias. Same contract as the
     Operator minus the status snapshot - one bounded model call per turn,
-    no tools, no authority, no conversation state."""
+    no tools, no authority - plus a bounded per-session transcript so a
+    session is a real conversation. Image blocks pass through to the
+    bound model; validate_chat enforces vision capability and limits."""
     id = "custom.chat"
     version = 1
     DEFAULT_MAX_OUTPUT_TOKENS = 1024
@@ -188,9 +215,9 @@ class CustomChatHarness:
                      or self.DEFAULT_MAX_OUTPUT_TOKENS)
 
     def run(self, input_blocks, context, emit) -> AgentStopReason:
-        text = "\n".join(b.text for b in input_blocks
-                         if b.kind == "text").strip()
-        if not text:
+        text = prompt_text(input_blocks)
+        images = prompt_images(input_blocks)
+        if not text and not images:
             emit("message_chunk", "Nothing to answer.")
             return AgentStopReason.REFUSAL
         if context.is_cancelled():
@@ -204,7 +231,13 @@ class CustomChatHarness:
         if self._system:
             messages.append(ChatMessage(role=ChatRole.SYSTEM,
                                         parts=[self._system]))
-        messages.append(ChatMessage(role=ChatRole.USER, parts=[text]))
+        for entry in context.history():
+            role = (ChatRole.USER if entry["role"] == "user"
+                    else ChatRole.ASSISTANT)
+            messages.append(ChatMessage(role=role,
+                                        parts=[entry["text"]]))
+        messages.append(ChatMessage(role=ChatRole.USER, parts=[text],
+                                    images=images))
         try:
             result = context.complete(ChatRequest(
                 model=self._alias, messages=messages,
@@ -409,6 +442,35 @@ class AgentService:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "harness missing")
         return entry[0]()
+
+    def transcript(self, session_id: str) -> list:
+        """Copy of the session's bounded turn transcript for harness
+        use; [] for unknown or never-prompted sessions."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            return list(session.transcript) if session else []
+
+    def record_turn(self, session_id: str, user_text: str,
+                    assistant_text: str) -> None:
+        """Append a completed turn to the session transcript, trimming
+        oldest entries past the turn/byte bounds. Images never enter the
+        transcript - history is text only."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            for role, text in (("user", user_text),
+                               ("assistant", assistant_text)):
+                if text:
+                    session.transcript.append({"role": role,
+                                               "text": text})
+                    session.transcript_bytes += len(text.encode())
+            max_entries = 2 * PlatformLimits.AGENT_SESSION_TURNS
+            while (len(session.transcript) > max_entries
+                   or session.transcript_bytes >
+                   PlatformLimits.AGENT_SESSION_TRANSCRIPT_BYTES):
+                old = session.transcript.pop(0)
+                session.transcript_bytes -= len(old["text"].encode())
 
     def set_prompt_active(self, session_id: str, active: bool) -> None:
         with self._lock:

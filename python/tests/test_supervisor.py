@@ -928,6 +928,122 @@ class TestCustomChatHarness(unittest.TestCase):
         self.assertEqual(result["result"]["stopReason"], "refusal")
         self.assertEqual(self.llm.calls, 0)
 
+    _PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQ"
+                "VR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+    def _prompt(self, sid, blocks, conn="c1", msg_id=3):
+        out = self.rpc({"jsonrpc": "2.0", "id": msg_id,
+                        "method": "session/prompt",
+                        "params": {"sessionId": sid, "prompt": blocks}},
+                       conn=conn)
+        result = [m for m in out if m.get("id") == msg_id][0]
+        notes = [m for m in out if m.get("method") == "session/update"]
+        return result, notes
+
+    def _session(self, agent="helper", conn="c1"):
+        out = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                        "params": {"cwd": "/tmp", "mcpServers": []}},
+                       conn=conn)
+        return out[0]["result"]["sessionId"]
+
+    def test_image_block_reaches_vision_model(self):
+        self.sup.register_model(
+            ModelProfile(alias="vm", provider_id="fake-llm",
+                         kind=ModelKind.LLM, task="chat",
+                         capabilities=("text", "vision")),
+            provider=self.llm)
+        self.sup.add_custom_agent(
+            LocalConsumers.ADMINISTRATION, "vista", "vm")
+        self.acp.bind("c9", "vista", LocalConsumers.AGENT)
+        sid = self._session(agent="vista", conn="c9")
+        result, _ = self._prompt(sid, [
+            {"type": "image", "data": self._PNG_B64,
+             "mimeType": "image/png"},
+            {"type": "text", "text": "what is this?"}], conn="c9")
+        self.assertEqual(result["result"]["stopReason"], "end_turn")
+        last = self.llm.requests[-1]
+        self.assertEqual(len(last.messages[-1].images), 1)
+        self.assertEqual(last.messages[-1].images[0].media_type,
+                         "image/png")
+
+    def test_image_on_text_only_model_errors(self):
+        sid = self._session()
+        result, notes = self._prompt(sid, [
+            {"type": "image", "data": self._PNG_B64,
+             "mimeType": "image/png"},
+            {"type": "text", "text": "look"}])
+        self.assertIn("error", json.dumps(result))
+        self.assertTrue(any("unavailable" in json.dumps(n).lower()
+                            for n in notes))
+
+    def test_resource_blocks_feed_context(self):
+        sid = self._session()
+        result, _ = self._prompt(sid, [
+            {"type": "resource",
+             "resource": {"uri": "file:///x.py", "text": "def f(): pass"}},
+            {"type": "resource_link", "uri": "file:///y.py",
+             "name": "y.py"},
+            {"type": "text", "text": "explain"}])
+        self.assertEqual(result["result"]["stopReason"], "end_turn")
+        sent = self.llm.requests[-1].messages[-1].combined_text
+        self.assertIn("def f(): pass", sent)
+        self.assertIn("file:///x.py", sent)
+        self.assertIn("[y.py](file:///y.py)", sent)
+        self.assertIn("explain", sent)
+
+    def test_bad_blocks_rejected(self):
+        sid = self._session()
+        for blocks in ([{"type": "image", "data": "!!!",
+                         "mimeType": "image/png"}],
+                       [{"type": "image", "data": self._PNG_B64,
+                         "mimeType": "text/plain"}],
+                       [{"type": "resource",
+                         "resource": {"uri": "x", "blob": "AA==",
+                                      "mimeType": "text/plain"}}],
+                       [{"type": "audio", "data": "AA=="}]):
+            result, _ = self._prompt(sid, blocks)
+            self.assertIn("error", json.dumps(result), blocks)
+
+    def test_session_transcript_feeds_next_turn(self):
+        sid = self._session()
+        self._prompt(sid, [{"type": "text", "text": "first question"}])
+        result, _ = self._prompt(
+            sid, [{"type": "text", "text": "follow up"}])
+        self.assertEqual(result["result"]["stopReason"], "end_turn")
+        msgs = self.llm.requests[-1].messages
+        texts = [m.combined_text for m in msgs]
+        roles = [m.role for m in msgs]
+        self.assertIn("first question", texts)
+        self.assertIn("pong", texts)
+        self.assertIn("follow up", texts)
+        self.assertEqual(roles[1], ChatRole.USER)
+        self.assertEqual(roles[2], ChatRole.ASSISTANT)
+
+    def test_error_turns_are_not_recorded(self):
+        self.sup.register_model(
+            ModelProfile(alias="unready", provider_id="unready-llm",
+                         kind=ModelKind.LLM, task="chat"),
+            provider=FakeUnreadyLLM())
+        self.sup.add_custom_agent(
+            LocalConsumers.ADMINISTRATION, "needy", "unready")
+        self.acp.bind("c8", "needy", LocalConsumers.AGENT)
+        sid = self._session(agent="needy", conn="c8")
+        self._prompt(sid, [{"type": "text", "text": "hi"}], conn="c8")
+        self.assertEqual(
+            self.agents.transcript(sid), [])
+
+    def test_transcript_is_bounded(self):
+        from unittest import mock
+        from ondevice_agent_platform.limits import PlatformLimits
+        sid = self._session()
+        with mock.patch.object(PlatformLimits, "AGENT_SESSION_TURNS", 1):
+            for i in range(3):
+                self._prompt(sid, [{"type": "text", "text": f"q{i}"}])
+        transcript = self.agents.transcript(sid)
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(transcript[-1]["role"], "assistant")
+        self.assertNotIn("q0", json.dumps(transcript))
+
     def test_uninstalled_model_reports_actionable_error(self):
         self.sup.register_model(
             ModelProfile(alias="unready", provider_id="unready-llm",

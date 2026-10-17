@@ -1,11 +1,13 @@
 """ACP service: the private bridge endpoint's JSON-RPC handling, mirroring
 ACPService.swift. Connections bind to one agent profile; the v1 subset is
-initialize/session-new/prompt/cancel with text and resource-link blocks.
-Turn cancellation, run slots, and emission gating mirror the actor model
-with locks and daemon threads.
+initialize/session-new/prompt/cancel with text, resource-link, embedded
+text-resource, and image blocks. Turn cancellation, run slots, and
+emission gating mirror the actor model with locks and daemon threads.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import threading
 import time
@@ -13,7 +15,8 @@ import uuid
 from dataclasses import dataclass
 
 from . import __version__
-from .agents import AgentStopReason, PromptBlock
+from .agents import AgentStopReason, PromptBlock, prompt_text
+from .chat import ChatImage
 from .cancellation import CancellationToken
 from .errors import ErrorCode, PlatformError
 from .limits import PlatformLimits
@@ -46,6 +49,51 @@ def _rpc_code(error: PlatformError) -> int:
         ErrorCode.FORBIDDEN: -32602,
         ErrorCode.UNAUTHORIZED: -32602,
     }.get(error.code, -32603)
+
+
+def _image_block(raw: dict) -> ChatImage:
+    data = raw.get("data")
+    mime = raw.get("mimeType")
+    if not isinstance(data, str) or not isinstance(mime, str) \
+            or not mime.startswith("image/"):
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "image blocks require data + image/* mimeType")
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "image data must be base64")
+    if not decoded:
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "image data is empty")
+    return ChatImage(data=decoded, media_type=mime)
+
+
+def _embedded_resource(res: dict):
+    """An embedded `resource` block: text content becomes a text block
+    (labelled by its uri); image/* blobs become image blocks; other
+    blobs are rejected."""
+    text = res.get("text")
+    if isinstance(text, str):
+        uri = res.get("uri")
+        labelled = (f"{uri}\n{text}"
+                    if isinstance(uri, str) and uri else text)
+        return None, labelled
+    blob = res.get("blob")
+    mime = res.get("mimeType")
+    if isinstance(blob, str) and isinstance(mime, str) \
+            and mime.startswith("image/"):
+        try:
+            decoded = base64.b64decode(blob, validate=True)
+        except (binascii.Error, ValueError):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "resource blob must be base64")
+        if not decoded:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "resource blob is empty")
+        return ChatImage(data=decoded, media_type=mime), None
+    raise PlatformError(ErrorCode.INVALID_REQUEST,
+                        "resource blocks require text or image/* blob")
 
 
 @dataclass
@@ -187,8 +235,8 @@ class ACPService:
             "agentCapabilities": {
                 "loadSession": False,
                 "promptCapabilities": {
-                    "audio": False, "embeddedContext": False,
-                    "image": False, "video": False,
+                    "audio": False, "embeddedContext": True,
+                    "image": True, "video": False,
                 },
             },
             "authMethods": [],
@@ -238,7 +286,7 @@ class ACPService:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "prompt blocks required")
         blocks: list[PromptBlock] = []
-        total_text = 0
+        total_text = total_image_bytes = image_count = 0
         for raw in raw_blocks:
             if not isinstance(raw, dict) or not isinstance(raw.get("type"), str):
                 raise PlatformError(ErrorCode.INVALID_REQUEST, "bad block")
@@ -258,10 +306,31 @@ class ACPService:
                 blocks.append(PromptBlock(
                     kind="resource_link",
                     uri=uri, text=raw.get("name") or ""))
+            elif btype == "resource":
+                res = raw.get("resource")
+                if not isinstance(res, dict):
+                    raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                        "bad resource block")
+                image, t = _embedded_resource(res)
+                if image is not None:
+                    image_count += 1
+                    total_image_bytes += len(image.data)
+                    blocks.append(PromptBlock(kind="image", image=image))
+                else:
+                    total_text += len(t.encode())
+                    blocks.append(PromptBlock(kind="text", text=t))
+            elif btype == "image":
+                image = _image_block(raw)
+                image_count += 1
+                total_image_bytes += len(image.data)
+                blocks.append(PromptBlock(kind="image", image=image))
             else:
                 raise PlatformError(ErrorCode.INVALID_REQUEST,
                                     "unsupported block type")
         if total_text > PlatformLimits.AGENT_PROMPT_BYTES:
+            raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE)
+        if (image_count > PlatformLimits.CHAT_IMAGES_PER_REQUEST
+                or total_image_bytes > PlatformLimits.CHAT_IMAGE_BYTES):
             raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE)
         if token.is_cancelled:
             return cancelled_result
@@ -308,8 +377,9 @@ class ACPService:
                 # A cancel that landed during setup reaches the harness via
                 # the token; the stopReason rail reports cancelled normally.
                 context = _HarnessContext(
-                    self._s, conn.principal, run_id, flag, token)
-                stop, orphaned = self._run_with_deadline(
+                    self._s, conn.principal, run_id, flag, token,
+                    session.id)
+                stop, orphaned, emitted = self._run_with_deadline(
                     run_id, session, harness, blocks, context, flag,
                     token, emit)
                 flag.set()
@@ -325,6 +395,12 @@ class ACPService:
                 if orphaned is not None:
                     raise PlatformError(ErrorCode.DEADLINE_EXCEEDED,
                                         "agent turn deadline")
+                if stop in (AgentStopReason.END_TURN,
+                            AgentStopReason.MAX_TOKENS) and emitted:
+                    self._s.agent_service.record_turn(
+                        session.id,
+                        prompt_text(blocks) or "(image)",
+                        "".join(emitted))
                 if stop == AgentStopReason.ERROR:
                     raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                         "agent turn failed")
@@ -360,12 +436,15 @@ class ACPService:
                            context, flag, token, emit):
         """Race the harness against the turn deadline. On timeout the caller
         is answered a deadline error while the harness thread is cancelled
-        and kept quarantined until it actually finishes."""
+        and kept quarantined until it actually finishes. Returns
+        (stop, orphaned_thread, emitted_text)."""
+        emitted: list[str] = []
 
         def emitter(kind: str, text: str) -> None:
             if flag.is_set() or token.is_cancelled:
                 return
             if kind == "message_chunk":
+                emitted.append(text)
                 emit(_rpc_notification("session/update", {
                     "sessionId": session.id,
                     "update": {
@@ -390,8 +469,9 @@ class ACPService:
             flag.set()
             token.cancel()
             self._s.cancel_children(run_id)
-            return AgentStopReason.CANCELLED, thread
-        return result_box.get("stop", AgentStopReason.ERROR), None
+            return AgentStopReason.CANCELLED, thread, emitted
+        return (result_box.get("stop", AgentStopReason.ERROR),
+                None, emitted)
 
     def _session_cancel(self, conn: _Conn, params) -> None:
         if not isinstance(params, dict):
@@ -422,15 +502,24 @@ class _HarnessContext:
     + cooperative cancellation. No admin surface is exposed."""
 
     def __init__(self, supervisor, principal, run_id,
-                 flag: threading.Event, token: CancellationToken) -> None:
+                 flag: threading.Event, token: CancellationToken,
+                 session_id: str = "") -> None:
         self._s = supervisor
         self._principal = principal
         self._run_id = run_id
         self._flag = flag
         self._token = token
+        self._session_id = session_id
 
     def is_cancelled(self) -> bool:
         return self._flag.is_set() or self._token.is_cancelled
+
+    def history(self) -> list:
+        """The session's bounded prior-turn transcript
+        ([{"role","text"}]) for harnesses that converse; empty for a new
+        or restarted session."""
+        service = getattr(self._s, "agent_service", None)
+        return service.transcript(self._session_id) if service else []
 
     def status_snapshot(self) -> dict:
         return self._s.status_snapshot()

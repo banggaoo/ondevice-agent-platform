@@ -40,6 +40,10 @@ class PlatformLimits:
     CHAT_IMAGE_PIXELS = 8 * 1024 * 1024
     AGENT_PROMPT_BYTES = 16 * 1024
     AGENT_SYSTEM_PROMPT_BYTES = 8 * 1024
+    # Bounded per-session transcript fed back as conversation history
+    # (message pairs, oldest trimmed first).
+    AGENT_SESSION_TURNS = 12
+    AGENT_SESSION_TRANSCRIPT_BYTES = 24 * 1024
     CUSTOM_AGENTS = 8
     AGENT_DEADLINE_SECONDS = 120.0
     AGENT_GENERATED_TOKEN_RESERVATIONS = 2048
