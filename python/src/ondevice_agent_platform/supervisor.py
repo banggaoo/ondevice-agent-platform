@@ -143,6 +143,8 @@ class PlatformSupervisor:
             alias = self._options.get("reference_echo_model_alias")
             if alias:
                 self.agent_service.register_builtin_echo(model_alias=alias)
+        if self._options.get("enable_workspace_agent") and self.agent_service:
+            self.agent_service.register_builtin_workspace()
 
     def shutdown(self) -> None:
         # Order: stop resource callbacks (no re-entry after teardown),

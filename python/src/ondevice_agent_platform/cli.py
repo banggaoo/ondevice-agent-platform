@@ -528,6 +528,7 @@ def cmd_serve(args) -> int:
         supervisor._options = {
             "enable_reference_agent": args.enable_reference_agent,
             "reference_echo_model_alias": args.reference_echo_model,
+            "enable_workspace_agent": args.enable_workspace_agent,
         }
         bridge = None
         if args.enable_operator:
@@ -1223,6 +1224,9 @@ def build_parser() -> argparse.ArgumentParser:
     data_root(serve)
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--enable-reference-agent", action="store_true")
+    serve.add_argument("--enable-workspace-agent", action="store_true",
+                       help="serve the deterministic workspace.manage agent "
+                            "over ACP for external orchestrators")
     serve.add_argument("--reference-echo-model", default=None)
     serve.add_argument("--enable-apple-model", action="store_true")
     serve.add_argument("--enable-operator", action="store_true")

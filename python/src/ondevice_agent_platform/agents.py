@@ -8,9 +8,12 @@ code resolved by reference name - never arbitrary path loading.
 from __future__ import annotations
 
 import enum
+import json
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .chat import (ChatImage, ChatMessage, ChatRequest, ChatRole,
                    FinishReason)
@@ -143,6 +146,158 @@ class ReferenceEchoHarness:
                 return AgentStopReason.CANCELLED
             emit("message_chunk", f"Echo unavailable: {e.safe_message}")
             return AgentStopReason.ERROR
+
+
+# ---------------------------------------------------------------------------
+# workspace.manage — deterministic workspace manager for external
+# orchestrators (e.g. POH). Read-only: analyzes the managed workspace and
+# returns a management report; it never deletes or mutates anything.
+# ---------------------------------------------------------------------------
+
+_WS_PURGE_DIRS = (
+    "DerivedData", "node_modules", ".venv", "venv", "env",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "dist", "build", ".next", ".build", "Pods",
+)
+_WS_SKIP_DIRS = {".git", ".venv", "venv", "env", "node_modules",
+                 "__pycache__", ".pytest_cache", "Pods", "DerivedData",
+                 ".build", "build", "dist", ".next"}
+_WS_MAX_WALK_FILES = 4000
+
+
+def _ws_dir_size(path: Path) -> int:
+    total = 0
+    files = 0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_dir():
+                    stack.append(e)
+                elif e.is_file():
+                    files += 1
+                    if files > _WS_MAX_WALK_FILES:
+                        return total
+                    total += e.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _ws_git_state(path: Path) -> dict:
+    if not (path / ".git").exists():
+        return {}
+    def _git(*args: str) -> str:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True, text=True, timeout=15)
+            return out.stdout if out.returncode == 0 else ""
+        except Exception:
+            return ""
+    status = _git("status", "--porcelain=v1", "--branch")
+    lines = status.splitlines()
+    ahead = _git("rev-list", "--count", "@{u}..HEAD").strip()
+    return {
+        "branch": lines[0].lstrip("# ") if lines else "?",
+        "dirty_files": max(0, len(lines) - 1),
+        "unpushed_commits": int(ahead) if ahead.isdigit() else None,
+    }
+
+
+def manage_workspace(task: dict) -> dict:
+    """Read-only workspace analysis for the workspace.manage harness."""
+    workspace = Path(task.get("workspace") or "").expanduser()
+    report = {
+        "workspace": str(workspace),
+        "agent": WorkspaceManageHarness.id,
+        "ok": False,
+        "metrics": task.get("metrics") or {},
+        "findings": task.get("findings") or [],
+        "entries": [],
+        "purge_total_bytes": 0,
+        "actions": [],
+    }
+    if not workspace.is_dir():
+        report["error"] = f"workspace {workspace} is not a directory"
+        return report
+    report["ok"] = True
+    for child in sorted(workspace.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        purges = []
+        for name in _WS_PURGE_DIRS:
+            candidate = child / name
+            if candidate.is_dir():
+                purges.append({"path": str(candidate),
+                               "bytes": _ws_dir_size(candidate)})
+        entry = {
+            "name": child.name,
+            "path": str(child),
+            "purge_candidates": purges,
+            "reclaimable_bytes": sum(p["bytes"] for p in purges),
+            "git": _ws_git_state(child),
+        }
+        report["entries"].append(entry)
+        report["purge_total_bytes"] += entry["reclaimable_bytes"]
+    metrics = report["metrics"]
+    disk_status = str(metrics.get("disk_status") or "")
+    top = sorted(report["entries"], key=lambda e: e["reclaimable_bytes"],
+                 reverse=True)
+    if disk_status == "CRITICAL_LOW":
+        report["actions"].append({
+            "action": "purge",
+            "severity": "CRITICAL",
+            "detail": "reclaim cache/build directories to restore free disk",
+            "candidates": [
+                {"path": p["path"], "bytes": p["bytes"]}
+                for e in top[:5] for p in e["purge_candidates"]][:8],
+        })
+    if disk_status in ("LOW", "CRITICAL_LOW"):
+        report["actions"].append({
+            "action": "report",
+            "severity": "WARNING",
+            "detail": f"workspace holds {report['purge_total_bytes']/1e9:.1f} GB "
+                      "of reclaimable cache/build data",
+        })
+    dirty = [e["name"] for e in report["entries"]
+             if (e["git"].get("dirty_files") or 0) > 0]
+    unpushed = [f"{e['name']}({e['git']['unpushed_commits']})"
+                for e in report["entries"]
+                if (e["git"].get("unpushed_commits") or 0) > 0]
+    if dirty or unpushed:
+        report["actions"].append({
+            "action": "git_hygiene",
+            "severity": "WARNING",
+            "detail": f"dirty: {', '.join(dirty) or 'none'}; "
+                      f"unpushed: {', '.join(unpushed) or 'none'}",
+        })
+    return report
+
+
+class WorkspaceManageHarness:
+    """Deterministic workspace manager (no model call): the prompt is a
+    JSON task ({workspace, metrics, findings}) or a bare workspace path.
+    Returns a JSON management report — proposes actions, executes none."""
+    id = "workspace.manage"
+    version = 1
+
+    def run(self, input_blocks, context, emit) -> AgentStopReason:
+        text = prompt_text(input_blocks)
+        if not text:
+            emit("message_chunk", "No workspace task to evaluate.")
+            return AgentStopReason.REFUSAL
+        try:
+            task = json.loads(text)
+        except json.JSONDecodeError:
+            task = {"workspace": text.strip()}
+        emit("message_chunk", json.dumps(manage_workspace(task), indent=2))
+        return AgentStopReason.END_TURN
 
 
 class RuntimeOperatorHarness:
@@ -325,6 +480,16 @@ class AgentService:
                          implementation_ref="builtin:reference.status"),
             ReferenceStatusHarness,
             ReferenceStatusHarness.id, ReferenceStatusHarness.version)
+
+    def register_builtin_workspace(self) -> None:
+        self.register(
+            AgentProfile(id="workspace.manage", version=1,
+                         harness_id=WorkspaceManageHarness.id,
+                         harness_version=WorkspaceManageHarness.version,
+                         state_schema_version=1,
+                         implementation_ref="builtin:workspace.manage"),
+            WorkspaceManageHarness,
+            WorkspaceManageHarness.id, WorkspaceManageHarness.version)
 
     def register_builtin_echo(self, model_alias: str) -> None:
         self.register(
