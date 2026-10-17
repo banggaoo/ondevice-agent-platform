@@ -1067,6 +1067,51 @@ class TestCustomChatHarness(unittest.TestCase):
         self.assertTrue(
             any("not installed" in json.dumps(n) for n in notes))
 
+    def test_session_load_resumes_with_transcript(self):
+        sid = self._session()
+        self._prompt(sid, [{"type": "text", "text": "remember blue"}])
+        # Simulate the client connection dropping: the session leaves
+        # memory but stays in the ledger with its transcript.
+        self.acp.connection_closed("c1")
+        self.assertIsNone(self.agents.session(sid, "c", "c1"))
+        self.acp.bind("c3", "helper", LocalConsumers.AGENT)
+        out = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "session/load",
+                        "params": {"sessionId": sid, "cwd": "/tmp",
+                                   "mcpServers": []}}, conn="c3")
+        result = [m for m in out if m.get("id") == 9][0]
+        self.assertEqual(result["result"]["sessionId"], sid)
+        updates = [m["params"]["update"]["sessionUpdate"]
+                   for m in out if m.get("method") == "session/update"]
+        self.assertIn("user_message_chunk", updates)
+        self.assertIn("agent_message_chunk", updates)
+        # History carried over: the next prompt sees prior turns.
+        result, _ = self._prompt(
+            sid, [{"type": "text", "text": "again"}], conn="c3", msg_id=10)
+        self.assertEqual(result["result"]["stopReason"], "end_turn")
+        texts = [m.combined_text
+                 for m in self.llm.requests[-1].messages]
+        self.assertIn("remember blue", texts)
+
+    def test_session_load_rejections(self):
+        sid = self._session()
+        self.acp.bind("cx", "helper", LocalConsumers.AGENT)
+        # Live session on another connection cannot be adopted.
+        out = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "session/load",
+                        "params": {"sessionId": sid, "cwd": "/tmp",
+                                   "mcpServers": []}}, conn="cx")
+        self.assertIn("error", json.dumps(out))
+        # Unknown session.
+        out = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "session/load",
+                        "params": {"sessionId": "sess-999", "cwd": "/tmp",
+                                   "mcpServers": []}}, conn="cx")
+        self.assertIn("error", json.dumps(out))
+        # Same connection, same session: idempotent.
+        out = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "session/load",
+                        "params": {"sessionId": sid, "cwd": "/tmp",
+                                   "mcpServers": []}})
+        self.assertEqual([m for m in out if m.get("id") == 9][0]
+                         ["result"]["sessionId"], sid)
+
     def test_removed_agent_cannot_bind(self):
         self.sup.remove_custom_agent(
             LocalConsumers.ADMINISTRATION, "helper")
@@ -1118,6 +1163,79 @@ class TestSessionIdResume(unittest.TestCase):
         sup2, svc2 = boot()
         s2 = svc2.new_session("reference.status", "c", "conn2")
         self.assertEqual(s2.id, "sess-2")
+
+
+class TestSessionLoadAcrossRestart(unittest.TestCase):
+    """Persisted transcripts + session/load: a restarted daemon can
+    resume a prior session on a new connection with its history."""
+
+    def test_load_after_restart_replays_turns(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        def boot():
+            root = RuntimeRoot(tmp.name)
+            root.prepare()
+            root.acquire_lock()
+            self.addCleanup(lambda: _safe_release(root))
+            sup = PlatformSupervisor(root, FakeSource())
+            service = AgentService(sup)
+            service.attach(sup)
+            sup.register_model(
+                ModelProfile(alias="m", provider_id="fake-llm",
+                             kind=ModelKind.LLM, task="chat"),
+                provider=FakeLLM())
+            sup.start()
+            sup.add_custom_agent(LocalConsumers.ADMINISTRATION,
+                                 "a1", "m")
+            return sup, ACPService(sup)
+
+        sup1, acp1 = boot()
+        self.addCleanup(sup1.shutdown)
+        acp1.bind("b1", "a1", LocalConsumers.AGENT)
+        out = []
+        acp1.handle("b1", {"jsonrpc": "2.0", "id": 1,
+                           "method": "session/new",
+                           "params": {"cwd": "/tmp", "mcpServers": []}},
+                    None, out.append)
+        sid = out[0]["result"]["sessionId"]
+        out.clear()
+        acp1.handle("b1", {"jsonrpc": "2.0", "id": 2,
+                           "method": "session/prompt",
+                           "params": {"sessionId": sid, "prompt": [
+                               {"type": "text",
+                                "text": "the code word is indigo"}]}},
+                    None, out.append)
+        self.assertEqual([m for m in out if m.get("id") == 2][0]
+                         ["result"]["stopReason"], "end_turn")
+        sup1.shutdown()
+
+        sup2, acp2 = boot()
+        self.addCleanup(sup2.shutdown)
+        acp2.bind("b2", "a1", LocalConsumers.AGENT)
+        out.clear()
+        acp2.handle("b2", {"jsonrpc": "2.0", "id": 3,
+                           "method": "session/load",
+                           "params": {"sessionId": sid, "cwd": "/tmp",
+                                      "mcpServers": []}},
+                    None, out.append)
+        result = [m for m in out if m.get("id") == 3][0]
+        self.assertEqual(result["result"]["sessionId"], sid)
+        updates = [m["params"]["update"]["sessionUpdate"]
+                   for m in out if m.get("method") == "session/update"]
+        self.assertIn("user_message_chunk", updates)
+        self.assertIn("agent_message_chunk", updates)
+        # The resumed session's transcript feeds the next model call.
+        live = sup2.agent_service.transcript(sid)
+        self.assertIn("indigo", json.dumps(live))
+        out.clear()
+        acp2.handle("b2", {"jsonrpc": "2.0", "id": 4,
+                           "method": "session/prompt",
+                           "params": {"sessionId": sid, "prompt": [
+                               {"type": "text", "text": "again"}]}},
+                    None, out.append)
+        self.assertEqual([m for m in out if m.get("id") == 4][0]
+                         ["result"]["stopReason"], "end_turn")
 
 
 def _safe_release(root):

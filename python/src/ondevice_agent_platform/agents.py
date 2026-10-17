@@ -79,6 +79,15 @@ class AgentSession:
 # Harnesses: reviewed, compiled-in implementations.
 # ---------------------------------------------------------------------------
 
+def _trim_transcript(session: "AgentSession") -> None:
+    max_entries = 2 * PlatformLimits.AGENT_SESSION_TURNS
+    while (len(session.transcript) > max_entries
+           or session.transcript_bytes
+           > PlatformLimits.AGENT_SESSION_TRANSCRIPT_BYTES):
+        old = session.transcript.pop(0)
+        session.transcript_bytes -= len(old["text"].encode())
+
+
 OPERATOR_INSTRUCTIONS = (
     "You are the platform Operator, an optional read-only explainer of this "
     "local agent serving platform. You have no tool-execution authority and "
@@ -111,16 +120,21 @@ class ReferenceEchoHarness:
         self._alias = model_alias
 
     def run(self, input_blocks, context, emit) -> AgentStopReason:
-        text = "\n".join(b.text for b in input_blocks if b.kind == "text")
-        if not text.strip():
+        text = prompt_text(input_blocks)
+        if not text:
             emit("message_chunk", "Nothing to echo.")
             return AgentStopReason.REFUSAL
         if context.is_cancelled():
             return AgentStopReason.CANCELLED
+        messages = [ChatMessage(role=(ChatRole.USER
+                                      if e["role"] == "user"
+                                      else ChatRole.ASSISTANT),
+                                parts=[e["text"]])
+                    for e in context.history()]
+        messages.append(ChatMessage(role=ChatRole.USER, parts=[text]))
         try:
             result = context.complete(ChatRequest(
-                model=self._alias,
-                messages=[ChatMessage(role=ChatRole.USER, parts=[text])],
+                model=self._alias, messages=messages,
                 max_output_tokens=64, has_explicit_output_limit=True))
             emit("message_chunk", result.content)
             return AgentStopReason.END_TURN
@@ -465,12 +479,31 @@ class AgentService:
                     session.transcript.append({"role": role,
                                                "text": text})
                     session.transcript_bytes += len(text.encode())
-            max_entries = 2 * PlatformLimits.AGENT_SESSION_TURNS
-            while (len(session.transcript) > max_entries
-                   or session.transcript_bytes >
-                   PlatformLimits.AGENT_SESSION_TRANSCRIPT_BYTES):
-                old = session.transcript.pop(0)
-                session.transcript_bytes -= len(old["text"].encode())
+            _trim_transcript(session)
+
+    def adopt_session(self, session_id: str, agent_id: str,
+                      consumer_id: str, connection_id: str,
+                      transcript: list) -> AgentSession:
+        """session/load: bring a ledger-resident session live again on a
+        (possibly new) connection, with its persisted transcript."""
+        with self._lock:
+            if session_id in self._sessions:
+                raise PlatformError(ErrorCode.CONFLICT,
+                                    "session already active")
+            profile = self._profiles.get(agent_id)
+            if profile is None \
+                    or profile.implementation_ref not in self._harnesses:
+                raise PlatformError(ErrorCode.NOT_FOUND,
+                                    "agent not registered")
+            session = AgentSession(
+                id=session_id, profile=profile, consumer_id=consumer_id,
+                connection_id=connection_id, created_at=time.time())
+            session.transcript = [dict(e) for e in transcript]
+            session.transcript_bytes = sum(
+                len(e["text"].encode()) for e in session.transcript)
+            _trim_transcript(session)
+            self._sessions[session_id] = session
+            return session
 
     def set_prompt_active(self, session_id: str, active: bool) -> None:
         with self._lock:

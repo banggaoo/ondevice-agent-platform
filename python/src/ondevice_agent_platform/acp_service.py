@@ -181,6 +181,10 @@ class ACPService:
         elif method == "session/new":
             self._respond(conn, msg_id, is_notification,
                           lambda: self._session_new(conn, params), emit)
+        elif method == "session/load":
+            self._respond(conn, msg_id, is_notification,
+                          lambda: self._session_load(
+                              conn, params, emit), emit)
         elif method == "session/prompt":
             self._respond(conn, msg_id, is_notification,
                           lambda: self._session_prompt(
@@ -233,7 +237,7 @@ class ACPService:
         return {
             "protocolVersion": 1,
             "agentCapabilities": {
-                "loadSession": False,
+                "loadSession": True,
                 "promptCapabilities": {
                     "audio": False, "embeddedContext": True,
                     "image": True, "video": False,
@@ -267,6 +271,53 @@ class ACPService:
                                           conn.principal.id, time.time())
         except PlatformError:
             pass   # session ledger write is best-effort like job persistence
+        return {"sessionId": session.id}
+
+    def _session_load(self, conn: _Conn, params, emit) -> dict:
+        """ACP session/load: resume a ledger-resident session onto this
+        connection, replaying its persisted transcript as
+        session/update notifications before the result."""
+        if not isinstance(params, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "params required")
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "sessionId required")
+        cwd = params.get("cwd")
+        if not isinstance(cwd, str) or not cwd.startswith("/"):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "absolute cwd required")
+        mcp = params.get("mcpServers")
+        if not isinstance(mcp, list) or mcp:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "mcpServers array required")
+        live = self._s.agent_service.session(
+            session_id, conn.principal.id, conn.connection_id)
+        if live is not None:
+            return {"sessionId": session_id}   # already live here
+        row = self._s._store.session_row(session_id)
+        if row is None:
+            raise PlatformError(ErrorCode.NOT_FOUND, "session not found")
+        agent_id, consumer_id, _state = row
+        if agent_id != conn.agent_id or consumer_id != conn.principal.id:
+            raise PlatformError(ErrorCode.NOT_FOUND, "session not found")
+        turns = self._s._store.session_turns(session_id)
+        session = self._s.agent_service.adopt_session(
+            session_id, agent_id, conn.principal.id,
+            conn.connection_id, turns)
+        try:
+            self._s._store.reopen_session(session_id, time.time())
+        except PlatformError:
+            pass
+        for entry in session.transcript:
+            kind = ("user_message_chunk" if entry["role"] == "user"
+                    else "agent_message_chunk")
+            emit(_rpc_notification("session/update", {
+                "sessionId": session.id,
+                "update": {"sessionUpdate": kind,
+                           "content": {"type": "text",
+                                       "text": entry["text"]}}}))
         return {"sessionId": session.id}
 
     def _session_prompt(self, conn: _Conn, params,
@@ -397,10 +448,22 @@ class ACPService:
                                         "agent turn deadline")
                 if stop in (AgentStopReason.END_TURN,
                             AgentStopReason.MAX_TOKENS) and emitted:
+                    user_text = prompt_text(blocks)
+                    if any(b.kind == "image" for b in blocks):
+                        user_text = (user_text + "\n[image]"
+                                     if user_text else "[image]")
+                    assistant_text = "".join(emitted)
                     self._s.agent_service.record_turn(
-                        session.id,
-                        prompt_text(blocks) or "(image)",
-                        "".join(emitted))
+                        session.id, user_text, assistant_text)
+                    try:
+                        store = self._s._store
+                        now = time.time()
+                        store.record_session_turn(
+                            session.id, "user", user_text, now)
+                        store.record_session_turn(
+                            session.id, "assistant", assistant_text, now)
+                    except PlatformError:
+                        pass  # ledger writes are best-effort like sessions
                 if stop == AgentStopReason.ERROR:
                     raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                         "agent turn failed")

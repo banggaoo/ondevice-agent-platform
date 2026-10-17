@@ -1401,3 +1401,16 @@ Live-verified on :8080: a vision-bound custom agent described a real
 base64 PNG ("The image is red."), and a remembered fact answered
 correctly in-turn while a fresh session had no memory. Suite: 321+
 tests.
+
+Session history, persisted (2026-10-17): completed turns now write to a
+new session_turns ledger table (schema v2; same 12-turn bound as the
+in-memory transcript, trimmed on insert). ACP gains session/load with
+loadSession advertised true: a session closed by restart or a dropped
+connection rehydrates onto a new connection under the same
+principal+agent, replays persisted turns as user/agent message-chunk
+updates, and prompts continue with the restored transcript (live-
+verified across a real daemon restart: resumed sess-14 answered from
+its persisted context). Session ids and turns both survive restart.
+reference.echo also consumes the session transcript; the Operator
+stays stateless by contract. Image-attached turns record an "[image]"
+marker in history. Suite: 324+ tests.

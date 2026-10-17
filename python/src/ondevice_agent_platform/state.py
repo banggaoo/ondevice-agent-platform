@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from .errors import ErrorCode, PlatformError
 from .limits import PlatformLimits
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class JobKind(enum.Enum):
@@ -136,6 +136,15 @@ class StateStore:
                             state TEXT NOT NULL,
                             created_at REAL NOT NULL,
                             updated_at REAL NOT NULL
+                        )""")
+                    db.execute("""
+                        CREATE TABLE IF NOT EXISTS session_turns(
+                            session_id TEXT NOT NULL,
+                            seq INTEGER NOT NULL,
+                            role TEXT NOT NULL,
+                            text TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            PRIMARY KEY(session_id, seq)
                         )""")
                     db.execute("""
                         CREATE TABLE IF NOT EXISTS counters(
@@ -272,6 +281,51 @@ class StateStore:
             self._conn().execute(
                 "UPDATE sessions SET state='closed',updated_at=? WHERE id=?",
                 (now, session_id))
+
+    def reopen_session(self, session_id: str, now: float) -> None:
+        with self._lock:
+            self._conn().execute(
+                "UPDATE sessions SET state='open',updated_at=? WHERE id=?",
+                (now, session_id))
+
+    def session_row(self, session_id: str):
+        """Ledger row for session/load: (agent_id, consumer_id, state)."""
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT agent_id, consumer_id, state FROM sessions "
+                "WHERE id=?", (session_id,)).fetchone()
+            return row
+
+    def record_session_turn(self, session_id: str, role: str,
+                            text: str, now: float) -> None:
+        """Append one transcript entry and trim the ledger to the same
+        bound the in-memory transcript keeps."""
+        keep = 2 * PlatformLimits.AGENT_SESSION_TURNS
+        with self._lock:
+            try:
+                db = self._conn()
+                (seq,) = db.execute(
+                    "SELECT COALESCE(MAX(seq),0)+1 FROM session_turns "
+                    "WHERE session_id=?", (session_id,)).fetchone()
+                db.execute(
+                    "INSERT INTO session_turns(session_id,seq,role,text,"
+                    "created_at) VALUES(?,?,?,?,?)",
+                    (session_id, seq, role, text, now))
+                db.execute(
+                    "DELETE FROM session_turns WHERE session_id=? "
+                    "AND seq NOT IN (SELECT seq FROM session_turns "
+                    "WHERE session_id=? ORDER BY seq DESC LIMIT ?)",
+                    (session_id, session_id, keep))
+            except sqlite3.Error as e:
+                raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                                    f"session turn: {e}")
+
+    def session_turns(self, session_id: str) -> list:
+        with self._lock:
+            rows = self._conn().execute(
+                "SELECT role, text FROM session_turns WHERE session_id=? "
+                "ORDER BY seq", (session_id,)).fetchall()
+            return [{"role": r, "text": t} for r, t in rows]
 
     def increment_counter(self, name: str) -> None:
         with self._lock:
