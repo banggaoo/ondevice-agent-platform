@@ -50,8 +50,59 @@ class TestManageWorkspace(unittest.TestCase):
             actions = {a["action"] for a in report["actions"]}
             self.assertIn("purge", actions)          # CRITICAL disk
             self.assertIn("git_hygiene", actions)    # dirty/untracked
+            # report action: proposal only, nothing deleted
+            purge_action = next(a for a in report["actions"]
+                                if a["action"] == "purge")
+            self.assertFalse(purge_action["executed"])
+            self.assertEqual(report["action_executed"], "report")
+            self.assertTrue((proj / "node_modules").is_dir())
+            self.assertEqual(report["freed_bytes"], 0)
             # fresh repo, no commits: everything is untracked
             self.assertEqual(entry["git"]["dirty_files"], 3)
+
+    def test_purge_action_removes_candidates(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            proj = ws / "alpha"
+            cache = proj / "__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "m.pyc").write_bytes(b"y" * 4096)
+            (proj / "app.py").write_text("real")
+
+            report = manage_workspace({
+                "workspace": str(ws),
+                "action": "purge",
+                "metrics": {"disk_status": "CRITICAL_LOW"},
+            })
+            self.assertEqual(report["action_executed"], "purge")
+            self.assertFalse(cache.exists())            # reclaimed
+            self.assertTrue((proj / "app.py").exists()) # source kept
+            self.assertEqual(report["removed_count"], 1)
+            self.assertGreater(report["freed_bytes"], 0)
+            self.assertIn("disk_free_bytes_after", report)
+            cand = report["entries"][0]["purge_candidates"][0]
+            self.assertTrue(cand["removed"])
+            purge_action = next(a for a in report["actions"]
+                                if a["action"] == "purge")
+            self.assertTrue(purge_action["executed"])
+
+    def test_purge_skips_symlinked_dir(self):
+        with tempfile.TemporaryDirectory() as d, \
+                tempfile.TemporaryDirectory() as outside_d:
+            ws, outside = Path(d), Path(outside_d)
+            proj = ws / "alpha"
+            proj.mkdir()
+            (outside / "keep.bin").write_bytes(b"z" * 1024)
+            link = proj / "build"
+            link.symlink_to(outside, target_is_directory=True)
+
+            report = manage_workspace({
+                "workspace": str(ws), "action": "purge"})
+            self.assertTrue((outside / "keep.bin").exists())
+            self.assertTrue(link.is_symlink())
+            cand = report["entries"][0]["purge_candidates"][0]
+            self.assertEqual(cand["skipped"], "symlink")
+            self.assertEqual(report["freed_bytes"], 0)
 
     def test_missing_workspace(self):
         report = manage_workspace({"workspace": "/nonexistent-xyz"})

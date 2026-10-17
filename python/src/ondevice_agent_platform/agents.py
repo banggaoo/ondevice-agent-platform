@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import enum
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -150,8 +151,10 @@ class ReferenceEchoHarness:
 
 # ---------------------------------------------------------------------------
 # workspace.manage — deterministic workspace manager for external
-# orchestrators (e.g. POH). Read-only: analyzes the managed workspace and
-# returns a management report; it never deletes or mutates anything.
+# orchestrators (e.g. POH). Default action "report" is analysis only; an
+# explicit {"action": "purge"} task deletes the allowlisted cache/build
+# directories found inside the declared workspace — nothing outside it,
+# never through a symlink — and reports reclaimed bytes.
 # ---------------------------------------------------------------------------
 
 _WS_PURGE_DIRS = (
@@ -210,17 +213,59 @@ def _ws_git_state(path: Path) -> dict:
     }
 
 
+def _ws_purge(workspace: Path, report: dict) -> None:
+    """Delete every scanned purge candidate inside ``workspace``.
+
+    Candidates come from the fixed _WS_PURGE_DIRS allowlist under direct
+    workspace children, so execution is bounded by construction; we still
+    refuse symlinks and resolved paths outside the workspace root.
+    """
+    root = workspace.resolve()
+    removed = 0
+    for entry in report["entries"]:
+        for cand in entry["purge_candidates"]:
+            target = Path(cand["path"])
+            if target.is_symlink():
+                cand["skipped"] = "symlink"
+                continue
+            try:
+                if not target.resolve().is_relative_to(root):
+                    cand["skipped"] = "outside-workspace"
+                    continue
+                shutil.rmtree(target)
+            except OSError as exc:
+                cand["error"] = str(exc)
+                report["purge_errors"].append(
+                    {"path": cand["path"], "error": str(exc)})
+                continue
+            cand["removed"] = True
+            removed += 1
+            report["freed_bytes"] += cand["bytes"]
+    report["removed_count"] = removed
+    report["action_executed"] = "purge"
+    report["disk_free_bytes_after"] = shutil.disk_usage(workspace).free
+
+
 def manage_workspace(task: dict) -> dict:
-    """Read-only workspace analysis for the workspace.manage harness."""
+    """Workspace analysis for the workspace.manage harness.
+
+    ``task["action"]`` defaults to ``"report"`` (analysis only). The
+    explicit ``"purge"`` action reclaims allowlisted directories inside
+    the workspace and annotates each candidate removed/skipped/error."""
     workspace = Path(task.get("workspace") or "").expanduser()
+    action = str(task.get("action") or "report")
     report = {
         "workspace": str(workspace),
         "agent": WorkspaceManageHarness.id,
         "ok": False,
+        "action_executed": "report",
         "metrics": task.get("metrics") or {},
         "findings": task.get("findings") or [],
         "entries": [],
         "purge_total_bytes": 0,
+        "freed_bytes": 0,
+        "removed_count": 0,
+        "purge_errors": [],
         "actions": [],
     }
     if not workspace.is_dir():
@@ -245,19 +290,33 @@ def manage_workspace(task: dict) -> dict:
         }
         report["entries"].append(entry)
         report["purge_total_bytes"] += entry["reclaimable_bytes"]
+    if action == "purge":
+        _ws_purge(workspace, report)
     metrics = report["metrics"]
     disk_status = str(metrics.get("disk_status") or "")
     top = sorted(report["entries"], key=lambda e: e["reclaimable_bytes"],
                  reverse=True)
-    if disk_status == "CRITICAL_LOW":
-        report["actions"].append({
+    if disk_status == "CRITICAL_LOW" or report["action_executed"] == "purge":
+        executed = report["action_executed"] == "purge"
+        purge_action = {
             "action": "purge",
             "severity": "CRITICAL",
-            "detail": "reclaim cache/build directories to restore free disk",
-            "candidates": [
+            "executed": executed,
+        }
+        if executed:
+            purge_action["detail"] = (
+                f"freed {report['freed_bytes']/1e9:.2f} GB across "
+                f"{report['removed_count']} directories"
+                + (f"; {len(report['purge_errors'])} error(s)"
+                   if report["purge_errors"] else ""))
+        else:
+            purge_action["detail"] = (
+                "reclaim cache/build directories to restore free disk "
+                "(send action='purge' to execute)")
+            purge_action["candidates"] = [
                 {"path": p["path"], "bytes": p["bytes"]}
-                for e in top[:5] for p in e["purge_candidates"]][:8],
-        })
+                for e in top[:5] for p in e["purge_candidates"]][:8]
+        report["actions"].append(purge_action)
     if disk_status in ("LOW", "CRITICAL_LOW"):
         report["actions"].append({
             "action": "report",
@@ -282,8 +341,10 @@ def manage_workspace(task: dict) -> dict:
 
 class WorkspaceManageHarness:
     """Deterministic workspace manager (no model call): the prompt is a
-    JSON task ({workspace, metrics, findings}) or a bare workspace path.
-    Returns a JSON management report — proposes actions, executes none."""
+    JSON task ({workspace, metrics, findings, action}) or a bare workspace
+    path. Returns a JSON management report; only the explicit "purge"
+    action mutates anything — allowlisted cache/build dirs inside the
+    declared workspace."""
     id = "workspace.manage"
     version = 1
 
