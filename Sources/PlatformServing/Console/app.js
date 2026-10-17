@@ -7,7 +7,8 @@ const VIEWS = ["overview", "models", "history", "train", "chat"];
 
 const state = { csrf: null, events: null, sessionPromise: null,
                 eventReconnects: 0, reconnectTimer: null,
-                data: null, operator: null,
+                data: null, operator: null, agents: [],
+                chatAgent: null,
                 chatAbort: null, chatPending: false };
 
 const $ = (id) => document.getElementById(id);
@@ -194,21 +195,125 @@ function renderModels(registry) {
   } else {
     renderList(ul, registry.models || [], "none registered");
   }
+}
+
+/* Agents card: operator + reference profiles are fixed (managed
+ * elsewhere); custom chat agents get a remove control. */
+function renderAgents(registry) {
   const agentProfiles = registry.agentProfiles;
   const agentsUl = $("agents");
   agentsUl.textContent = "";
-  if (Array.isArray(agentProfiles) && agentProfiles.length) {
-    for (const a of agentProfiles.slice(0, 50)) {
+  const list = Array.isArray(agentProfiles) ? agentProfiles : [];
+  state.agents = list;
+  if (!list.length) {
+    renderList(agentsUl, [], "none registered");
+  } else {
+    for (const a of list.slice(0, 50)) {
       const li = document.createElement("li");
+      li.className = "modelrow";
       li.textContent = `${a.id} — v${a.version}` +
         ` · harness ${a.harnessId} v${a.harnessVersion}` +
         ` · model ${a.model || "none"}` +
-        ` · tools ${(a.toolScope || []).length}`;
+        ` · tools ${(a.toolScope || []).length}` +
+        (a.custom ? " · custom" : "");
+      if (a.custom) {
+        li.appendChild(actionButton("remove",
+          () => modelMutation("/api/console/agents/remove",
+                              { id: a.id })));
+      }
       agentsUl.appendChild(li);
     }
-  } else {
-    renderList(agentsUl, registry.agents || [], "none registered");
   }
+  /* The add-agent model picker lists declared LLM aliases; the select
+   * rebuilds only when the set changes so an open dropdown is not
+   * disrupted by the 2s refresh tick. */
+  const models = (registry.modelProfiles || [])
+    .filter((p) => p.kind === "llm")
+    .map((p) => p.alias);
+  const sel = $("agent-model");
+  const want = models.join("|");
+  if (sel.dataset.models !== want) {
+    sel.dataset.models = want;
+    sel.textContent = "";
+    for (const alias of models) {
+      const opt = document.createElement("option");
+      opt.value = alias;
+      opt.textContent = alias;
+      sel.appendChild(opt);
+    }
+  }
+  $("agent-add-btn").disabled = models.length === 0;
+}
+
+async function addAgent() {
+  const id = $("agent-id").value.trim();
+  const model = $("agent-model").value;
+  const systemPrompt = $("agent-prompt").value;
+  const maxOut = parseInt($("agent-max").value, 10);
+  if (!id || !model) {
+    setText("agent-status", "id and model are required");
+    return;
+  }
+  const body = { id, model, systemPrompt };
+  if (Number.isInteger(maxOut) && maxOut > 0) body.maxOutputTokens = maxOut;
+  const result = await api("/api/console/agents/add", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (result.status === 401 || result.status === 403) {
+    await bootstrapSession();
+  }
+  if (result.status === 200) {
+    $("agent-id").value = "";
+    $("agent-prompt").value = "";
+    $("agent-max").value = "";
+    setText("agent-status", `agent ${id} registered`);
+  } else {
+    const err = result.body && result.body.error;
+    const msg = (err && typeof err === "object" && err.message) ||
+      `request failed (status ${result.status || "unreachable"})`;
+    setText("agent-status", msg);
+  }
+  await refreshStatus();
+}
+
+async function declareModel() {
+  const alias = $("add-alias").value.trim();
+  const repo = $("add-repo").value.trim();
+  const revision = $("add-revision").value.trim() || "main";
+  const file = $("add-file").value.trim();
+  const maxOut = parseInt($("add-max").value, 10);
+  if (!alias || !repo) {
+    setText("add-model-status", "alias and repo are required");
+    return;
+  }
+  const body = { alias, repo, revision,
+                 provider: $("add-provider").value };
+  if (file) body.file = file;
+  if ($("add-vision").checked) body.capabilities = ["text", "vision"];
+  if (Number.isInteger(maxOut) && maxOut > 0) body.maxOutputTokens = maxOut;
+  const result = await api("/api/console/models/declare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (result.status === 401 || result.status === 403) {
+    await bootstrapSession();
+  }
+  if (result.status === 200) {
+    $("add-alias").value = "";
+    $("add-repo").value = "";
+    $("add-file").value = "";
+    $("add-max").value = "";
+    setText("add-model-status", `declared ${alias} - pull to install`);
+  } else {
+    const err = result.body && result.body.error;
+    const msg = (err && typeof err === "object" && err.message) ||
+      `request failed (status ${result.status || "unreachable"})`;
+    setText("add-model-status", msg);
+  }
+  await refreshStatus();
 }
 
 function jobTime(epoch) {
@@ -334,10 +439,7 @@ function renderCatalog(cat, registry, jobs) {
   }
   const ul = $("catalog-list");
   ul.textContent = "";
-  const profiles = (registry.modelProfiles || []);
-  const shown = new Set();
   for (const e of entries.slice(0, 50)) {
-    shown.add(e.alias);
     const li = document.createElement("li");
     li.className = "modelrow";
     const size = e.approxBytes ? ` ~${(e.approxBytes / 1e9).toFixed(1)} GB`
@@ -356,8 +458,8 @@ function renderCatalog(cat, registry, jobs) {
       status = e.reason || "not eligible";
     }
     li.textContent = `${e.alias} — ${e.summary || ""} · ${e.provider}${size}`
-      + ` · ${status}`;
-    if (!job && e.eligible !== false) {
+      + (e.custom ? " · custom" : "") + ` · ${status}`;
+    if (!job && e.eligible !== false && e.hasSource !== false) {
       if (!e.ready) {
         li.appendChild(actionButton(e.declared ? "pull" : "install",
           () => modelMutation("/api/console/models/pull",
@@ -369,16 +471,6 @@ function renderCatalog(cat, registry, jobs) {
                               { alias: e.alias })));
       }
     }
-    ul.appendChild(li);
-  }
-  /* Declared profiles outside the catalog (composite routes like
-   * vision-hybrid) still list, status-only. */
-  for (const p of profiles) {
-    if (shown.has(p.alias)) continue;
-    const li = document.createElement("li");
-    li.className = "modelrow";
-    li.textContent = `${p.alias} — ${p.provider || "?"} · declared · `
-      + artifactReadyLabel(p.artifactReady);
     ul.appendChild(li);
   }
 }
@@ -422,29 +514,55 @@ function initOperator() {
   $("op-disable").addEventListener("click", () => {
     modelMutation("/api/console/operator", { enabled: false });
   });
+  $("add-model-btn").addEventListener("click", declareModel);
+  $("agent-add-btn").addEventListener("click", addAgent);
 }
 
 /* ---- Operator chat ---- */
 
-function detectOperator(registry) {
+/* Chat can address any registered agent: operator, custom.chat ids, or
+ * reference harnesses. The picker keeps the current selection across
+ * refresh ticks. */
+function detectAgents(registry) {
   const profiles = registry.agentProfiles;
   if (Array.isArray(profiles)) {
-    const op = profiles.find((a) => a && a.id === "operator");
-    if (op) return { model: op.model || null,
-                     harness: `${op.harnessId} v${op.harnessVersion}` };
+    return profiles.filter((a) => a && a.id).map((a) => ({
+      id: a.id,
+      model: a.model || null,
+      harness: `${a.harnessId} v${a.harnessVersion}`,
+    }));
   }
-  if (Array.isArray(registry.agents) && registry.agents.includes("operator")) {
-    return { model: null, harness: "operator.runtime" };
+  if (Array.isArray(registry.agents)) {
+    return registry.agents.map((id) => ({ id, model: null,
+                                         harness: "builtin" }));
   }
-  return null;
+  return [];
 }
 
 function renderChatMeta() {
-  const op = state.operator;
-  if (op) {
+  const agents = state.agents;
+  const sel = $("chat-agent");
+  const want = agents.map((a) => a.id).join("|");
+  if (sel.dataset.agents !== want) {
+    sel.dataset.agents = want;
+    sel.textContent = "";
+    for (const a of agents) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = a.id;
+      sel.appendChild(opt);
+    }
+  }
+  if (!state.chatAgent || !agents.some((a) => a.id === state.chatAgent)) {
+    const op = agents.find((a) => a.id === "operator");
+    state.chatAgent = (op || agents[0] || {}).id || null;
+  }
+  if (state.chatAgent) sel.value = state.chatAgent;
+  const current = agents.find((a) => a.id === state.chatAgent);
+  if (current) {
     hide("chat-unavailable");
-    setText("chat-model", op.model || "unbound");
-    setText("chat-harness", op.harness || "operator.runtime");
+    setText("chat-model", current.model || "unbound");
+    setText("chat-harness", current.harness || "builtin");
     $("chat-input").disabled = false;
     $("chat-send").disabled = state.chatPending;
   } else {
@@ -470,7 +588,7 @@ function stopLabel(stopReason) {
   switch (stopReason) {
     case "end_turn": return "complete";
     case "max_tokens": return "partial answer - token limit reached";
-    case "refusal": return "the Operator declined to answer";
+    case "refusal": return "the agent declined to answer";
     case "cancelled": return "cancelled";
     default: return stopReason || "error";
   }
@@ -480,23 +598,24 @@ function stopLabel(stopReason) {
  * (the daemon cancels the turn), and a 401 or network failure is reported
  * without re-running inference. */
 async function sendOperatorPrompt(text) {
-  if (state.chatPending || !state.operator) return;
+  const agent = state.chatAgent;
+  if (state.chatPending || !agent) return;
   state.chatPending = true;
   $("chat-send").disabled = true;
   $("chat-stop").hidden = false;
-  setText("chat-status", "asking the runtime Operator");
+  setText("chat-status", `asking ${agent}`);
   const controller = new AbortController();
   state.chatAbort = controller;
   const result = await api("/api/console/operator/prompt", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, agent }),
     signal: controller.signal,
   });
   state.chatPending = false;
   state.chatAbort = null;
   $("chat-stop").hidden = true;
-  $("chat-send").disabled = !state.operator;
+  $("chat-send").disabled = !state.chatAgent;
   if (result.aborted) {
     setText("chat-status", "cancelled");
     chatEntry("chat-note", "cancelled");
@@ -533,9 +652,9 @@ function stopOperatorPrompt() {
 function initChat() {
   $("chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    /* An ignored submit (pending turn or no Operator) must not clear the
+    /* An ignored submit (pending turn or no agent) must not clear the
      * draft or log a phantom question. */
-    if (state.chatPending || !state.operator) return;
+    if (state.chatPending || !state.chatAgent) return;
     const text = $("chat-input").value;
     if (!text || !text.trim()) return;
     $("chat-input").value = "";
@@ -549,6 +668,10 @@ function initChat() {
     }
   });
   $("chat-stop").addEventListener("click", stopOperatorPrompt);
+  $("chat-agent").addEventListener("change", (event) => {
+    state.chatAgent = event.target.value;
+    renderChatMeta();
+  });
 }
 
 /* ---- refresh ---- */
@@ -576,11 +699,11 @@ async function refreshStatus() {
     hide("offline");
     state.data = { status: status.body, registry: registry.body,
                    jobs: jobs.body, catalog: catalog.body };
-    state.operator = detectOperator(registry.body);
     renderOverview(status.body);
     renderModels(registry.body);
     renderJobs(jobs.body.jobs || []);
     renderCatalog(catalog.body, registry.body, jobs.body.jobs || []);
+    renderAgents(registry.body);
     renderOperator(registry.body);
     renderChatMeta();
   } finally {

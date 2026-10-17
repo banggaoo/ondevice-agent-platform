@@ -205,12 +205,20 @@ class Router:
             return self._admin_jobs(req)
         if method == "GET" and path == "/api/catalog":
             return self._admin_json(req, self._s.catalog_status)
+        if method == "GET" and path == "/api/agents":
+            return self._admin_json(req, self._agents_payload)
+        if method == "POST" and path == "/api/console/models/declare":
+            return self._console_declare(req)
         if method == "POST" and path == "/api/console/models/pull":
             return self._console_pull(req)
         if method == "POST" and path == "/api/console/models/remove":
             return self._console_remove(req)
         if method == "POST" and path == "/api/console/provider/install":
             return self._console_provider_install(req)
+        if method == "POST" and path == "/api/console/agents/add":
+            return self._console_agent_add(req)
+        if method == "POST" and path == "/api/console/agents/remove":
+            return self._console_agent_remove(req)
         if method == "POST" and path == "/api/console/operator":
             return self._console_operator(req)
         if method == "POST" and path == "/api/console/operator/prompt":
@@ -289,11 +297,23 @@ class Router:
     def _operator_prompt(self, req: _Request) -> _Response:
         session = self._require_console_session(req, mutation=True)
         self._consumer_rate_limit("console-operator")
-        if self._bridge is None:
-            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                "operator is not enabled")
-        reply = self._bridge.prompt(session, req.body, req.cancellation)
+        bridge = self._console_bridge()
+        reply = bridge.prompt(session, req.body, req.cancellation)
         return _Response.json(reply)
+
+    def _console_bridge(self):
+        """The chat bridge is agent-generic: it exists whenever any
+        console-reachable agent may be registered, so it is created
+        lazily even when the daemon was not started with
+        --enable-operator."""
+        if self._bridge is None:
+            from .console_bridge import ConsoleOperatorBridge
+            if self._op_principal is None:
+                self._op_principal = (
+                    self._s.register_console_operator_consumer())
+            self._bridge = ConsoleOperatorBridge(
+                self._acp, self._s, self._sessions, self._op_principal)
+        return self._bridge
 
     # -- admin reads ----------------------------------------------------------------
 
@@ -329,6 +349,66 @@ class Router:
                                 "alias required")
         return alias
 
+    def _agents_payload(self) -> dict:
+        service = getattr(self._s, "agent_service", None)
+        agents = (service.profile_summaries() if service else [])
+        return {"agents": agents}
+
+    def _console_json_body(self, req) -> dict:
+        self._require_console_session(req, mutation=True)
+        self._consumer_rate_limit("console-admin")
+        try:
+            body = json.loads(req.body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise PlatformError(ErrorCode.MALFORMED_JSON)
+        if not isinstance(body, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "object body required")
+        return body
+
+    def _console_declare(self, req: _Request) -> _Response:
+        body = self._console_json_body(req)
+        unknown = set(body) - {"alias", "provider", "repo", "revision",
+                               "file", "capabilities", "purposes",
+                               "maxOutputTokens", "imageMaxSoftTokens"}
+        if unknown:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                f"unknown fields: {sorted(unknown)}")
+        capabilities = body.get("capabilities")
+        if capabilities is None and body.get("vision") is True:
+            capabilities = ["text", "vision"]
+        profile = self._s.declare_custom_model(
+            alias=body.get("alias"), provider=body.get("provider"),
+            repo=body.get("repo"),
+            revision=body.get("revision") or "main",
+            artifact_file=body.get("file"),
+            capabilities=capabilities, purposes=body.get("purposes"),
+            max_output_tokens=body.get("maxOutputTokens"),
+            image_max_soft_tokens=body.get("imageMaxSoftTokens"))
+        return _Response.json({"ok": True, "alias": profile.alias})
+
+    def _console_agent_add(self, req: _Request) -> _Response:
+        body = self._console_json_body(req)
+        unknown = set(body) - {"id", "model", "systemPrompt",
+                               "maxOutputTokens"}
+        if unknown:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                f"unknown fields: {sorted(unknown)}")
+        self._s.add_custom_agent(
+            LocalConsumers.ADMINISTRATION,
+            agent_id=body.get("id"), model_alias=body.get("model"),
+            system_prompt=body.get("systemPrompt") or "",
+            max_output_tokens=body.get("maxOutputTokens"))
+        return _Response.json({"ok": True})
+
+    def _console_agent_remove(self, req: _Request) -> _Response:
+        body = self._console_json_body(req)
+        agent_id = body.get("id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise PlatformError(ErrorCode.INVALID_REQUEST, "id required")
+        self._s.remove_custom_agent(LocalConsumers.ADMINISTRATION, agent_id)
+        return _Response.json({"ok": True})
+
     def _console_pull(self, req: _Request) -> _Response:
         alias = self._console_body_alias(req)
         job = self._s.pull_model(LocalConsumers.ADMINISTRATION, alias)
@@ -356,22 +436,15 @@ class Router:
                    if isinstance(body, dict) else True)
         if enabled is not True:
             self._s.clear_operator()
-            self._bridge = None
+            # The bridge is shared by custom agents too - it stays up;
+            # operator bindings lapse with the profile unregister.
             return _Response.json({"enabled": False})
         model = body.get("model") if isinstance(body, dict) else None
         if not isinstance(model, str) or not model:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "model required")
         self._s.set_operator(model)
-        if self._bridge is None:
-            # The daemon was started without --enable-operator: wire the
-            # bridge lazily so console enable applies without a restart.
-            from .console_bridge import ConsoleOperatorBridge
-            if self._op_principal is None:
-                self._op_principal = (
-                    self._s.register_console_operator_consumer())
-            self._bridge = ConsoleOperatorBridge(
-                self._acp, self._s, self._sessions, self._op_principal)
+        self._console_bridge()   # ensure the chat bridge exists
         return _Response.json({"enabled": True, "model": model})
 
     # -- job cancel ----------------------------------------------------------------

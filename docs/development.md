@@ -1347,3 +1347,24 @@ post-remove request fails `provider_unavailable`; SIGKILLed in-flight
 job marks `interrupted` on restart; ACP stdio facade, console
 pull/cancel/remove/operator, daemon lock refusals all correct.
 Suite: 287/287.
+
+Generalized agents + models (2026-10-17): `model declare` / console
+Add-model write non-catalog declarations - any Hugging Face repo on
+mlx/llamacpp/vllm-mlx, validated through parse_registry, registered
+live so a console pull needs no restart; catalog_status marks them
+`custom` with `hasSource` gating. `agent add` / console Add-agent
+register `custom.chat` harnesses (owner id + system prompt + declared
+model alias, read-only, one bounded call per turn), persisted in
+config.json agents[] and re-registered at serve boot; `operator` and
+`reference.*` ids reserved. The console chat bridge generalized from
+the operator to any registered agent ({"text","agent"?} body,
+per-agent bindings). Root cause found for the intermittent ACP
+session/new -32603 seen during earlier probes: the sessions ledger
+survives restarts but AgentService's in-memory sequence restarted at
+0, so the first `sess-N` insert collided on the primary key - now
+resumed via max_session_sequence at store-open, and insert_session
+maps sqlite errors to PlatformError. Live-verified on :8080: custom
+agent `coder` (qwen3.8-9b) answered via console bridge and stdio ACP;
+custom model `tiny-test` declared, pulled ~400MB, and served real
+inference; custom agent survived a daemon restart from config.
+License set to MIT. Suite: 308+ tests.

@@ -238,15 +238,34 @@ class StateStore:
                 (max(0, min(limit, 1000)),)).fetchall()
             return [self._row_to_job(r) for r in rows]
 
+    def max_session_sequence(self) -> int:
+        """Session ids are `sess-N` minted from an in-memory sequence;
+        the ledger survives restarts, so resume above every durable id
+        or the next insert collides on the primary key."""
+        with self._lock:
+            rows = self._conn().execute("SELECT id FROM sessions").fetchall()
+            best = 0
+            for (session_id,) in rows:
+                if session_id.startswith("sess-"):
+                    try:
+                        best = max(best, int(session_id[5:]))
+                    except ValueError:
+                        pass
+            return best
+
     def insert_session(self, session_id: str, agent, consumer_id: str,
                        now: float) -> None:
         with self._lock:
-            self._conn().execute(
-                "INSERT INTO sessions(id,agent_id,agent_version,harness_id,"
-                "harness_version,consumer_id,state,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (session_id, agent.id, agent.version, agent.harness_id,
-                 agent.harness_version, consumer_id, "open", now, now))
+            try:
+                self._conn().execute(
+                    "INSERT INTO sessions(id,agent_id,agent_version,"
+                    "harness_id,harness_version,consumer_id,state,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (session_id, agent.id, agent.version, agent.harness_id,
+                     agent.harness_version, consumer_id, "open", now, now))
+            except sqlite3.Error as e:
+                raise PlatformError(ErrorCode.STORAGE_FAILURE,
+                                    f"session insert: {e}")
 
     def close_session(self, session_id: str, now: float) -> None:
         with self._lock:

@@ -849,6 +849,81 @@ class TestACP(unittest.TestCase):
         t.join(5)
 
 
+class RecordingLLM(FakeLLM):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.requests = []
+
+    def complete(self, request, profile, token=None):
+        self.requests.append(request)
+        return super().complete(request, profile, token)
+
+
+class TestCustomChatHarness(unittest.TestCase):
+    """custom.chat agents serve over ACP like the operator: one bounded
+    model call per turn, system prompt prepended, no tool authority."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sup = make_supervisor(self.tmp.name)
+        self.addCleanup(self.sup.shutdown)
+        self.llm = RecordingLLM()
+        self.sup.register_model(
+            ModelProfile(alias="m", provider_id="fake-llm",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=self.llm)
+        self.agents = AgentService(self.sup)
+        self.agents.attach(self.sup)
+        self.sup.add_custom_agent(
+            LocalConsumers.ADMINISTRATION, "helper", "m",
+            "Always answer tersely.", 32)
+        self.acp = ACPService(self.sup)
+        self.acp.bind("c1", "helper", LocalConsumers.AGENT)
+
+    def rpc(self, msg, conn="c1"):
+        out = []
+        self.acp.handle(conn, msg, None, out.append)
+        return out
+
+    def test_prompt_runs_one_model_call_with_system_prompt(self):
+        out = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                        "params": {"cwd": "/tmp", "mcpServers": []}})
+        sid = out[0]["result"]["sessionId"]
+        out = self.rpc({"jsonrpc": "2.0", "id": 3,
+                        "method": "session/prompt",
+                        "params": {"sessionId": sid, "prompt": [
+                            {"type": "text", "text": "hello"}]}})
+        result = [m for m in out if m.get("id") == 3][0]
+        self.assertEqual(result["result"]["stopReason"], "end_turn")
+        notes = [m for m in out if m.get("method") == "session/update"]
+        self.assertTrue(any("pong" in json.dumps(n) for n in notes))
+        req = self.llm.requests[0]
+        self.assertEqual(req.model, "m")
+        self.assertEqual(req.messages[0].role, ChatRole.SYSTEM)
+        self.assertIn("tersely", req.messages[0].parts[0])
+        self.assertEqual(req.max_output_tokens, 32)
+
+    def test_empty_prompt_refuses(self):
+        out = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                        "params": {"cwd": "/tmp", "mcpServers": []}})
+        sid = out[0]["result"]["sessionId"]
+        out = self.rpc({"jsonrpc": "2.0", "id": 3,
+                        "method": "session/prompt",
+                        "params": {"sessionId": sid, "prompt": [
+                            {"type": "text", "text": "   "}]}})
+        result = [m for m in out if m.get("id") == 3][0]
+        self.assertEqual(result["result"]["stopReason"], "refusal")
+        self.assertEqual(self.llm.calls, 0)
+
+    def test_removed_agent_cannot_bind(self):
+        self.sup.remove_custom_agent(
+            LocalConsumers.ADMINISTRATION, "helper")
+        with self.assertRaises(PlatformError) as cm:
+            self.acp.bind("c2", "helper", LocalConsumers.AGENT)
+        self.assertEqual(cm.exception.code, ErrorCode.NOT_FOUND)
+
+
 class SlowHarness:
     def __init__(self):
         self.started = threading.Event()
@@ -860,6 +935,45 @@ class SlowHarness:
         emit("message_chunk", "done")
         from ondevice_agent_platform.agents import AgentStopReason
         return AgentStopReason.END_TURN
+
+
+class TestSessionIdResume(unittest.TestCase):
+    """The sessions ledger survives restarts; a new daemon must resume
+    sess-N above every durable row or its first insert collides."""
+    def test_restart_does_not_collide(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        def boot():
+            root = RuntimeRoot(tmp.name)
+            root.prepare()
+            root.acquire_lock()
+            self.addCleanup(lambda: _safe_release(root))
+            sup = PlatformSupervisor(root, FakeSource())
+            service = AgentService(sup)
+            service.attach(sup)
+            service.register_builtin_reference()
+            sup.start()
+            self.addCleanup(sup.shutdown)
+            return sup, service
+
+        sup1, svc1 = boot()
+        s1 = svc1.new_session("reference.status", "c", "conn1")
+        self.assertEqual(s1.id, "sess-1")
+        sup1._store.insert_session(s1.id, s1.profile, "c",
+                                   time.time())
+        sup1.shutdown()
+
+        sup2, svc2 = boot()
+        s2 = svc2.new_session("reference.status", "c", "conn2")
+        self.assertEqual(s2.id, "sess-2")
+
+
+def _safe_release(root):
+    try:
+        root.release_lock()
+    except Exception:
+        pass
 
 
 class TestHTTP(unittest.TestCase):

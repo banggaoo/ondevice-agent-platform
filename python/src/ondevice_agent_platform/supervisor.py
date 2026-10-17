@@ -10,6 +10,7 @@ actually finishes.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 import uuid
@@ -30,6 +31,10 @@ from .registry import (APPLE_PROVIDER_ID, MLX_PROVIDER_ID,
                        VISIONHYBRID_PROVIDER_ID, parse_registry)
 from . import __version__, resources
 from .state import JobKind, JobRecord, JobState, StateStore
+
+_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_AGENT_ID_RE = re.compile(r"[a-z][a-z0-9._-]{0,31}")
+_RESERVED_AGENT_IDS = {"operator", "reference.status", "reference.echo"}
 
 
 @dataclass
@@ -112,6 +117,8 @@ class PlatformSupervisor:
     def start(self) -> None:
         self._store.open()
         self._job_sequence = self._store.max_job_sequence()
+        if self.agent_service is not None:
+            self.agent_service.resume_sessions(self._store)
         for consumer in (LocalConsumers.MODEL, LocalConsumers.AGENT,
                          LocalConsumers.ADMINISTRATION):
             self._grants[consumer.id] = consumer.scope.base_grants
@@ -379,6 +386,54 @@ class PlatformSupervisor:
             raise PlatformError(
                 ErrorCode.INVALID_REQUEST,
                 f"{alias}: not eligible on this host ({reason})")
+        return self._declare_model_value(alias, entry.registry_value())
+
+    def declare_custom_model(self, *, alias: str, provider: str,
+                             repo: str, revision: str = "main",
+                             artifact_file: str | None = None,
+                             capabilities=None, purposes=None,
+                             max_output_tokens: int | None = None,
+                             image_max_soft_tokens: int | None = None
+                             ) -> ModelProfile:
+        """Declare a non-catalog model: any Hugging Face repo on a
+        real artifact provider, validated through parse_registry before
+        persisting, then registered live so a pull can start without a
+        restart."""
+        if provider not in (MLX_PROVIDER_ID, LLAMACPP_PROVIDER_ID,
+                            VLLMMLX_PROVIDER_ID):
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                "custom models use mlx, llamacpp, or vllm-mlx providers")
+        if not isinstance(alias, str) \
+                or not _ALIAS_RE.fullmatch(alias):
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                "alias must be 1-64 lowercase letters, digits, . _ - "
+                "starting with a letter or digit")
+        for name, value in (("capabilities", capabilities),
+                            ("purposes", purposes)):
+            if value is not None and not (
+                    isinstance(value, (list, tuple))
+                    and all(isinstance(v, str) for v in value)):
+                raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                    f"{name} must be a string array")
+        source = {"repo": repo, "revision": revision}
+        if artifact_file:
+            source["file"] = artifact_file
+        value = {"alias": alias, "kind": "llm", "provider": provider,
+                 "task": "chat",
+                 "purposes": list(purposes or ("general",)),
+                 "capabilities": list(capabilities or ("text",)),
+                 "source": source}
+        if max_output_tokens is not None:
+            value["maxOutputTokens"] = max_output_tokens
+        if image_max_soft_tokens is not None:
+            value["imageMaxSoftTokens"] = image_max_soft_tokens
+        return self._declare_model_value(alias, value)
+
+    def _declare_model_value(self, alias: str, value: dict) -> ModelProfile:
+        """Merge one registry model dict, validate the whole registry
+        through parse_registry, persist, then register the profile live."""
         existing = (self._root.read_json(self._root.registry_path)
                     if os.path.isfile(self._root.registry_path) else {})
         existing = existing if isinstance(existing, dict) else {}
@@ -386,7 +441,9 @@ class PlatformSupervisor:
                for m in existing.get("models", [])):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 f"already declared: {alias}")
-        merged = catalog.merged_registry(existing, [entry])
+        merged = {"schemaVersion": 1,
+                  "models": list(existing.get("models", [])) + [value]}
+        parse_registry(merged)   # fail loudly before persisting
         self._root.write_json(merged, self._root.registry_path)
         declared = next(e for e in parse_registry(merged)
                         if e.profile.alias == alias)
@@ -521,6 +578,22 @@ class PlatformSupervisor:
                 "declared": reg is not None,
                 "ready": (store.is_ready(e.source, artifact_file)
                           if e.source else True)})
+        catalog_aliases = {e.alias for e in catalog.ENTRIES}
+        for alias, reg in declared.items():
+            if alias in catalog_aliases:
+                continue
+            p = reg.profile
+            entries.append({
+                "alias": alias, "provider": p.provider_id,
+                "summary": "custom declaration",
+                "purposes": list(p.purposes),
+                "capabilities": list(p.capabilities),
+                "approxBytes": None,
+                "eligible": True, "reason": "custom",
+                "declared": True, "custom": True,
+                "hasSource": p.source is not None,
+                "ready": (store.is_ready(p.source, reg.artifact_file)
+                          if p.source else True)})
         env_installed, pins_ready = self._provider_env_state()
         return {"entries": entries,
                 "providerEnvInstalled": env_installed,
@@ -546,6 +619,93 @@ class PlatformSupervisor:
 
     def unregister_runtime_operator(self) -> None:
         self.clear_operator()
+
+    def add_custom_agent(self, principal: Principal, agent_id: str,
+                         model_alias: str, system_prompt: str = "",
+                         max_output_tokens: int | None = None) -> None:
+        """Register a named chat agent bound to a declared LLM alias and
+        persist it in config.json so serve re-registers it on boot.
+        Read-only like every harness: no tools, no authority."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+        self._register_custom_agent(agent_id, model_alias, system_prompt,
+                                    max_output_tokens)
+        config = self._read_config()
+        agents = [a for a in config.get("agents", [])
+                  if isinstance(a, dict) and a.get("id") != agent_id]
+        agents.append({"id": agent_id, "model": model_alias,
+                       "systemPrompt": system_prompt,
+                       "maxOutputTokens": max_output_tokens})
+        config["agents"] = agents
+        self._root.write_json(config, self._root.config_path)
+
+    def remove_custom_agent(self, principal: Principal,
+                            agent_id: str) -> None:
+        self.require(Grant.ADMIN_MANAGE, principal)
+        if agent_id in _RESERVED_AGENT_IDS:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                f"agent id is reserved: {agent_id}")
+        service = getattr(self, "agent_service", None)
+        if service is None or not service.unregister_agent(agent_id):
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"agent not registered: {agent_id}")
+        config = self._read_config()
+        config["agents"] = [a for a in config.get("agents", [])
+                            if isinstance(a, dict)
+                            and a.get("id") != agent_id]
+        self._root.write_json(config, self._root.config_path)
+
+    def _register_custom_agent(self, agent_id: str, model_alias: str,
+                               system_prompt: str,
+                               max_output_tokens: int | None) -> None:
+        service = getattr(self, "agent_service", None)
+        if service is None:
+            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
+                                "agent service not attached")
+        if not isinstance(agent_id, str) \
+                or agent_id in _RESERVED_AGENT_IDS \
+                or not _AGENT_ID_RE.fullmatch(agent_id):
+            raise PlatformError(
+                ErrorCode.INVALID_REQUEST,
+                "agent id must be 1-32 lowercase letters, digits, . _ - "
+                "starting with a letter; operator/reference.* reserved")
+        if not isinstance(system_prompt, str):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "system prompt must be a string")
+        if len(system_prompt.encode()) > \
+                PlatformLimits.AGENT_SYSTEM_PROMPT_BYTES:
+            raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE,
+                                "system prompt too large")
+        if max_output_tokens is not None and not (
+                isinstance(max_output_tokens, int)
+                and 0 < max_output_tokens <= PlatformLimits.OUTPUT_TOKENS):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "maxOutputTokens out of bounds")
+        with self._lock:
+            model = self._model_profiles.get(model_alias)
+            registered = service.profile(agent_id) is not None
+            custom_count = sum(
+                1 for p in service.profile_summaries() if p["custom"])
+        if model is None or model.kind != ModelKind.LLM:
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"model alias not declared: {model_alias}")
+        if not registered and custom_count >= PlatformLimits.CUSTOM_AGENTS:
+            raise PlatformError(ErrorCode.CAPACITY_LIMITED,
+                                "custom agent limit reached")
+        service.register_custom_agent(agent_id, model_alias,
+                                      system_prompt, max_output_tokens)
+
+    def restore_custom_agents(self) -> None:
+        """serve boot path: re-register config.json's persisted agents."""
+        for spec in self._read_config().get("agents", []):
+            if not isinstance(spec, dict):
+                continue
+            try:
+                self._register_custom_agent(
+                    spec.get("id"), spec.get("model"),
+                    spec.get("systemPrompt") or "",
+                    spec.get("maxOutputTokens"))
+            except (PlatformError, TypeError, AttributeError):
+                continue   # stale/invalid persisted entries are skipped
 
     def _read_config(self) -> dict:
         config = self._root.read_json(self._root.config_path)

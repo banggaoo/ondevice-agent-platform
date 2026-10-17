@@ -171,6 +171,68 @@ class RuntimeOperatorHarness:
             return AgentStopReason.ERROR
 
 
+class CustomChatHarness:
+    """Owner-declared general chat agent: a named profile with its own
+    system prompt bound to a declared model alias. Same contract as the
+    Operator minus the status snapshot - one bounded model call per turn,
+    no tools, no authority, no conversation state."""
+    id = "custom.chat"
+    version = 1
+    DEFAULT_MAX_OUTPUT_TOKENS = 1024
+
+    def __init__(self, model_alias: str, system_prompt: str,
+                 max_output_tokens: int | None = None) -> None:
+        self._alias = model_alias
+        self._system = system_prompt
+        self._max = (max_output_tokens
+                     or self.DEFAULT_MAX_OUTPUT_TOKENS)
+
+    def run(self, input_blocks, context, emit) -> AgentStopReason:
+        text = "\n".join(b.text for b in input_blocks
+                         if b.kind == "text").strip()
+        if not text:
+            emit("message_chunk", "Nothing to answer.")
+            return AgentStopReason.REFUSAL
+        if context.is_cancelled():
+            return AgentStopReason.CANCELLED
+        messages = []
+        if self._system:
+            messages.append(ChatMessage(role=ChatRole.SYSTEM,
+                                        parts=[self._system]))
+        messages.append(ChatMessage(role=ChatRole.USER, parts=[text]))
+        try:
+            result = context.complete(ChatRequest(
+                model=self._alias, messages=messages,
+                max_output_tokens=self._max,
+                has_explicit_output_limit=True))
+            if context.is_cancelled():
+                return AgentStopReason.CANCELLED
+            if result.tool_calls:
+                emit("message_chunk",
+                     "This agent cannot execute tool calls.")
+                return AgentStopReason.ERROR
+            if result.finish_reason == FinishReason.CONTENT_FILTER:
+                emit("message_chunk",
+                     result.content or "Response was refused.")
+                return AgentStopReason.REFUSAL
+            if result.finish_reason in (FinishReason.ERROR,
+                                        FinishReason.TOOL_CALLS):
+                emit("message_chunk", "Model returned an unusable response.")
+                return AgentStopReason.ERROR
+            if not result.content.strip():
+                emit("message_chunk", "Model returned no usable text.")
+                return AgentStopReason.ERROR
+            emit("message_chunk", result.content)
+            return (AgentStopReason.MAX_TOKENS
+                    if result.finish_reason == FinishReason.LENGTH
+                    else AgentStopReason.END_TURN)
+        except PlatformError as e:
+            if e.code == ErrorCode.CANCELLED:
+                return AgentStopReason.CANCELLED
+            emit("message_chunk", f"Agent unavailable: {e.safe_message}")
+            return AgentStopReason.ERROR
+
+
 class AgentService:
     def __init__(self, supervisor=None) -> None:
         self._lock = threading.RLock()
@@ -185,6 +247,14 @@ class AgentService:
     def attach(self, supervisor) -> None:
         self._supervisor = supervisor
         supervisor.agent_service = self
+
+    def resume_sessions(self, store) -> None:
+        """Session ids persist in the durable ledger across restarts;
+        resume the in-memory sequence above them or the next
+        `sess-N` collides on the store's primary key. Called by the
+        supervisor after the store opens."""
+        with self._lock:
+            self._sequence = store.max_session_sequence()
 
     def register(self, profile: AgentProfile, harness_factory,
                  harness_id: str, harness_version: int) -> None:
@@ -224,6 +294,34 @@ class AgentService:
             self._versions.pop("operator", None)
             return existed
 
+    def register_custom_agent(self, agent_id: str, model_alias: str,
+                              system_prompt: str,
+                              max_output_tokens: int | None) -> None:
+        """Owner-declared chat agent. Each id gets its own
+        implementation_ref so its factory (system prompt + model) is
+        distinct; unregister keeps the harness entry so bound sessions
+        finish like operator sessions do."""
+        self.register(
+            AgentProfile(id=agent_id, version=1,
+                         harness_id=CustomChatHarness.id,
+                         harness_version=CustomChatHarness.version,
+                         state_schema_version=1,
+                         model_profile_alias=model_alias,
+                         implementation_ref=
+                         f"builtin:custom.chat/{agent_id}"),
+            lambda: CustomChatHarness(model_alias, system_prompt,
+                                      max_output_tokens),
+            CustomChatHarness.id, CustomChatHarness.version)
+
+    def unregister_agent(self, agent_id: str) -> bool:
+        """Remove any agent profile (custom or operator). Sessions keep
+        their bound profile snapshot; the harness factory stays so an
+        in-flight turn still resolves."""
+        with self._lock:
+            profile = self._profiles.pop(agent_id, None)
+            self._versions.pop(agent_id, None)
+            return profile is not None
+
     def register_runtime_operator(self, model_alias: str) -> None:
         self.register(
             AgentProfile(id="operator", version=1,
@@ -248,6 +346,8 @@ class AgentService:
                 "stateSchemaVersion": p.state_schema_version,
                 "toolScope": list(p.tool_scope),
                 "model": p.model_profile_alias,
+                "custom": p.implementation_ref.startswith(
+                    "builtin:custom.chat/"),
             } for p in sorted(self._profiles.values(), key=lambda x: x.id)]
 
     def profile(self, agent_id: str) -> AgentProfile | None:

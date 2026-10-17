@@ -77,8 +77,6 @@
     <div class="card">
       <h2>Model profiles</h2>
       <ul id="model-list" class="plain"></ul>
-      <h3>Agents</h3>
-      <ul id="agents" class="plain"></ul>
     </div>
 
     <div class="card">
@@ -90,12 +88,58 @@
       </p>
       <p id="catalog-status" class="error" role="status" hidden></p>
       <ul id="catalog-list" class="plain"></ul>
+      <h3>Add a model</h3>
+      <div class="formgrid">
+        <label>Alias <input id="add-alias" autocomplete="off"
+                          placeholder="my-model"></label>
+        <label>Provider
+          <select id="add-provider">
+            <option value="mlx">mlx</option>
+            <option value="llamacpp">llamacpp</option>
+            <option value="vllm-mlx">vllm-mlx</option>
+          </select></label>
+        <label>HF repo <input id="add-repo" autocomplete="off"
+                             placeholder="owner/name"></label>
+        <label>Revision <input id="add-revision" value="main"
+                              autocomplete="off"></label>
+        <label>File (llamacpp GGUF) <input id="add-file"
+            autocomplete="off" placeholder="model.gguf"></label>
+        <label><input type="checkbox" id="add-vision"> vision</label>
+        <label>Max output tokens <input id="add-max" type="number"
+            min="1" max="32768" placeholder="4096"></label>
+        <button type="button" id="add-model-btn">Declare</button>
+      </div>
+      <p id="add-model-status" class="hint" role="status"></p>
       <p class="hint">Pulls run governed: declared source + pinned
         revision, staged download, verified manifest. Remove deletes
-        artifacts only - the registry declaration stays for re-pull.
-        Nothing is downloaded at inference time. The provider runtime
-        install uses the same pinned env as
-        <code>provider install</code>.</p>
+        artifacts and evicts the resident model - the registry
+        declaration stays for re-pull. Nothing is downloaded at
+        inference time. The provider runtime install uses the same
+        pinned env as <code>provider install</code>. Custom
+        declarations accept any Hugging Face repo; the console pull
+        applies without a restart.</p>
+    </div>
+
+    <div class="card">
+      <h2>Agents</h2>
+      <ul id="agents" class="plain"></ul>
+      <h3>Add an agent</h3>
+      <div class="formgrid">
+        <label>Id <input id="agent-id" autocomplete="off"
+                        placeholder="my-assistant"></label>
+        <label>Bound model <select id="agent-model"></select></label>
+        <label>System prompt
+          <textarea id="agent-prompt" rows="2" maxlength="8192"
+                    placeholder="You are a concise assistant."></textarea></label>
+        <label>Max output tokens <input id="agent-max" type="number"
+            min="1" max="8192" placeholder="1024"></label>
+        <button type="button" id="agent-add-btn">Add agent</button>
+      </div>
+      <p id="agent-status" class="hint" role="status"></p>
+      <p class="hint">Custom agents are read-only chat harnesses served
+        over ACP (<code>acp --agent ID</code>) and the console Chat view:
+        one bounded model call per turn, no tools, no authority. They
+        persist in <code>config.json</code>.</p>
     </div>
 
     <div class="card">
@@ -136,20 +180,24 @@
     </div>
   </section>
 
-  <section id="view-chat" class="view" aria-label="Operator chat" hidden>
+  <section id="view-chat" class="view" aria-label="Agent chat" hidden>
     <div class="card">
-      <h2>Operator</h2>
-      <p class="hint" id="chat-meta">One bounded call per question; fresh
-        snapshot; no conversation memory or applied actions.</p>
+      <h2>Chat</h2>
+      <p class="hint" id="chat-meta">One bounded call per question; no
+        conversation memory or applied actions.</p>
+      <div class="oprow">
+        <label class="hint" for="chat-agent">Agent</label>
+        <select id="chat-agent"></select>
+      </div>
       <p class="hint">Bound model <span id="chat-model" class="mono">-</span>
          &middot; harness <span id="chat-harness" class="mono">-</span></p>
       <p id="chat-unavailable" class="error" role="status" hidden>
-        The Operator is not enabled. Start the daemon with
-        <code>--enable-operator</code> to use this view.
+        No agent is registered. Enable the Operator or add a custom
+        agent on the Models view.
       </p>
       <div id="chat-log" class="chatlog" aria-live="polite"></div>
       <form id="chat-form">
-        <label class="hint" for="chat-input">Question for the runtime Operator</label>
+        <label class="hint" for="chat-input">Message for the selected agent</label>
         <textarea id="chat-input" rows="3" maxlength="16384"
                   placeholder="Explain runtime status."></textarea>
         <div class="chat-actions">

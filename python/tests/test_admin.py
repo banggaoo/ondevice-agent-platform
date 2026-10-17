@@ -283,6 +283,256 @@ class TestPullDeclareRemove(unittest.TestCase):
         self.assertEqual(done.state, JobState.FAILED)
 
 
+class TestCustomModelDeclare(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sup = make_supervisor(self.tmp.name)
+        self.addCleanup(self.sup.shutdown)
+
+    def test_declare_custom_model_registers_live(self):
+        profile = self.sup.declare_custom_model(
+            alias="my-model", provider="mlx",
+            repo="owner/name", revision="main")
+        self.assertEqual(profile.alias, "my-model")
+        self.assertEqual(profile.source.repo, "owner/name")
+        self.assertIsNotNone(self.sup._model_profiles.get("my-model"))
+        payload = self.sup._root.read_json(self.sup._root.registry_path)
+        self.assertTrue(any(m["alias"] == "my-model"
+                            for m in payload["models"]))
+        status = self.sup.catalog_status()
+        mine = next(e for e in status["entries"]
+                    if e["alias"] == "my-model")
+        self.assertTrue(mine["custom"])
+        self.assertTrue(mine["declared"])
+        self.assertFalse(mine["ready"])
+
+    def test_declare_custom_model_pull_path(self):
+        self.sup.declare_custom_model(
+            alias="pull-me", provider="mlx",
+            repo="owner/name", revision="main")
+        calls = []
+
+        def fake_pull(self, source, artifact_file=None, progress=None,
+                      should_stop=None):
+            calls.append(source.repo)
+            return {"files": []}
+
+        with mock.patch.object(ModelStore, "pull", fake_pull):
+            job = self.sup.pull_model(ADMIN, "pull-me")
+            done = _wait_state(self.sup, job.id, {JobState.COMPLETED,
+                                                  JobState.FAILED})
+        self.assertEqual(done.state, JobState.COMPLETED)
+        self.assertEqual(calls, ["owner/name"])
+
+    def test_declare_rejects_bad_inputs(self):
+        for kwargs in (
+                dict(alias="Bad Alias", provider="mlx",
+                     repo="o/r", revision="main"),
+                dict(alias="ok", provider="vision-hybrid",
+                     repo="o/r", revision="main"),
+                dict(alias="ok2", provider="mlx",
+                     repo="not-a-repo", revision="main"),
+                dict(alias="ok3", provider="llamacpp",
+                     repo="o/r", revision="main",
+                     artifact_file="bad/path.gguf")):
+            with self.assertRaises(PlatformError) as cm:
+                self.sup.declare_custom_model(**kwargs)
+            self.assertIn(cm.exception.code,
+                          (ErrorCode.INVALID_REQUEST,
+                           ErrorCode.NOT_FOUND))
+
+    def test_declare_rejects_duplicate(self):
+        _declare_fake(self.sup)
+        with self.assertRaises(PlatformError) as cm:
+            self.sup.declare_custom_model(
+                alias="fake-pull", provider="mlx",
+                repo="o/r", revision="main")
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_custom_entry_has_source_gating(self):
+        # vision-hybrid-style declarations (no source) list without
+        # pull/remove affordances via hasSource.
+        self.sup.declare_custom_model(
+            alias="src-model", provider="mlx",
+            repo="o/r", revision="main")
+        status = self.sup.catalog_status()
+        mine = next(e for e in status["entries"]
+                    if e["alias"] == "src-model")
+        self.assertTrue(mine["hasSource"])
+
+
+class TestCustomAgents(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sup = make_supervisor(self.tmp.name)
+        self.addCleanup(self.sup.shutdown)
+        from ondevice_agent_platform.agents import AgentService
+        service = AgentService()
+        service.attach(self.sup)
+        self.service = service
+        self.sup.register_model(
+            ModelProfile(alias="m", provider_id="fake-llm",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=FakeLLM())
+
+    def test_add_agent_registers_and_persists(self):
+        self.sup.add_custom_agent(
+            ADMIN, "helper", "m", "Be terse.", 64)
+        profile = self.service.profile("helper")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.model_profile_alias, "m")
+        config = self.sup._root.read_json(self.sup._root.config_path)
+        self.assertEqual(config["agents"][0]["id"], "helper")
+        self.assertEqual(config["agents"][0]["model"], "m")
+
+    def test_add_agent_validation(self):
+        for bad in ("operator", "reference.echo", "Bad Id", "", None):
+            with self.assertRaises(PlatformError):
+                self.sup.add_custom_agent(ADMIN, bad, "m")
+        with self.assertRaises(PlatformError) as cm:
+            self.sup.add_custom_agent(ADMIN, "ghost-model-agent",
+                                      "no-such-model")
+        self.assertEqual(cm.exception.code, ErrorCode.NOT_FOUND)
+        with self.assertRaises(PlatformError) as cm:
+            self.sup.add_custom_agent(ADMIN, "big", "m",
+                                      "x" * (9 * 1024))
+        self.assertEqual(cm.exception.code,
+                         ErrorCode.PAYLOAD_TOO_LARGE)
+
+    def test_remove_agent_unregisters_and_clears(self):
+        self.sup.add_custom_agent(ADMIN, "helper", "m")
+        session = self.service.new_session("helper", "c", "conn")
+        self.sup.remove_custom_agent(ADMIN, "helper")
+        self.assertIsNone(self.service.profile("helper"))
+        config = self.sup._root.read_json(self.sup._root.config_path)
+        self.assertEqual(config.get("agents", []), [])
+        # The bound session keeps its profile snapshot, like operator.
+        self.assertEqual(session.profile.id, "helper")
+        with self.assertRaises(PlatformError):
+            self.service.new_session("helper", "c", "conn")
+
+    def test_remove_reserved_or_unknown(self):
+        with self.assertRaises(PlatformError) as cm:
+            self.sup.remove_custom_agent(ADMIN, "operator")
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        with self.assertRaises(PlatformError) as cm:
+            self.sup.remove_custom_agent(ADMIN, "ghost")
+        self.assertEqual(cm.exception.code, ErrorCode.NOT_FOUND)
+
+    def test_restore_custom_agents(self):
+        config = {"agents": [
+            {"id": "good", "model": "m", "systemPrompt": "hi",
+             "maxOutputTokens": 32},
+            {"id": "bad", "model": "ghost", "systemPrompt": "",
+             "maxOutputTokens": None},
+            "junk"]}
+        self.sup._root.write_json(config, self.sup._root.config_path)
+        self.sup.restore_custom_agents()
+        self.assertIsNotNone(self.service.profile("good"))
+        self.assertIsNone(self.service.profile("bad"))
+
+    def test_custom_agent_profile_summary_flag(self):
+        self.sup.add_custom_agent(ADMIN, "helper", "m")
+        summaries = self.service.profile_summaries()
+        mine = next(s for s in summaries if s["id"] == "helper")
+        self.assertTrue(mine["custom"])
+        self.assertEqual(mine["harnessId"], "custom.chat")
+
+
+class TestCustomAgentRoutes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sup = make_supervisor(self.tmp.name)
+        self.addCleanup(self.sup.shutdown)
+        from ondevice_agent_platform.agents import AgentService
+        service = AgentService()
+        service.attach(self.sup)
+        self.service = service
+        self.sup.register_model(
+            ModelProfile(alias="m2", provider_id="mlx",
+                         kind=ModelKind.LLM, task="chat",
+                         max_output_tokens=64),
+            provider=FakeLLM())
+        self.server = PlatformHTTPServer(self.sup, port=0)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.base = f"http://127.0.0.1:{self.server.port}"
+        self.csrf, self.cookie = self._session()
+
+    def _req(self, path, method="GET", body=None, headers=None):
+        h = {"Content-Type": "application/json",
+             "Origin": self.base}
+        h.update(headers or {})
+        r = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers=h, method=method)
+        try:
+            return urllib.request.urlopen(r, timeout=10)
+        except urllib.error.HTTPError as e:
+            return e
+
+    def _session(self):
+        r = urllib.request.Request(self.base + "/api/session",
+                                   data=b"", method="POST",
+                                   headers={"Origin": self.base})
+        resp = urllib.request.urlopen(r, timeout=10)
+        body = json.loads(resp.read())
+        cookie = resp.headers["Set-Cookie"].split(";")[0]
+        return body["csrf"], cookie
+
+    def _mutate(self, path, body):
+        return self._req(path, "POST", body, headers={
+            "Cookie": self.cookie, "X-CSRF-Token": self.csrf})
+
+    def test_declare_route(self):
+        r = self._mutate("/api/console/models/declare",
+                         {"alias": "my-model", "provider": "mlx",
+                          "repo": "owner/name", "revision": "main"})
+        self.assertEqual(r.status, 200)
+        self.assertIsNotNone(self.sup._model_profiles.get("my-model"))
+
+    def test_declare_route_rejects_unknown_fields(self):
+        r = self._mutate("/api/console/models/declare",
+                         {"alias": "x", "provider": "mlx",
+                          "repo": "o/r", "evil": True})
+        self.assertEqual(r.status, 400)
+
+    def test_declare_route_requires_session(self):
+        r = self._req("/api/console/models/declare", "POST",
+                      {"alias": "x", "provider": "mlx", "repo": "o/r"})
+        self.assertEqual(r.status, 401)
+
+    def test_agents_route_lists(self):
+        r = self._req("/api/agents")
+        self.assertEqual(r.status, 200)
+        self.assertIn("agents", json.loads(r.read()))
+
+    def test_agent_add_remove_routes(self):
+        r = self._mutate("/api/console/agents/add",
+                         {"id": "helper", "model": "m2",
+                          "systemPrompt": "Be terse."})
+        self.assertEqual(r.status, 200)
+        self.assertIsNotNone(self.service.profile("helper"))
+        r = self._mutate("/api/console/agents/remove",
+                         {"id": "helper"})
+        self.assertEqual(r.status, 200)
+        self.assertIsNone(self.service.profile("helper"))
+
+    def test_agent_add_rejects_reserved(self):
+        r = self._mutate("/api/console/agents/add",
+                         {"id": "operator", "model": "m2"})
+        self.assertEqual(r.status, 400)
+
+    def test_agent_remove_unknown(self):
+        r = self._mutate("/api/console/agents/remove", {"id": "ghost"})
+        self.assertEqual(r.status, 404)
+
+
 class TestOperatorToggle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -438,7 +688,10 @@ class TestAdminRoutes(unittest.TestCase):
         r = self._mutate("/api/console/operator", {"enabled": False})
         self.assertEqual(r.status, 200)
         self.assertFalse(json.loads(r.read())["enabled"])
-        self.assertIsNone(self.server.router._bridge)
+        # The bridge is shared with custom agents - it stays up;
+        # the operator profile is what disappears.
+        service = getattr(self.sup, "agent_service", None)
+        self.assertIsNone(service.profile("operator"))
 
     def test_operator_enable_unknown_model(self):
         r = self._mutate("/api/console/operator", {"model": "ghost"})

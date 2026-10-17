@@ -21,6 +21,7 @@ from .agents import AgentService
 from .console_bridge import ConsoleOperatorBridge
 from .console_sessions import ConsoleSessions
 from .errors import ErrorCode, PlatformError
+from .limits import PlatformLimits
 from .modelstore import ModelStore
 from .profiles import ModelKind, ModelProfile, ModelSource
 from .providers.linear import LinearPredictor
@@ -535,6 +536,7 @@ def cmd_serve(args) -> int:
             principal = supervisor.register_console_operator_consumer()
             bridge = ConsoleOperatorBridge(acp, supervisor, sessions,
                                            principal)
+        supervisor.restore_custom_agents()
         supervisor.start()
         server = PlatformHTTPServer(supervisor, acp, sessions, bridge,
                                     port=args.port)
@@ -640,6 +642,45 @@ def cmd_model_pull(args) -> int:
     print(f"installed {len(files)} file(s), "
           f"{total / 1e9:.2f} GB -> "
           f"{store.directory(source, artifact_file)}")
+    return 0
+
+
+def cmd_model_declare(args) -> int:
+    """Declare a non-catalog model into registry.json: any Hugging Face
+    repo on an artifact provider. The declaration is validated through
+    the same parse_registry path; a running daemon serves it after a
+    restart (or use the console's Add model, which registers live)."""
+    root = _root_for(args)
+    root.prepare()
+    capabilities = ["text", "vision"] if args.vision else ["text"]
+    source = {"repo": args.repo, "revision": args.revision}
+    if args.file:
+        source["file"] = args.file
+    value = {"alias": args.alias, "kind": "llm",
+             "provider": args.provider, "task": "chat",
+             "purposes": ["general"], "capabilities": capabilities,
+             "source": source}
+    if args.max_output_tokens:
+        value["maxOutputTokens"] = args.max_output_tokens
+    if args.image_soft_tokens:
+        value["imageMaxSoftTokens"] = args.image_soft_tokens
+    existing = root.read_json(root.registry_path) \
+        if os.path.isfile(root.registry_path) else None
+    existing = existing if isinstance(existing, dict) \
+        else {"models": []}
+    if any(m.get("alias") == args.alias
+           for m in existing.get("models", [])):
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            f"already declared: {args.alias}")
+    merged = {"schemaVersion": 1,
+              "models": list(existing.get("models", [])) + [value]}
+    parse_registry(merged)   # fail loudly before persisting
+    root.write_json(merged, root.registry_path)
+    print(f"declared {args.alias} ({args.provider}: "
+          f"{args.repo}@{args.revision}"
+          + (f" [{args.file}]" if args.file else "") + ")")
+    print(f"run `model pull --alias {args.alias}` to fetch artifacts; "
+          "restart `serve` for a running daemon to register it")
     return 0
 
 
@@ -1047,6 +1088,65 @@ def _install_impl(root: RuntimeRoot, args) -> int:
     return 0
 
 
+# -- agent ------------------------------------------------------------------------
+
+
+def _config_agents(root: RuntimeRoot) -> list:
+    agents = _read_config(root).get("agents", [])
+    return [a for a in agents if isinstance(a, dict)]
+
+
+def cmd_agent_list(args) -> int:
+    root = _root_for(args)
+    agents = _config_agents(root)
+    if not agents:
+        print("no custom agents declared")
+        return 0
+    for a in agents:
+        print(f"{a.get('id', '?'):24} model={a.get('model', '-')}")
+    return 0
+
+
+def cmd_agent_add(args) -> int:
+    root = _root_for(args)
+    root.prepare()
+    if args.system_prompt_file:
+        with open(args.system_prompt_file, "r",
+                  encoding="utf-8") as fh:
+            system_prompt = fh.read()
+    else:
+        system_prompt = args.system_prompt or ""
+    if len(system_prompt.encode()) > \
+            PlatformLimits.AGENT_SYSTEM_PROMPT_BYTES:
+        raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE,
+                            "system prompt too large")
+    config = _read_config(root)
+    agents = [a for a in _config_agents(root)
+              if a.get("id") != args.id]
+    agents.append({"id": args.id, "model": args.model,
+                   "systemPrompt": system_prompt,
+                   "maxOutputTokens": args.max_output_tokens})
+    config["agents"] = agents
+    root.write_json(config, root.config_path)
+    print(f"declared agent {args.id} (model {args.model}); "
+          "restart `serve` to activate, or use the console")
+    return 0
+
+
+def cmd_agent_remove(args) -> int:
+    root = _root_for(args)
+    config = _read_config(root)
+    agents = _config_agents(root)
+    kept = [a for a in agents if a.get("id") != args.id]
+    if len(kept) == len(agents):
+        raise PlatformError(ErrorCode.NOT_FOUND,
+                            f"agent not declared: {args.id}")
+    config["agents"] = kept
+    root.write_json(config, root.config_path)
+    print(f"removed agent {args.id}; restart `serve` to apply")
+    return 0
+
+
 # -- acp ------------------------------------------------------------------------
 
 
@@ -1087,6 +1187,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     model = sub.add_parser("model", help="model store commands")
     msub = model.add_subparsers(dest="model_command", required=True)
+    dec = msub.add_parser(
+        "declare", help="declare a non-catalog Hugging Face model")
+    dec.add_argument("--alias", required=True)
+    dec.add_argument("--provider", required=True,
+                     choices=["mlx", "llamacpp", "vllm-mlx"])
+    dec.add_argument("--repo", required=True,
+                     help="Hugging Face repo, owner/name")
+    dec.add_argument("--revision", default="main")
+    dec.add_argument("--file", default=None,
+                     help="single-file artifact (llamacpp GGUF)")
+    dec.add_argument("--vision", action="store_true",
+                     help="declare vision capability")
+    dec.add_argument("--max-output-tokens", type=int, default=None)
+    dec.add_argument("--image-soft-tokens", type=int, default=None)
+    data_root(dec)
+    dec.set_defaults(func=cmd_model_declare)
     pull = msub.add_parser("pull")
     pull.add_argument("--alias")
     pull.add_argument("--repo")
@@ -1134,6 +1250,26 @@ def build_parser() -> argparse.ArgumentParser:
                       help="after install, start the daemon and open the "
                       "console to finish setup (install models, Operator)")
     inst.set_defaults(func=cmd_install)
+
+    agent = sub.add_parser("agent", help="custom agent commands")
+    asub = agent.add_subparsers(dest="agent_command", required=True)
+    alist = asub.add_parser("list", help="list declared custom agents")
+    data_root(alist)
+    alist.set_defaults(func=cmd_agent_list)
+    aadd = asub.add_parser(
+        "add", help="declare a named chat agent bound to a model alias")
+    aadd.add_argument("--id", required=True)
+    aadd.add_argument("--model", required=True,
+                      help="declared model alias")
+    aadd.add_argument("--system-prompt", default=None)
+    aadd.add_argument("--system-prompt-file", default=None)
+    aadd.add_argument("--max-output-tokens", type=int, default=None)
+    data_root(aadd)
+    aadd.set_defaults(func=cmd_agent_add)
+    arm = asub.add_parser("remove", help="remove a custom agent")
+    arm.add_argument("--id", required=True)
+    data_root(arm)
+    arm.set_defaults(func=cmd_agent_remove)
 
     acp = sub.add_parser("acp", help="ACP stdio facade")
     acp.add_argument("--agent", required=True)

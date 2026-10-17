@@ -1,7 +1,9 @@
-"""Console-only bridge to the opt-in read-only runtime Operator, mirroring
-ConsoleOperatorBridge.swift. Reuses the shared ACP service under the fixed
-console consumer; accepts only a bounded {"text": ...} body; never exposes
-tool/model/cwd/configuration selection to the browser."""
+"""Console-only bridge to ACP-served agents, mirroring
+ConsoleOperatorBridge.swift. Reuses the shared ACP service under the
+fixed console consumer; accepts only a bounded {"text", "agent"?} body;
+never exposes tool/model/cwd/configuration selection to the browser.
+The Operator remains the default agent; owner-declared custom chat
+agents are reachable by id."""
 from __future__ import annotations
 
 import json
@@ -76,10 +78,10 @@ class ConsoleOperatorBridge:
         self._sessions = sessions
         self._principal = principal
         self._lock = threading.RLock()
-        self._bindings: dict[str, _Binding] = {}
-        self._creating: dict[str, threading.Event] = {}
-        self._created: dict[str, object] = {}
-        self._turn_owners: set[str] = set()
+        self._bindings: dict[tuple, _Binding] = {}
+        self._creating: dict[tuple, threading.Event] = {}
+        self._created: dict[tuple, object] = {}
+        self._turn_owners: set[tuple] = set()
         self._sequence = 0
 
     def bound_connection_count(self) -> int:
@@ -87,30 +89,32 @@ class ConsoleOperatorBridge:
             return len(self._bindings)
 
     @staticmethod
-    def _reply(model: str | None, text: str, stop: str) -> dict:
-        return {"agent": "operator", "model": model,
+    def _reply(agent: str, model: str | None, text: str,
+               stop: str) -> dict:
+        return {"agent": agent, "model": model,
                 "text": text, "stopReason": stop}
 
     def prompt(self, console_session, body: bytes, cancellation) -> dict:
-        if self._principal is None:
-            raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                "operator is not enabled")
-        text = self._parse_body(body)
+        text, agent_id = self._parse_body(body)
+        profile = self._s.agent_service.profile(agent_id) \
+            if self._s.agent_service else None
+        if profile is None:
+            raise PlatformError(ErrorCode.NOT_FOUND,
+                                f"agent not registered: {agent_id}")
         if cancellation.is_cancelled:
-            profile = self._s.agent_service.profile("operator")
-            return self._reply(
-                profile.model_profile_alias if profile else None,
-                "", "cancelled")
-        binding = self._binding_for(console_session)
-        if cancellation.is_cancelled:
-            return self._reply(binding.profile.model_profile_alias,
+            return self._reply(agent_id, profile.model_profile_alias,
                                "", "cancelled")
-        cookie_id = console_session.id
+        binding = self._binding_for(console_session, agent_id)
+        if cancellation.is_cancelled:
+            return self._reply(agent_id,
+                               binding.profile.model_profile_alias,
+                               "", "cancelled")
+        key = (console_session.id, agent_id)
         with self._lock:
-            if cookie_id in self._turn_owners:
+            if key in self._turn_owners:
                 raise PlatformError(ErrorCode.CONFLICT,
                                     "a question is already running")
-            self._turn_owners.add(cookie_id)
+            self._turn_owners.add(key)
             self._sequence += 1
             prompt_id = f"op-{self._sequence}"
         try:
@@ -136,16 +140,18 @@ class ConsoleOperatorBridge:
                                     "response overflow")
             stop = (response.get("result", {}) or {}).get(
                 "stopReason", "error")
-            return self._reply(binding.profile.model_profile_alias,
+            return self._reply(agent_id,
+                               binding.profile.model_profile_alias,
                                collector.joined_text, stop)
         finally:
             with self._lock:
-                self._turn_owners.discard(cookie_id)
+                self._turn_owners.discard(key)
 
     def connection_closed(self, cookie_id: str) -> None:
         with self._lock:
-            binding = self._bindings.pop(cookie_id, None)
-        if binding is not None:
+            owned = [k for k in self._bindings if k[0] == cookie_id]
+            bindings = [self._bindings.pop(k) for k in owned]
+        for binding in bindings:
             self._acp.connection_closed(binding.connection_id)
 
     def reap_expired(self) -> None:
@@ -153,78 +159,84 @@ class ConsoleOperatorBridge:
         with self._lock:
             expired = [k for k, b in self._bindings.items()
                        if b.expires_at <= now]
-        for cookie_id in expired:
+        for cookie_id in {k[0] for k in expired}:
             self.connection_closed(cookie_id)
 
-    def _parse_body(self, body: bytes) -> str:
+    def _parse_body(self, body: bytes) -> tuple:
         try:
             obj = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 'expected {"text": "..."}')
-        if not isinstance(obj, dict) or len(obj) != 1 or \
-                not isinstance(obj.get("text"), str):
+        if not isinstance(obj, dict) \
+                or not set(obj) <= {"text", "agent"} \
+                or not isinstance(obj.get("text"), str):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
-                                'expected {"text": "..."}')
+                                'expected {"text": "...", "agent"?}')
         text = obj["text"]
         if len(text.encode()) > PlatformLimits.AGENT_PROMPT_BYTES:
             raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE)
         if not text.strip():
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "empty question")
-        return text
+        agent_id = obj.get("agent") or "operator"
+        if not isinstance(agent_id, str):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "agent must be a string")
+        return text, agent_id
 
-    def _binding_for(self, session) -> _Binding:
+    def _binding_for(self, session, agent_id: str) -> _Binding:
         live = self._sessions.lookup(session.id)
         if live is None or live.csrf != session.csrf:
             raise PlatformError(ErrorCode.SESSION_CLOSED,
                                 "console session ended")
         now = time.time()
+        key = (session.id, agent_id)
         with self._lock:
-            existing = self._bindings.get(session.id)
+            existing = self._bindings.get(key)
             if existing and existing.expires_at > now:
                 return existing
             if len(self._bindings) >= PlatformLimits.CONSOLE_SESSIONS:
                 raise PlatformError(ErrorCode.CAPACITY_LIMITED,
-                                    "operator session limit")
-        # Single-flight creation per console session.
+                                    "agent session limit")
+        # Single-flight creation per console session + agent.
         with self._lock:
-            event = self._creating.get(session.id)
+            event = self._creating.get(key)
             if event is None:
                 event = threading.Event()
-                self._creating[session.id] = event
+                self._creating[key] = event
                 owner = True
             else:
                 owner = False
         if not owner:
             event.wait()
             with self._lock:
-                result = self._created.get(session.id)
+                result = self._created.get(key)
             if isinstance(result, _Binding):
                 return result
             if isinstance(result, PlatformError):
                 raise result
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE)
         try:
-            binding = self._create_binding(session)
+            binding = self._create_binding(session, agent_id)
             with self._lock:
-                self._bindings[session.id] = binding
-                self._created[session.id] = binding
+                self._bindings[key] = binding
+                self._created[key] = binding
             return binding
         except PlatformError as e:
             with self._lock:
-                self._created[session.id] = e
+                self._created[key] = e
             raise
         finally:
             event.set()
             with self._lock:
-                self._creating.pop(session.id, None)
-                self._created.pop(session.id, None)
+                self._creating.pop(key, None)
+                self._created.pop(key, None)
 
-    def _create_binding(self, session) -> _Binding:
+    def _create_binding(self, session, agent_id: str) -> _Binding:
         conn_id = f"console-{uuid.uuid4().hex}"
         collector = _Collector()
-        self._acp.bind(conn_id, "operator", self._principal)
+        self._acp.bind(conn_id, agent_id, self._principal)
         try:
             self._acp.handle(
                 conn_id,
@@ -237,12 +249,12 @@ class ConsoleOperatorBridge:
             if not isinstance(session_id, str) or not session_id:
                 self._acp.connection_closed(conn_id)
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                    "operator session failed")
-            profile = self._s.agent_service.profile("operator")
+                                    "agent session failed")
+            profile = self._s.agent_service.profile(agent_id)
             if profile is None:
                 self._acp.connection_closed(conn_id)
-                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                    "operator is not enabled")
+                raise PlatformError(ErrorCode.NOT_FOUND,
+                                    f"agent not registered: {agent_id}")
             return _Binding(conn_id, session_id, profile,
                             session.expires_at)
         except PlatformError:
