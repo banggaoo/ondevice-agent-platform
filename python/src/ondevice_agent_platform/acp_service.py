@@ -435,6 +435,12 @@ class _HarnessContext:
     def status_snapshot(self) -> dict:
         return self._s.status_snapshot()
 
+    def model_ready(self, model_alias: str) -> bool:
+        """Whether the bound model's artifacts are installed - lets a
+        harness report an actionable not-installed message instead of a
+        masked provider failure."""
+        return self._s.model_artifact_ready(model_alias)
+
     def complete(self, request):
         if self._token.is_cancelled:
             raise PlatformError(ErrorCode.CANCELLED)

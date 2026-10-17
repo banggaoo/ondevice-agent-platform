@@ -195,6 +195,11 @@ class CustomChatHarness:
             return AgentStopReason.REFUSAL
         if context.is_cancelled():
             return AgentStopReason.CANCELLED
+        if not context.model_ready(self._alias):
+            emit("message_chunk",
+                 f"model '{self._alias}' is not installed; "
+                 "pull it first.")
+            return AgentStopReason.ERROR
         messages = []
         if self._system:
             messages.append(ChatMessage(role=ChatRole.SYSTEM,

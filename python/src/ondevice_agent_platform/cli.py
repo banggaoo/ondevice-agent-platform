@@ -31,7 +31,7 @@ from .registry import (APPLE_PROVIDER_ID, LINEAR_PROVIDER_ID,
                        parse_registry)
 from .runtime_root import RuntimeRoot
 from .server import PlatformHTTPServer
-from .supervisor import PlatformSupervisor
+from .supervisor import PlatformSupervisor, validate_agent_id
 
 # One managed venv under <root>/providers/oap-env owns the platform's
 # provider dependencies: vllm-mlx's server binary resolves there without
@@ -1096,20 +1096,51 @@ def _config_agents(root: RuntimeRoot) -> list:
     return [a for a in agents if isinstance(a, dict)]
 
 
+def _registry_llm_entries(root: RuntimeRoot) -> dict:
+    """Declared registry entries keyed by alias; {} when no registry or
+    an unparsable one (serve refuses to boot on the same file)."""
+    if not os.path.isfile(root.registry_path):
+        return {}
+    try:
+        entries = parse_registry(root.read_json(root.registry_path))
+    except PlatformError:
+        return {}
+    return {e.profile.alias: e for e in entries}
+
+
+def _agent_model_state(entry, store: ModelStore) -> str:
+    if entry is None:
+        return "undeclared"
+    profile = entry.profile
+    if profile.kind != ModelKind.LLM:
+        return "not-llm"
+    if profile.source is None:
+        return "provider-bound"
+    return ("ready" if store.is_ready(profile.source, entry.artifact_file)
+            else "not-pulled")
+
+
 def cmd_agent_list(args) -> int:
     root = _root_for(args)
     agents = _config_agents(root)
     if not agents:
         print("no custom agents declared")
         return 0
+    entries = _registry_llm_entries(root)
+    store = ModelStore(root)
     for a in agents:
-        print(f"{a.get('id', '?'):24} model={a.get('model', '-')}")
+        alias = a.get("model", "-")
+        state = _agent_model_state(entries.get(alias), store)
+        extra = (f" · maxTokens={a['maxOutputTokens']}"
+                 if a.get("maxOutputTokens") else "")
+        print(f"{a.get('id', '?'):24} model={alias} ({state}){extra}")
     return 0
 
 
 def cmd_agent_add(args) -> int:
     root = _root_for(args)
     root.prepare()
+    validate_agent_id(args.id)
     if args.system_prompt_file:
         with open(args.system_prompt_file, "r",
                   encoding="utf-8") as fh:
@@ -1120,12 +1151,27 @@ def cmd_agent_add(args) -> int:
             PlatformLimits.AGENT_SYSTEM_PROMPT_BYTES:
         raise PlatformError(ErrorCode.PAYLOAD_TOO_LARGE,
                             "system prompt too large")
+    if args.max_output_tokens is not None and not (
+            0 < args.max_output_tokens <= PlatformLimits.OUTPUT_TOKENS):
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "--max-output-tokens out of bounds")
+    entries = _registry_llm_entries(root)
+    entry = entries.get(args.model)
+    if entry is None:
+        raise PlatformError(
+            ErrorCode.NOT_FOUND,
+            f"model alias not declared in registry.json: {args.model}")
+    if entry.profile.kind != ModelKind.LLM:
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            f"model is not an LLM route: {args.model}")
     config = _read_config(root)
     agents = [a for a in _config_agents(root)
               if a.get("id") != args.id]
-    agents.append({"id": args.id, "model": args.model,
-                   "systemPrompt": system_prompt,
-                   "maxOutputTokens": args.max_output_tokens})
+    spec = {"id": args.id, "model": args.model,
+            "systemPrompt": system_prompt}
+    if args.max_output_tokens is not None:
+        spec["maxOutputTokens"] = args.max_output_tokens
+    agents.append(spec)
     config["agents"] = agents
     root.write_json(config, root.config_path)
     print(f"declared agent {args.id} (model {args.model}); "
@@ -1257,7 +1303,8 @@ def build_parser() -> argparse.ArgumentParser:
     data_root(alist)
     alist.set_defaults(func=cmd_agent_list)
     aadd = asub.add_parser(
-        "add", help="declare a named chat agent bound to a model alias")
+        "add", help="declare or update a named chat agent bound to a "
+        "model alias")
     aadd.add_argument("--id", required=True)
     aadd.add_argument("--model", required=True,
                       help="declared model alias")

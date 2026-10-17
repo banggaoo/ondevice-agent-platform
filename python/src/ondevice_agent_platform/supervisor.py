@@ -34,7 +34,21 @@ from .state import JobKind, JobRecord, JobState, StateStore
 
 _ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _AGENT_ID_RE = re.compile(r"[a-z][a-z0-9._-]{0,31}")
-_RESERVED_AGENT_IDS = {"operator", "reference.status", "reference.echo"}
+_RESERVED_AGENT_IDS = {"operator"}
+
+
+def validate_agent_id(agent_id) -> None:
+    """The id contract shared by supervisor registration and the offline
+    CLI declaration path: an owner-chosen id, never the builtin
+    namespaces."""
+    if not isinstance(agent_id, str) \
+            or agent_id in _RESERVED_AGENT_IDS \
+            or agent_id.startswith("reference.") \
+            or not _AGENT_ID_RE.fullmatch(agent_id):
+        raise PlatformError(
+            ErrorCode.INVALID_REQUEST,
+            "agent id must be 1-32 lowercase letters, digits, . _ - "
+            "starting with a letter; operator/reference.* reserved")
 
 
 @dataclass
@@ -632,16 +646,20 @@ class PlatformSupervisor:
         config = self._read_config()
         agents = [a for a in config.get("agents", [])
                   if isinstance(a, dict) and a.get("id") != agent_id]
-        agents.append({"id": agent_id, "model": model_alias,
-                       "systemPrompt": system_prompt,
-                       "maxOutputTokens": max_output_tokens})
+        spec = {"id": agent_id, "model": model_alias,
+                "systemPrompt": system_prompt}
+        if max_output_tokens is not None:
+            spec["maxOutputTokens"] = max_output_tokens
+        agents.append(spec)
         config["agents"] = agents
         self._root.write_json(config, self._root.config_path)
 
     def remove_custom_agent(self, principal: Principal,
                             agent_id: str) -> None:
         self.require(Grant.ADMIN_MANAGE, principal)
-        if agent_id in _RESERVED_AGENT_IDS:
+        if not isinstance(agent_id, str) \
+                or agent_id in _RESERVED_AGENT_IDS \
+                or agent_id.startswith("reference."):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 f"agent id is reserved: {agent_id}")
         service = getattr(self, "agent_service", None)
@@ -661,13 +679,7 @@ class PlatformSupervisor:
         if service is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "agent service not attached")
-        if not isinstance(agent_id, str) \
-                or agent_id in _RESERVED_AGENT_IDS \
-                or not _AGENT_ID_RE.fullmatch(agent_id):
-            raise PlatformError(
-                ErrorCode.INVALID_REQUEST,
-                "agent id must be 1-32 lowercase letters, digits, . _ - "
-                "starting with a letter; operator/reference.* reserved")
+        validate_agent_id(agent_id)
         if not isinstance(system_prompt, str):
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "system prompt must be a string")
@@ -710,6 +722,42 @@ class PlatformSupervisor:
     def _read_config(self) -> dict:
         config = self._root.read_json(self._root.config_path)
         return config if isinstance(config, dict) else {}
+
+    def agent_summaries(self) -> list[dict]:
+        """Registered agent profiles joined with bound-model truth so
+        console/CLI surfaces can show why an agent would fail before a
+        prompt is sent."""
+        service = getattr(self, "agent_service", None)
+        if service is None:
+            return []
+        summaries = service.profile_summaries()
+        with self._lock:
+            models = dict(self._model_profiles)
+            providers = dict(self._llm_providers)
+        for a in summaries:
+            profile = models.get(a.get("model"))
+            a["modelDeclared"] = profile is not None
+            a["modelReady"] = None
+            if profile is not None and profile.provider_id in providers:
+                provider = providers[profile.provider_id]
+                if isinstance(provider, ProviderReadiness):
+                    a["modelReady"] = bool(
+                        provider.artifact_ready(profile))
+        return summaries
+
+    def model_artifact_ready(self, model_alias: str) -> bool:
+        """Whether a declared model's artifacts are installed. Providers
+        with no artifact concept count as ready - they decide at call
+        time."""
+        with self._lock:
+            profile = self._model_profiles.get(model_alias)
+            provider = (self._llm_providers.get(profile.provider_id)
+                        if profile is not None else None)
+        if profile is None or provider is None:
+            return False
+        if not isinstance(provider, ProviderReadiness):
+            return True
+        return bool(provider.artifact_ready(profile))
 
     # -- status ------------------------------------------------------------
 
@@ -825,8 +873,7 @@ class PlatformSupervisor:
     def registry_snapshot(self) -> dict:
         with self._lock:
             models = self._model_summaries_locked()
-            agents = (self.agent_service.profile_summaries()
-                      if self.agent_service else [])
+            agents = self.agent_summaries()
             return {
                 "models": [p.alias for p in
                            sorted(self._model_profiles.values(),

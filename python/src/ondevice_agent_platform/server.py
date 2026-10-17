@@ -350,9 +350,7 @@ class Router:
         return alias
 
     def _agents_payload(self) -> dict:
-        service = getattr(self._s, "agent_service", None)
-        agents = (service.profile_summaries() if service else [])
-        return {"agents": agents}
+        return {"agents": self._s.agent_summaries()}
 
     def _console_json_body(self, req) -> dict:
         self._require_console_session(req, mutation=True)

@@ -389,7 +389,8 @@ class TestCustomAgents(unittest.TestCase):
         self.assertEqual(config["agents"][0]["model"], "m")
 
     def test_add_agent_validation(self):
-        for bad in ("operator", "reference.echo", "Bad Id", "", None):
+        for bad in ("operator", "reference.echo", "reference.new",
+                    "Bad Id", "", None):
             with self.assertRaises(PlatformError):
                 self.sup.add_custom_agent(ADMIN, bad, "m")
         with self.assertRaises(PlatformError) as cm:
@@ -440,6 +441,93 @@ class TestCustomAgents(unittest.TestCase):
         mine = next(s for s in summaries if s["id"] == "helper")
         self.assertTrue(mine["custom"])
         self.assertEqual(mine["harnessId"], "custom.chat")
+
+    def test_agent_summaries_join_model_truth(self):
+        from ondevice_agent_platform.providers.base import (
+            ProviderReadiness)
+
+        class Unready(FakeLLM, ProviderReadiness):
+            provider_id = "unready-llm"
+
+            def artifact_ready(self, profile):
+                return False
+
+        self.sup.register_model(
+            ModelProfile(alias="unready", provider_id="unready-llm",
+                         kind=ModelKind.LLM, task="chat"),
+            provider=Unready())
+        self.sup.add_custom_agent(ADMIN, "plain", "m")
+        self.sup.add_custom_agent(ADMIN, "needy", "unready")
+        summaries = {a["id"]: a for a in self.sup.agent_summaries()}
+        # FakeLLM is not ProviderReadiness: readiness unknown, not False.
+        self.assertIsNone(summaries["plain"]["modelReady"])
+        self.assertTrue(summaries["plain"]["modelDeclared"])
+        self.assertIs(summaries["needy"]["modelReady"], False)
+        with self.sup._lock:
+            del self.sup._model_profiles["m"]
+        summaries = {a["id"]: a for a in self.sup.agent_summaries()}
+        self.assertFalse(summaries["plain"]["modelDeclared"])
+
+    def test_model_artifact_ready(self):
+        self.assertTrue(self.sup.model_artifact_ready("m"))
+        self.assertFalse(self.sup.model_artifact_ready("ghost"))
+
+
+class TestAgentCLI(unittest.TestCase):
+    """The offline `agent add` declaration path applies the same id and
+    bound-model contract as live registration - a bad spec must fail at
+    declare time, not be skipped silently at boot."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from ondevice_agent_platform.runtime_root import RuntimeRoot
+        self.root = RuntimeRoot(self.tmp.name)
+        self.root.prepare()
+        self.root.write_json(
+            {"schemaVersion": 1, "models": [
+                {"alias": "m", "kind": "llm", "provider": "mlx",
+                 "task": "chat", "purposes": ["general"],
+                 "capabilities": ["text"],
+                 "source": {"repo": "owner/name", "revision": "main"}}]},
+            self.root.registry_path)
+
+    def _args(self, **kw):
+        import argparse
+        defaults = dict(data_root=self.tmp.name, id="helper", model="m",
+                        system_prompt=None, system_prompt_file=None,
+                        max_output_tokens=None)
+        defaults.update(kw)
+        return argparse.Namespace(**defaults)
+
+    def test_add_validates_id_and_model(self):
+        from ondevice_agent_platform import cli
+        for bad in ("reference.new", "operator", "Bad Id", "x" * 33):
+            with self.assertRaises(PlatformError):
+                cli.cmd_agent_add(self._args(id=bad))
+        with self.assertRaises(PlatformError) as cm:
+            cli.cmd_agent_add(self._args(model="ghost"))
+        self.assertEqual(cm.exception.code, ErrorCode.NOT_FOUND)
+        with self.assertRaises(PlatformError) as cm:
+            cli.cmd_agent_add(self._args(max_output_tokens=99999))
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_add_writes_spec_and_list_reports_state(self):
+        from ondevice_agent_platform import cli
+        import contextlib
+        import io
+        cli.cmd_agent_add(self._args(system_prompt="hi",
+                                     max_output_tokens=32))
+        spec = self.root.read_json(self.root.config_path)["agents"][0]
+        self.assertEqual(spec["id"], "helper")
+        self.assertEqual(spec["model"], "m")
+        self.assertEqual(spec["maxOutputTokens"], 32)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.cmd_agent_list(self._args())
+        line = out.getvalue()
+        self.assertIn("helper", line)
+        self.assertIn("not-pulled", line)
+        self.assertIn("maxTokens=32", line)
 
 
 class TestCustomAgentRoutes(unittest.TestCase):

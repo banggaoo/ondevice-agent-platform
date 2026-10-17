@@ -1368,3 +1368,19 @@ agent `coder` (qwen3.8-9b) answered via console bridge and stdio ACP;
 custom model `tiny-test` declared, pulled ~400MB, and served real
 inference; custom agent survived a daemon restart from config.
 License set to MIT. Suite: 308+ tests.
+
+Agent surface hardening (2026-10-17): `validate_agent_id` is now shared
+by live registration and the offline `agent add` path, and the
+`reference.` prefix is enforced reserved (only exact ids were blocked
+before, so `reference.foo` could shadow the builtin namespace). CLI
+`agent add` now fails at declare time on an undeclared or non-LLM
+model alias instead of writing a spec boot silently skipped.
+`agent_summaries()` joins each registered profile with bound-model
+truth (`modelDeclared`/`modelReady` via ProviderReadiness) for
+/api/agents, registry_snapshot, and the console Agents card, which now
+shows installed/not-installed like the model rows. custom.chat
+preflights `context.model_ready(alias)` and emits an actionable
+"not installed; pull it first" turn rather than a masked
+provider-unavailable. `maxOutputTokens` is omitted from persisted
+agent specs when unset. `agent list` reports bound-model state offline
+via the registry + artifact manifest. Suite: 314 tests.

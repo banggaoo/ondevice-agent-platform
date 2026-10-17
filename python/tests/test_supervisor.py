@@ -88,6 +88,18 @@ class FakeLLM(LLMProvider):
         self._cancel.set()
 
 
+class FakeUnreadyLLM(FakeLLM, ProviderReadiness):
+    """Artifact-backed provider whose artifacts are not installed."""
+    provider_id = "unready-llm"
+
+    @property
+    def has_ready_artifact(self):
+        return False
+
+    def artifact_ready(self, profile):
+        return False
+
+
 class FakeEvictingLLM(FakeLLM, ModelCacheEvicting):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -915,6 +927,29 @@ class TestCustomChatHarness(unittest.TestCase):
         result = [m for m in out if m.get("id") == 3][0]
         self.assertEqual(result["result"]["stopReason"], "refusal")
         self.assertEqual(self.llm.calls, 0)
+
+    def test_uninstalled_model_reports_actionable_error(self):
+        self.sup.register_model(
+            ModelProfile(alias="unready", provider_id="unready-llm",
+                         kind=ModelKind.LLM, task="chat"),
+            provider=FakeUnreadyLLM())
+        self.sup.add_custom_agent(
+            LocalConsumers.ADMINISTRATION, "needy", "unready")
+        self.acp.bind("c2", "needy", LocalConsumers.AGENT)
+        out = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                        "params": {"cwd": "/tmp", "mcpServers": []}},
+                       conn="c2")
+        sid = out[0]["result"]["sessionId"]
+        out = self.rpc({"jsonrpc": "2.0", "id": 3,
+                        "method": "session/prompt",
+                        "params": {"sessionId": sid, "prompt": [
+                            {"type": "text", "text": "hello"}]}},
+                       conn="c2")
+        result = [m for m in out if m.get("id") == 3][0]
+        self.assertIn("error", json.dumps(result).lower())
+        notes = [m for m in out if m.get("method") == "session/update"]
+        self.assertTrue(
+            any("not installed" in json.dumps(n) for n in notes))
 
     def test_removed_agent_cannot_bind(self):
         self.sup.remove_custom_agent(

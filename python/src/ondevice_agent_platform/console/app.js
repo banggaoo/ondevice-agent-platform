@@ -215,7 +215,10 @@ function renderAgents(registry) {
         ` · harness ${a.harnessId} v${a.harnessVersion}` +
         ` · model ${a.model || "none"}` +
         ` · tools ${(a.toolScope || []).length}` +
-        (a.custom ? " · custom" : "");
+        (a.custom ? " · custom" : "") +
+        (a.modelDeclared === false ? " · model undeclared"
+         : a.modelReady === false ? " · model not installed"
+         : a.modelReady === true ? " · installed" : "");
       if (a.custom) {
         li.appendChild(actionButton("remove",
           () => modelMutation("/api/console/agents/remove",
