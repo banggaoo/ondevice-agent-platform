@@ -452,6 +452,59 @@ class TestMlxVlmPath(unittest.TestCase):
                          {"city": "Seoul", "units": "celsius"})
         self.assertEqual(result.content, "")
 
+    def test_functiongemma_call_markup_parsed(self):
+        # FunctionGemma emits <start_function_call>call:name{args}
+        # <end_function_call> with its own arg syntax (<escape> strings,
+        # bare scalars, unquoted-key literals).
+        text = ("<start_function_call>call:get_weather"
+                "{city:<escape>Seoul<escape>,days:3}"
+                "<end_function_call>")
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.finish_reason, FinishReason.TOOL_CALLS)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "get_weather")
+        self.assertEqual(result.tool_calls[0].arguments,
+                         {"city": "Seoul", "days": 3})
+        self.assertEqual(result.content, "")
+
+    def test_functiongemma_text_pseudo_call_becomes_content(self):
+        # "text:" blocks are FunctionGemma's plain-reply channel, not
+        # tool calls; extract the inner text as message content.
+        text = ('<start_function_call>text: "Please provide a city."'
+                '<end_function_call>')
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.finish_reason, FinishReason.STOP)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(result.content, "Please provide a city.")
+
+    def test_functiongemma_text_and_call_together(self):
+        text = ('<start_function_call>text: "Calling now."'
+                '<end_function_call>'
+                '<start_function_call>call:get_weather{city:"Busan"}'
+                '<end_function_call>')
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.finish_reason, FinishReason.TOOL_CALLS)
+        self.assertEqual(result.tool_calls[0].arguments,
+                         {"city": "Busan"})
+        self.assertEqual(result.content, "Calling now.")
+
+    def test_functiongemma_nested_literal_args(self):
+        text = ("<start_function_call>call:search"
+                "{query:<escape>cats<escape>,opts:{limit:5,deep:true}}"
+                "<end_function_call>")
+        req = _request(tools=[TOOL])
+        provider = MLXProvider.__new__(MLXProvider)
+        result = provider._result(text, req, 10, 5)
+        self.assertEqual(result.tool_calls[0].arguments,
+                         {"query": "cats",
+                          "opts": {"limit": 5, "deep": True}})
+
 
 class TestMlxTextPath(unittest.TestCase):
     def test_sampler_params_and_result(self):

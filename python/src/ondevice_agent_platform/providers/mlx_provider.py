@@ -536,18 +536,87 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                             args[pm.group(1).strip()] = raw
                     calls.append(ChatToolCall(name=match.group(1),
                                               arguments=args))
-            if calls:
-                content = re.sub(r'<think>.*?</think>', '', text,
-                                 flags=re.DOTALL)
-                content = re.sub(
-                    r'<\|channel>.*?<channel\|>', '', content,
-                    flags=re.DOTALL)
-                content = re.sub(
-                    r'\x3c\x7ctool_call\x3e.*?\x3ctool_call\x7c\x3e',
-                    '', content, flags=re.DOTALL)
-                content = re.sub(
-                    r'<tool_call>.*?</tool_call>', '', content,
-                    flags=re.DOTALL).strip()
+            if not calls:
+                # FunctionGemma markup: <start_function_call>call:name
+                # {args}<end_function_call>. Args use the model's own
+                # syntax: <escape>-wrapped or quoted strings, bare
+                # scalars, and {..}/[..] literals with unquoted keys.
+                def _fg_value(raw):
+                    raw = raw.strip()
+                    if raw.startswith("<escape>") \
+                            and raw.endswith("<escape>"):
+                        return raw[len("<escape>"):-len("<escape>")]
+                    try:
+                        return _json.loads(raw)
+                    except _json.JSONDecodeError:
+                        fixed = re.sub(r'<escape>(.*?)<escape>',
+                                       lambda m: _json.dumps(m.group(1)),
+                                       raw)
+                        fixed = re.sub(r'([{,]\s*)([\w.-]+)(\s*:)',
+                                       r'\1"\2"\3', fixed)
+                        try:
+                            return _json.loads(fixed)
+                        except _json.JSONDecodeError:
+                            return raw
+                for match in re.finditer(
+                        r'<start_function_call>\s*call:(\w+)\s*'
+                        r'\{(.*?)\}\s*<end_function_call>',
+                        text, re.DOTALL):
+                    args = {}
+                    for am in re.finditer(
+                            r'(\w+)\s*:\s*('
+                            r'<escape>.*?<escape>'
+                            r'|\{(?:[^{}]|\{[^{}]*\})*\}'
+                            r'|\[(?:[^\[\]]|\[[^\]]*\])*\]'
+                            r'|"(?:[^"\\]|\\.)*"'
+                            r'|[^,}]*)',
+                            match.group(2), re.DOTALL):
+                        args[am.group(1)] = _fg_value(am.group(2))
+                    calls.append(ChatToolCall(name=match.group(1),
+                                              arguments=args))
+                # Zero-argument form: call:name with no {..} body.
+                if not calls:
+                    for match in re.finditer(
+                            r'<start_function_call>\s*call:(\w+)\s*'
+                            r'(?:<end_function_call>'
+                            r'|<start_function_call>|$)', text, re.DOTALL):
+                        calls.append(ChatToolCall(
+                            name=match.group(1), arguments={}))
+        if calls or '<start_function_call>' in text:
+            content = re.sub(r'<think>.*?</think>', '', text,
+                             flags=re.DOTALL)
+            content = re.sub(
+                r'<\|channel>.*?<channel\|>', '', content,
+                flags=re.DOTALL)
+            content = re.sub(
+                r'\x3c\x7ctool_call\x3e.*?\x3ctool_call\x7c\x3e',
+                '', content, flags=re.DOTALL)
+            content = re.sub(
+                r'<tool_call>.*?</tool_call>', '', content,
+                flags=re.DOTALL)
+            # FunctionGemma's "text:" pseudo-call is the model's
+            # plain-reply channel; a bare block (no call:/text:) is a
+            # fumbled reply. Either way the text is message content.
+            parts = []
+            for m in re.finditer(
+                    r'<start_function_call>\s*(?!call:)'
+                    r'(?:text:\s*)?(.*?)'
+                    r'(?:<end_function_call>|<start_function_call>|$)',
+                    text, re.DOTALL):
+                part = re.sub(r'</?escape>', '', m.group(1)).strip()
+                if part.startswith('"'):
+                    part = part[1:]
+                if part.endswith('"'):
+                    part = part[:-1]
+                parts.append(part)
+            content = re.sub(
+                r'<start_function_call>.*?'
+                r'(?:<end_function_call>|<start_function_call>|$)',
+                '', content, flags=re.DOTALL).strip()
+            if parts:
+                reply = ' '.join(p for p in parts if p)
+                content = (reply + ' ' + content).strip() \
+                    if content else reply
         if calls:
             reason = FinishReason.TOOL_CALLS
         elif finish == "length":
