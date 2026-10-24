@@ -993,6 +993,51 @@ def _link_executable(root: RuntimeRoot, bin_name: str) -> str:
     return link
 
 
+def _install_apple_bridge(root: RuntimeRoot, source: str | None) -> None:
+    """Build and place the oap-apple-bridge helper into providers/.
+    macOS + a source checkout (Package.swift beside python/) + a swift
+    toolchain are all required; any miss is reported, never fatal -
+    the apple route just stays unavailable until the helper exists."""
+    from .compat import IS_MACOS
+    if not IS_MACOS:
+        return
+    package = (os.path.dirname(source) if source else None)
+    if package is None or not os.path.isfile(
+            os.path.join(package, "Package.swift")):
+        print("note: apple bridge not built - no source checkout found; "
+              "apple-foundation-model stays unavailable")
+        return
+    if shutil.which("swift") is None:
+        print("note: apple bridge not built - no swift toolchain; "
+              "apple-foundation-model stays unavailable")
+        return
+    print("building oap-apple-bridge (swift release build may take a "
+          "minute)…")
+    try:
+        proc = subprocess.run(
+            ["swift", "build", "-c", "release",
+             "--product", "oap-apple-bridge"],
+            cwd=package, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"note: apple bridge build failed: {e}")
+        return
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        print("note: apple bridge build failed: "
+              + (tail[-1] if tail else "swift build error"))
+        return
+    binary = os.path.join(package, ".build", "release",
+                          "oap-apple-bridge")
+    if not os.path.isfile(binary):
+        print("note: apple bridge build produced no binary")
+        return
+    target = os.path.join(root.providers_path, "oap-apple-bridge")
+    os.makedirs(root.providers_path, exist_ok=True)
+    shutil.copy2(binary, target)
+    os.chmod(target, 0o755)
+    print(f"apple bridge installed: {target}")
+
+
 def cmd_install(args) -> int:
     """Install the platform: managed provider env (reused, never wiped),
     the package installed non-editably from --source, and an
@@ -1083,6 +1128,7 @@ def _install_impl(root: RuntimeRoot, args) -> int:
         if bindir not in os.environ.get("PATH", "").split(os.pathsep):
             print(f"note: {bindir} is not on PATH - add it: "
                   f'export PATH="{bindir}:$PATH"')
+        _install_apple_bridge(root, source)
     if os.path.isfile(root.daemon_path):
         print("note: a daemon is running - restart `serve` to pick up "
               "the new install")

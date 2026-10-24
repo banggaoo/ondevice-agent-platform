@@ -674,6 +674,67 @@ class TestOperatorToggle(unittest.TestCase):
             self.service.new_session("operator", "c", "conn")
 
 
+class TestAppleToggle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sup = make_supervisor(self.tmp.name)
+        self.addCleanup(self.sup.shutdown)
+
+    def _enable(self):
+        from ondevice_agent_platform.providers import apple
+        from ondevice_agent_platform.profiles import LocalConsumers
+        with mock.patch.object(
+                apple.AppleFoundationProvider, "available_on_host",
+                staticmethod(lambda: True)):
+            self.sup.enable_apple(LocalConsumers.ADMINISTRATION)
+
+    def test_enable_apple_registers_and_persists(self):
+        from ondevice_agent_platform.profiles import LocalConsumers
+        self._enable()
+        aliases = [p.alias
+                   for p in self.sup.registered_models(ModelKind.LLM)]
+        self.assertIn("apple-foundation-model", aliases)
+        from ondevice_agent_platform.registry import APPLE_PROVIDER_ID
+        self.assertIn(APPLE_PROVIDER_ID, self.sup._llm_providers)
+        config = self.sup._root.read_json(self.sup._root.config_path)
+        self.assertTrue(config["enableAppleModel"])
+
+    def test_enable_apple_without_bridge_refused(self):
+        from ondevice_agent_platform.providers import apple
+        from ondevice_agent_platform.profiles import LocalConsumers
+        with mock.patch.object(
+                apple.AppleFoundationProvider, "available_on_host",
+                staticmethod(lambda: False)):
+            with self.assertRaises(PlatformError) as cm:
+                self.sup.enable_apple(LocalConsumers.ADMINISTRATION)
+        self.assertEqual(cm.exception.code,
+                         ErrorCode.PROVIDER_UNAVAILABLE)
+        self.assertFalse(os.path.exists(self.sup._root.config_path))
+
+    def test_disable_apple_unregisters_and_clears(self):
+        from ondevice_agent_platform.profiles import LocalConsumers
+        from ondevice_agent_platform.registry import APPLE_PROVIDER_ID
+        self._enable()
+        provider = self.sup._llm_providers[APPLE_PROVIDER_ID]
+        closed = []
+        provider.close = lambda: closed.append(True)
+        self.sup.disable_apple(LocalConsumers.ADMINISTRATION)
+        aliases = [p.alias
+                   for p in self.sup.registered_models(ModelKind.LLM)]
+        self.assertNotIn("apple-foundation-model", aliases)
+        self.assertNotIn(APPLE_PROVIDER_ID, self.sup._llm_providers)
+        self.assertTrue(closed)
+        config = self.sup._root.read_json(self.sup._root.config_path)
+        self.assertFalse(config["enableAppleModel"])
+
+    def test_disable_apple_idempotent(self):
+        from ondevice_agent_platform.profiles import LocalConsumers
+        self.sup.disable_apple(LocalConsumers.ADMINISTRATION)
+        config = self.sup._root.read_json(self.sup._root.config_path)
+        self.assertFalse(config["enableAppleModel"])
+
+
 class TestAdminRoutes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -219,6 +219,8 @@ class Router:
             return self._console_agent_add(req)
         if method == "POST" and path == "/api/console/agents/remove":
             return self._console_agent_remove(req)
+        if method == "POST" and path == "/api/console/apple":
+            return self._console_apple(req)
         if method == "POST" and path == "/api/console/operator":
             return self._console_operator(req)
         if method == "POST" and path == "/api/console/operator/prompt":
@@ -422,6 +424,21 @@ class Router:
         self._consumer_rate_limit("console-admin")
         job = self._s.install_provider_env(LocalConsumers.ADMINISTRATION)
         return _Response.json({"jobId": job.id, "state": job.state.value})
+
+    def _console_apple(self, req: _Request) -> _Response:
+        self._require_console_session(req, mutation=True)
+        self._consumer_rate_limit("console-admin")
+        try:
+            body = json.loads(req.body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise PlatformError(ErrorCode.MALFORMED_JSON)
+        enabled = (body.get("enabled", True)
+                   if isinstance(body, dict) else True)
+        if enabled is not True:
+            self._s.disable_apple(LocalConsumers.ADMINISTRATION)
+            return _Response.json({"enabled": False})
+        self._s.enable_apple(LocalConsumers.ADMINISTRATION)
+        return _Response.json({"enabled": True})
 
     def _console_operator(self, req: _Request) -> _Response:
         self._require_console_session(req, mutation=True)

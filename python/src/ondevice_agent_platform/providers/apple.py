@@ -96,9 +96,13 @@ class AppleFoundationProvider(LLMProvider):
             raise PlatformError(
                 ErrorCode.INVALID_REQUEST,
                 "apple route honors only temperature")
-        if request.tools or request.tool_choice not in (None,) and \
-                getattr(request.tool_choice, "value", request.tool_choice) \
-                != "none":
+        # AUTO/NONE with no tools offered means no tool surface at all;
+        # refuse only when tools exist or a call is explicitly demanded
+        # (REQUIRED / a named tool) - an AUTO default is not a demand.
+        from ..chat import NamedToolChoice, ToolChoice
+        if request.tools \
+                or isinstance(request.tool_choice, NamedToolChoice) \
+                or request.tool_choice == ToolChoice.REQUIRED:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 "apple provider does not accept tools")
         for m in request.messages:

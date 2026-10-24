@@ -170,6 +170,25 @@ function renderOverview(s) {
   setText("cat-ml", cats.typedML);
 }
 
+/* The apple route is opt-in: enabled state derives from the registered
+ * model profiles, availability from the status readout. The toggle is
+ * hidden when the route can neither be enabled nor disabled. */
+function renderApple(s, registry) {
+  const btn = $("apple-toggle");
+  if (!btn) return;
+  const enabled = ((registry && registry.modelProfiles) || [])
+    .some((p) => p.alias === "apple-foundation-model");
+  const available = s.appleAvailability === "available";
+  if (!enabled && !available) {
+    btn.hidden = true;
+    return;
+  }
+  btn.hidden = false;
+  btn.textContent = enabled ? "disable" : "enable";
+  btn.onclick = () => modelMutation("/api/console/apple",
+                                  { enabled: !enabled });
+}
+
 function renderModels(registry) {
   /* Rich profiles when the daemon reports them; plain alias lists remain
    * the fallback for an older or partial server response. */
@@ -703,6 +722,7 @@ async function refreshStatus() {
     state.data = { status: status.body, registry: registry.body,
                    jobs: jobs.body, catalog: catalog.body };
     renderOverview(status.body);
+    renderApple(status.body, registry.body);
     renderModels(registry.body);
     renderJobs(jobs.body.jobs || []);
     renderCatalog(catalog.body, registry.body, jobs.body.jobs || []);

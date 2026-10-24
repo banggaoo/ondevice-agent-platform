@@ -636,6 +636,40 @@ class PlatformSupervisor:
     def unregister_runtime_operator(self) -> None:
         self.clear_operator()
 
+    def enable_apple(self, principal: Principal) -> None:
+        """Register the Apple Foundation Models route live and persist
+        `enableAppleModel` so the next serve applies it without a flag.
+        Requires the bridge helper; an absent helper is refused rather
+        than silently ignored."""
+        self.require(Grant.ADMIN_MANAGE, principal)
+        from .providers.apple import (AppleFoundationProvider,
+                                      APPLE_MODEL_ALIAS)
+        if not AppleFoundationProvider.available_on_host():
+            raise PlatformError(
+                ErrorCode.PROVIDER_UNAVAILABLE,
+                "apple bridge helper not available on this host")
+        provider = AppleFoundationProvider(
+            providers_dir=self._root.providers_path)
+        self.register_model(ModelProfile(
+            alias=APPLE_MODEL_ALIAS, provider_id=APPLE_PROVIDER_ID,
+            kind=ModelKind.LLM, task="chat", capabilities=("text",),
+            max_output_tokens=8192), provider=provider)
+        config = self._read_config()
+        config["enableAppleModel"] = True
+        self._root.write_json(config, self._root.config_path)
+
+    def disable_apple(self, principal: Principal) -> None:
+        self.require(Grant.ADMIN_MANAGE, principal)
+        from .providers.apple import APPLE_MODEL_ALIAS
+        with self._lock:
+            self._model_profiles.pop(APPLE_MODEL_ALIAS, None)
+            provider = self._llm_providers.pop(APPLE_PROVIDER_ID, None)
+        if provider is not None:
+            provider.close()
+        config = self._read_config()
+        config["enableAppleModel"] = False
+        self._root.write_json(config, self._root.config_path)
+
     def add_custom_agent(self, principal: Principal, agent_id: str,
                          model_alias: str, system_prompt: str = "",
                          max_output_tokens: int | None = None) -> None:
