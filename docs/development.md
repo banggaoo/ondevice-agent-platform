@@ -1236,13 +1236,14 @@ confirmed - the job sat CANCELLATION_UNCONFIRMED and `_inference_blocked`
 refused all new submissions for the rest of the (40s+) load, and the
 completed load was then thrown away with the dead job.
 
-`MLXProvider._ensure_container` now runs the load on a provider-owned
-daemon thread (`_loads` per alias, deduplicated); job workers wait on the
-load's event and unwind on cancellation. A disconnect mid-load resolves
-CANCELLED immediately (confirmable - no latch), while the load still
-completes and caches the container for the next caller. Eviction-during-
-load stays guarded by the existing epoch check; a load thread that ends
-without a result reports provider_unavailable to its waiters.
+`MLXProvider._ensure_container` runs the load through a provider-owned
+in-flight entry (`_loads` per alias, deduplicated); the first caller
+executes the load on the platform's single MLX lane thread (see the
+2026-10-26 note below), later callers wait on the load's event and
+unwind on cancellation. A disconnect mid-load resolves CANCELLED
+immediately (confirmable - no latch), while the lane still completes
+and caches the container for the next caller. Eviction-during-load
+stays guarded by the existing epoch check.
 
 Verified live on :8080: disconnect 3s into a `gemma4-e4b` cold load ->
 job `cancelled` (confirmed, `inferenceBlocked` stayed false); the
@@ -1414,3 +1415,34 @@ its persisted context). Session ids and turns both survive restart.
 reference.echo also consumes the session transcript; the Operator
 stays stateless by contract. Image-attached turns record an "[image]"
 marker in history. Suite: 324+ tests.
+
+## LoRA adapters, the MLX GPU lane, and nemotron-e4b (2026-10-26)
+
+Adapters: an `mlx` text-model declaration may bind `adapter:
+{repo, revision}` - a second governed artifact pulled through the same
+ModelStore under the same admin pull job, ANDed into
+`artifact_ready`/`model_artifact_ready`, passed to
+`mlx_lm.load(adapter_path=…)` at container build, and removed only when
+no other declared model shares the source. Registry validation refuses
+`adapter` on vision and non-mlx routes; console declare, CLI
+`declare/pull/list/remove`, and the supervisor declare/pull/remove
+paths all carry it.
+
+Lane: verified empirically that MLX stream tables are per-thread with
+process-global indices, and lazy arrays keep the stream handle that
+produced them - a container loaded on a dedicated loader thread then
+driven from a job worker fails `no Stream(gpu,N) in current thread`
+(reproduced on the Gemma4 E4B text path; qwen-vl/qwen3.8 happened not
+to trip it). All loads and generations now run on one persistent
+`oap-mlx-lane` thread inside `MLXProvider`. `ACTIVE_INFERENCE` is 1, so
+the single lane loses no parallelism; the disconnect-mid-load contract
+is unchanged (the caller unwinds CANCELLED while the lane finishes and
+caches the container).
+
+Model swap: `qwen3.8-9b` replaced by `rapid-mlx/
+NVIDIA-Nemotron-3.5-Bolt-E4B-MLX-4bit` (~4.0 GB, Gemma4 text arch,
+tool-call qualified) as `nemotron-e4b`; `coder` rebinds to it. Also
+shipped: `available_on_host` takes `providers_dir` so apple status/
+enable find the managed `providers/oap-apple-bridge` without a repo
+`.build` tree. Suite: 362/362; nemotron serving verified live through
+`/v1/chat/completions` and a `coder` ACP turn on :8081.
