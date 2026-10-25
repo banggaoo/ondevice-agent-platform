@@ -1439,9 +1439,11 @@ the single lane loses no parallelism; the disconnect-mid-load contract
 is unchanged (the caller unwinds CANCELLED while the lane finishes and
 caches the container).
 
-Model swap: `qwen3.8-9b` replaced by `rapid-mlx/
-NVIDIA-Nemotron-3.5-Bolt-E4B-MLX-4bit` (~4.0 GB, Gemma4 text arch,
-tool-call qualified) as `nemotron-e4b`; `coder` rebinds to it. Also
+Model swap: `qwen3.8-9b` replaced by `mlx-community/
+NVIDIA-Nemotron-3.5-Bolt-E4B-OptiQ-4bit` (~7.0 GB full multimodal
+checkpoint incl. vision/audio towers; per-tensor mixed 4/8-bit quant is
+native to pinned `mlx_lm`'s `config["quantization"]` map handling, no
+mlx-optiq dependency) as `nemotron-e4b`; `coder` rebinds to it. Also
 shipped: `available_on_host` takes `providers_dir` so apple status/
 enable find the managed `providers/oap-apple-bridge` without a repo
 `.build` tree. Suite: 362/362; nemotron serving verified live through
