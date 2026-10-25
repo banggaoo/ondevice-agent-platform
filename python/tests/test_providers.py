@@ -70,10 +70,15 @@ class _Chunk:
 
 
 class _FakeStore:
-    def __init__(self, ready=True):
+    def __init__(self, ready=True, ready_repos=None):
         self._ready = ready
+        self._ready_repos = ready_repos
+        self._root = types.SimpleNamespace(
+            models_path=tempfile.gettempdir())
 
     def is_ready(self, source, artifact_file=None):
+        if self._ready_repos is not None:
+            return source.repo in self._ready_repos
         return self._ready
 
     def directory(self, source, artifact_file=None):
@@ -218,7 +223,10 @@ def _lm_module(chunks, captured):
             yield c
 
     lm.stream_generate = stream_generate
-    lm.load = lambda path: (object(), object())
+    def load(path, adapter_path=None):
+        captured["adapter_path"] = adapter_path
+        return (object(), object())
+    lm.load = load
     sample_utils = types.ModuleType("mlx_lm.sample_utils")
 
     def make_sampler(**kw):
@@ -710,16 +718,21 @@ class TestAppleBridgeLifecycle(unittest.TestCase):
                 except PlatformError as e:
                     box["r"] = e
 
-            t = threading.Thread(target=run, daemon=True)
-            t.start()
-            # Wait until the fake child has consumed the request line:
-            # the provider is now blocked in stdout.readline.
-            deadline = time.time() + 10
-            while not os.path.exists(marker) and time.time() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(os.path.exists(marker))
-            token.cancel()
-            t.join(5)
+            # _ensure resolves a bridge path before reusing the injected
+            # child; the check must not depend on a local swift build.
+            with mock.patch(
+                    "ondevice_agent_platform.providers.apple._bridge_binary",
+                    return_value="/bin/true"):
+                t = threading.Thread(target=run, daemon=True)
+                t.start()
+                # Wait until the fake child has consumed the request line:
+                # the provider is now blocked in stdout.readline.
+                deadline = time.time() + 10
+                while not os.path.exists(marker) and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(marker))
+                token.cancel()
+                t.join(5)
             self.assertFalse(t.is_alive())
             self.assertIsInstance(box.get("r"), PlatformError)
             self.assertEqual(box["r"].code, ErrorCode.CANCELLED)
@@ -969,6 +982,131 @@ class TestVisionHybrid(unittest.TestCase):
             delegate=_FakeDelegate(ready=False))
         self.assertFalse(hybrid.has_ready_artifact)
         self.assertIs(hybrid.artifact_ready(profile), False)
+
+
+class TestMlxAdapter(unittest.TestCase):
+    """A bound LoRA adapter is part of the model's artifact set: the
+    store's verified dir becomes mlx_lm.load's adapter_path, and
+    readiness ANDs base + adapter."""
+
+    def _profile_with_adapter(self, adapter_repo="o/lora"):
+        import dataclasses
+        p = _profile()
+        return dataclasses.replace(
+            p, adapter=ModelSource(repo=adapter_repo, revision="main"))
+
+    def test_container_load_passes_adapter_path(self):
+        captured = {}
+        lm, modules = _lm_module([], captured)
+        provider = MLXProvider(_FakeStore())
+        profile = self._profile_with_adapter()
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(mlx_provider, "_import_mlx_lm",
+                                  return_value=lm):
+            provider._container_for(profile)
+        self.assertEqual(captured["adapter_path"],
+                         tempfile.gettempdir())
+
+    def test_no_adapter_loads_plain(self):
+        captured = {}
+        lm, modules = _lm_module([], captured)
+        provider = MLXProvider(_FakeStore())
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(mlx_provider, "_import_mlx_lm",
+                                  return_value=lm):
+            provider._container_for(_profile())
+        self.assertIsNone(captured["adapter_path"])
+
+    def test_unpulled_adapter_refuses(self):
+        # Base artifact ready, adapter not: the route refuses rather
+        # than silently loading base weights only.
+        provider = MLXProvider(_FakeStore(ready_repos={"o/r"}))
+        raises(ErrorCode.PROVIDER_UNAVAILABLE,
+               provider._container_for, self._profile_with_adapter())
+
+    def test_artifact_ready_ands_adapter(self):
+        profile = self._profile_with_adapter()
+        ready = MLXProvider(_FakeStore(ready_repos={"o/r", "o/lora"}))
+        self.assertTrue(ready.artifact_ready(profile))
+        base_only = MLXProvider(_FakeStore(ready_repos={"o/r"}))
+        self.assertFalse(base_only.artifact_ready(profile))
+        nothing = MLXProvider(_FakeStore(ready_repos=set()))
+        self.assertFalse(nothing.artifact_ready(profile))
+
+
+class TestLane(unittest.TestCase):
+    """The single GPU thread that owns every load and generation. MLX
+    stream tables are per-thread, so containers must live on the thread
+    that produced them; the lane is what makes that true."""
+
+    def test_run_returns_result_and_propagates_error(self):
+        lane = mlx_provider._Lane()
+        try:
+            self.assertEqual(lane.run(lambda: 3), 3)
+
+            def boom():
+                raise ValueError("x")
+
+            with self.assertRaises(ValueError):
+                lane.run(boom)
+            # An error must not poison the lane.
+            self.assertEqual(lane.run(lambda: 4), 4)
+        finally:
+            lane.stop()
+        self.assertFalse(lane._t.is_alive())
+
+    def test_cancellation_leaves_lane_task_running(self):
+        lane = mlx_provider._Lane()
+        try:
+            finished = threading.Event()
+
+            def slow():
+                time.sleep(0.3)
+                finished.set()
+                return "done"
+
+            token = CancellationToken()
+            box = {}
+
+            def call():
+                try:
+                    lane.run(slow, token)
+                except PlatformError as e:
+                    box["r"] = e
+
+            t = threading.Thread(target=call, daemon=True)
+            t.start()
+            time.sleep(0.05)
+            token.cancel()
+            t.join(3)
+            self.assertEqual(box["r"].code, ErrorCode.CANCELLED)
+            self.assertTrue(finished.wait(3))
+        finally:
+            lane.stop()
+
+    def test_complete_runs_generation_on_lane_thread(self):
+        provider = _installed_provider(vlm=False)
+        captured = {}
+
+        def stream_generate(model, tokenizer, prompt=None, **kw):
+            captured["thread"] = threading.current_thread().name
+            yield _Chunk("hi", finish_reason="stop")
+
+        lm = types.ModuleType("mlx_lm")
+        lm.stream_generate = stream_generate
+        sample_utils = types.ModuleType("mlx_lm.sample_utils")
+        sample_utils.make_sampler = lambda **kw: ("sampler", kw)
+        lm.sample_utils = sample_utils
+        mods = {"mlx_lm": lm, "mlx_lm.sample_utils": sample_utils}
+        tokenizer = types.SimpleNamespace(
+            apply_chat_template=lambda *a, **kw: "p")
+        provider._containers["m"].processor = tokenizer
+        with mock.patch.dict(sys.modules, mods), \
+                mock.patch.object(mlx_provider, "_import_mlx_lm",
+                                  return_value=lm):
+            result = provider.complete(_request(), _profile())
+        self.assertEqual(result.content, "hi")
+        self.assertEqual(captured["thread"], "oap-mlx-lane")
 
 
 if __name__ == "__main__":

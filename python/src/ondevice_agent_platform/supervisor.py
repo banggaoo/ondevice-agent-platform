@@ -378,8 +378,15 @@ class PlatformSupervisor:
                                 f"alias not declared: {alias}")
         store = ModelStore(self._root)
         source, artifact_file = match.profile.source, match.artifact_file
+        adapter = match.profile.adapter
 
         def work(token, progress):
+            # A bound adapter is part of the model's artifact set:
+            # pulled under the same governed job before the route can
+            # report ready.
+            if adapter is not None:
+                store.pull(adapter,
+                           should_stop=lambda: token.is_cancelled)
             store.pull(source, artifact_file=artifact_file,
                        progress=progress,
                        should_stop=lambda: token.is_cancelled)
@@ -409,7 +416,9 @@ class PlatformSupervisor:
                              artifact_file: str | None = None,
                              capabilities=None, purposes=None,
                              max_output_tokens: int | None = None,
-                             image_max_soft_tokens: int | None = None
+                             image_max_soft_tokens: int | None = None,
+                             adapter_repo: str | None = None,
+                             adapter_revision: str = "main"
                              ) -> ModelProfile:
         """Declare a non-catalog model: any Hugging Face repo on a
         real artifact provider, validated through parse_registry before
@@ -445,6 +454,9 @@ class PlatformSupervisor:
             value["maxOutputTokens"] = max_output_tokens
         if image_max_soft_tokens is not None:
             value["imageMaxSoftTokens"] = image_max_soft_tokens
+        if adapter_repo is not None:
+            value["adapter"] = {"repo": adapter_repo,
+                                "revision": adapter_revision}
         return self._declare_model_value(alias, value)
 
     def _declare_model_value(self, alias: str, value: dict) -> ModelProfile:
@@ -520,8 +532,15 @@ class PlatformSupervisor:
         if match is None or match.profile.source is None:
             raise PlatformError(ErrorCode.NOT_FOUND,
                                 f"alias not declared: {alias}")
-        ModelStore(self._root).remove(match.profile.source,
-                                      match.artifact_file)
+        store = ModelStore(self._root)
+        store.remove(match.profile.source, match.artifact_file)
+        adapter = match.profile.adapter
+        if adapter is not None:
+            shared = any(
+                e.profile.adapter == adapter
+                for e in entries if e.profile.alias != alias)
+            if not shared:
+                store.remove(adapter)
         # Delete first, then evict: the epoch bump lands after any
         # in-flight load's captured epoch, so its result discards
         # instead of caching a removed artifact's container.
@@ -644,7 +663,8 @@ class PlatformSupervisor:
         self.require(Grant.ADMIN_MANAGE, principal)
         from .providers.apple import (AppleFoundationProvider,
                                       APPLE_MODEL_ALIAS)
-        if not AppleFoundationProvider.available_on_host():
+        if not AppleFoundationProvider.available_on_host(
+                self._root.providers_path):
             raise PlatformError(
                 ErrorCode.PROVIDER_UNAVAILABLE,
                 "apple bridge helper not available on this host")
@@ -879,7 +899,8 @@ class PlatformSupervisor:
         if not IS_MACOS:
             return "notApplePlatform"
         from .providers.apple import AppleFoundationProvider
-        return ("available" if AppleFoundationProvider.available_on_host()
+        return ("available" if AppleFoundationProvider.available_on_host(
+                    self._root.providers_path)
                 else "unavailable")
 
     def _apple_category(self) -> CategoryStatus:

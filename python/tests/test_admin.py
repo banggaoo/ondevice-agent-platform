@@ -686,7 +686,7 @@ class TestAppleToggle(unittest.TestCase):
         from ondevice_agent_platform.profiles import LocalConsumers
         with mock.patch.object(
                 apple.AppleFoundationProvider, "available_on_host",
-                staticmethod(lambda: True)):
+                staticmethod(lambda *_a, **_k: True)):
             self.sup.enable_apple(LocalConsumers.ADMINISTRATION)
 
     def test_enable_apple_registers_and_persists(self):
@@ -705,7 +705,7 @@ class TestAppleToggle(unittest.TestCase):
         from ondevice_agent_platform.profiles import LocalConsumers
         with mock.patch.object(
                 apple.AppleFoundationProvider, "available_on_host",
-                staticmethod(lambda: False)):
+                staticmethod(lambda *_a, **_k: False)):
             with self.assertRaises(PlatformError) as cm:
                 self.sup.enable_apple(LocalConsumers.ADMINISTRATION)
         self.assertEqual(cm.exception.code,

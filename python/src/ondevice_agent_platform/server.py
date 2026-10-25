@@ -370,13 +370,21 @@ class Router:
         body = self._console_json_body(req)
         unknown = set(body) - {"alias", "provider", "repo", "revision",
                                "file", "capabilities", "purposes",
-                               "maxOutputTokens", "imageMaxSoftTokens"}
+                               "maxOutputTokens", "imageMaxSoftTokens",
+                               "adapter"}
         if unknown:
             raise PlatformError(ErrorCode.INVALID_REQUEST,
                                 f"unknown fields: {sorted(unknown)}")
         capabilities = body.get("capabilities")
         if capabilities is None and body.get("vision") is True:
             capabilities = ["text", "vision"]
+        adapter = body.get("adapter")
+        if adapter is not None and not isinstance(adapter, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "adapter must be an object")
+        adapter_repo = adapter.get("repo") if adapter else None
+        adapter_revision = (adapter.get("revision") or "main"
+                            if adapter else "main")
         profile = self._s.declare_custom_model(
             alias=body.get("alias"), provider=body.get("provider"),
             repo=body.get("repo"),
@@ -384,7 +392,9 @@ class Router:
             artifact_file=body.get("file"),
             capabilities=capabilities, purposes=body.get("purposes"),
             max_output_tokens=body.get("maxOutputTokens"),
-            image_max_soft_tokens=body.get("imageMaxSoftTokens"))
+            image_max_soft_tokens=body.get("imageMaxSoftTokens"),
+            adapter_repo=adapter_repo,
+            adapter_revision=adapter_revision)
         return _Response.json({"ok": True, "alias": profile.alias})
 
     def _console_agent_add(self, req: _Request) -> _Response:

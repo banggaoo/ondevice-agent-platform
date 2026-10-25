@@ -241,6 +241,37 @@ class TestRegistry(unittest.TestCase):
             raises(ErrorCode.INVALID_REQUEST, parse_registry,
                    {"schemaVersion": 1, "models": [bad]})
 
+    MLX = {"alias": "m2", "kind": "llm", "provider": "mlx",
+           "task": "chat", "capabilities": ["text"],
+           "source": {"repo": "o/r", "revision": "abc1234"}}
+
+    def test_adapter_valid_mlx_text(self):
+        entry = dict(self.MLX, adapter={"repo": "o/lora"})
+        entries = parse_registry({"schemaVersion": 1, "models": [entry]})
+        self.assertEqual(entries[0].profile.adapter.repo, "o/lora")
+        self.assertEqual(entries[0].profile.adapter.revision, "main")
+
+    def test_adapter_is_mlx_only(self):
+        bad = dict(self.LLM, adapter={"repo": "o/lora"})
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
+    def test_adapter_rejects_vision(self):
+        bad = dict(self.MLX, capabilities=["text", "vision"],
+                   adapter={"repo": "o/lora"})
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
+    def test_adapter_unknown_key_rejected(self):
+        bad = dict(self.MLX, adapter={"repo": "o/lora", "scale": 0.5})
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
+    def test_adapter_bad_repo_rejected(self):
+        bad = dict(self.MLX, adapter={"repo": "bad repo!!"})
+        raises(ErrorCode.INVALID_REQUEST, parse_registry,
+               {"schemaVersion": 1, "models": [bad]})
+
     def test_linear_valid(self):
         entries = parse_registry({"schemaVersion": 1, "models": [{
             "alias": "clf", "kind": "ml", "provider": "builtin.linear",

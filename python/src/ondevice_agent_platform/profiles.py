@@ -47,6 +47,10 @@ class ModelProfile:
     # max_soft_tokens); None = the model's own default.
     image_max_soft_tokens: int | None = None
     source: ModelSource | None = None
+    # LoRA adapter bound to this model (mlx text models only): a
+    # governed artifact pulled like `source`, passed as adapter_path
+    # at load. None = base weights only.
+    adapter: ModelSource | None = None
 
 
 @dataclass(frozen=True)

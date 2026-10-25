@@ -17,7 +17,7 @@ _TOP_KEYS = {"schemaVersion", "models"}
 _MODEL_KEYS = {
     "alias", "kind", "task", "provider", "purposes", "capabilities",
     "inputSchema", "outputSchema", "maxInputBytes", "maxOutputTokens",
-    "imageMaxSoftTokens", "linear", "source", "delegate",
+    "imageMaxSoftTokens", "linear", "source", "delegate", "adapter",
 }
 
 MLX_PROVIDER_ID = "mlx"
@@ -196,6 +196,27 @@ def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
             if provider != LLAMACPP_PROVIDER_ID:
                 raise PlatformError(ErrorCode.INVALID_REQUEST,
                                     "source file is a llamacpp-only key")
+    adapter = None
+    adapter_obj = obj.get("adapter")
+    if adapter_obj is not None:
+        if provider != MLX_PROVIDER_ID:
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "adapter is an mlx-only key")
+        if not isinstance(adapter_obj, dict):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "adapter must be an object")
+        for key in adapter_obj:
+            if key not in ("repo", "revision"):
+                raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                    "unknown adapter key")
+        arepo, arev = (adapter_obj.get("repo"),
+                       adapter_obj.get("revision", "main"))
+        if (not isinstance(arepo, str) or not isinstance(arev, str)
+                or not is_valid_repo(arepo)
+                or not is_valid_revision(arev)):
+            raise PlatformError(ErrorCode.INVALID_REQUEST,
+                                "adapter repo/revision malformed")
+        adapter = ModelSource(repo=arepo, revision=arev)
     task = obj.get("task", "chat")
     if task != "chat":
         raise PlatformError(ErrorCode.INVALID_REQUEST,
@@ -222,11 +243,17 @@ def _parse_llm(obj: dict, alias: str) -> RegistryEntry:
             raise PlatformError(
                 ErrorCode.INVALID_REQUEST,
                 "imageMaxSoftTokens requires vision capability")
+    if adapter is not None and "vision" in capabilities:
+        # mlx-vlm exposes no adapter_path; only the text route can
+        # bind a LoRA adapter.
+        raise PlatformError(ErrorCode.INVALID_REQUEST,
+                            "adapter is not supported on vision models")
     return RegistryEntry(profile=ModelProfile(
         alias=alias, provider_id=provider, kind=ModelKind.LLM, task=task,
         purposes=tuple(purposes), capabilities=tuple(capabilities),
         max_input_bytes=max_input, max_output_tokens=max_out,
-        image_max_soft_tokens=img_tokens, source=source),
+        image_max_soft_tokens=img_tokens, source=source,
+        adapter=adapter),
         artifact_file=artifact_file, delegate=delegate)
 
 

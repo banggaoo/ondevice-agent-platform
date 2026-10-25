@@ -634,6 +634,11 @@ def cmd_model_pull(args) -> int:
                                 "--repo and --revision required")
         source = ModelSource(repo=args.repo, revision=args.revision)
         artifact_file = args.file
+    if args.alias and match.profile.adapter is not None:
+        adapter = match.profile.adapter
+        if not store.is_ready(adapter):
+            print(f"pulling adapter {adapter.repo}@{adapter.revision}")
+            store.pull(adapter, progress=_progress(adapter.repo))
     print(f"pulling {source.repo}@{source.revision}"
           + (f" [{artifact_file}]" if artifact_file else ""))
     manifest = store.pull(source, artifact_file=artifact_file,
@@ -665,6 +670,9 @@ def cmd_model_declare(args) -> int:
         value["maxOutputTokens"] = args.max_output_tokens
     if args.image_soft_tokens:
         value["imageMaxSoftTokens"] = args.image_soft_tokens
+    if args.adapter_repo:
+        value["adapter"] = {"repo": args.adapter_repo,
+                            "revision": args.adapter_revision}
     existing = root.read_json(root.registry_path) \
         if os.path.isfile(root.registry_path) else None
     existing = existing if isinstance(existing, dict) \
@@ -697,8 +705,14 @@ def cmd_model_list(args) -> int:
         src = p.source.repo if p.source else "-"
         ready = (store.is_ready(p.source, e.artifact_file)
                  if p.source else True)
+        adapter = ""
+        if p.adapter is not None:
+            ready = ready and store.is_ready(p.adapter)
+            adapter = (f" adapter:{p.adapter.repo}"
+                       f"{' ready' if store.is_ready(p.adapter) else ' not-pulled'}")
         print(f"{p.alias:24} {p.kind.value:4} {p.provider_id:10} "
-              f"{p.task:15} {'ready' if ready else 'not-pulled':10} {src}")
+              f"{p.task:15} {'ready' if ready else 'not-pulled':10} {src}"
+              f"{adapter}")
     return 0
 
 
@@ -713,6 +727,11 @@ def cmd_model_remove(args) -> int:
         raise PlatformError(ErrorCode.NOT_FOUND,
                             f"alias not declared: {args.alias}")
     store.remove(match.profile.source, match.artifact_file)
+    adapter = match.profile.adapter
+    if adapter is not None and not any(
+            e.profile.adapter == adapter
+            for e in entries if e.profile.alias != args.alias):
+        store.remove(adapter)
     print(f"removed artifacts for {args.alias} "
           f"(registry declaration kept)")
     return 0
@@ -1297,6 +1316,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="declare vision capability")
     dec.add_argument("--max-output-tokens", type=int, default=None)
     dec.add_argument("--image-soft-tokens", type=int, default=None)
+    dec.add_argument("--adapter-repo", default=None,
+                     help="LoRA adapter repo (mlx text models only)")
+    dec.add_argument("--adapter-revision", default="main")
     data_root(dec)
     dec.set_defaults(func=cmd_model_declare)
     pull = msub.add_parser("pull")

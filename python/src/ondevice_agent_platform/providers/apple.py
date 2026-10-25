@@ -67,8 +67,8 @@ class AppleFoundationProvider(LLMProvider):
         self._providers_dir = providers_dir
 
     @staticmethod
-    def available_on_host() -> bool:
-        return IS_MACOS and _bridge_binary() is not None
+    def available_on_host(providers_dir: str | None = None) -> bool:
+        return IS_MACOS and _bridge_binary(providers_dir) is not None
 
     def requires_load(self, profile) -> bool:
         return False   # system-managed; never loads platform weights

@@ -8,6 +8,7 @@ Swift PlatformMLX provider.
 from __future__ import annotations
 
 import importlib.util
+import queue
 import threading
 import time
 from io import BytesIO
@@ -44,6 +45,55 @@ def _module_present(name: str) -> bool:
         return False
 
 
+class _Lane:
+    """One persistent thread for every MLX load and generation.
+
+    MLX streams live in a per-thread table with process-global indices,
+    and lazy arrays keep a handle to the stream that produced them. A
+    container loaded on a dedicated loader thread then driven from a
+    job worker fails with "no Stream(gpu,N) in current thread" (seen on
+    Gemma4 hybrids). ACTIVE_INFERENCE already serializes work, so one
+    lane loses no parallelism; a caller that disconnects mid-load still
+    leaves the lane free to finish caching the container.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue = queue.Queue()
+        self._t = threading.Thread(target=self._loop, daemon=True,
+                                   name="oap-mlx-lane")
+        self._t.start()
+
+    def _loop(self) -> None:
+        while True:
+            task = self._q.get()
+            if task is None:
+                return
+            fn, done, box = task
+            try:
+                box["result"] = fn()
+            except BaseException as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+    def run(self, fn, token=None):
+        done = threading.Event()
+        box: dict = {}
+        self._q.put((fn, done, box))
+        while not done.wait(0.25):
+            if token is not None and token.is_cancelled:
+                raise PlatformError(ErrorCode.CANCELLED)
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def stop(self) -> None:
+        if threading.current_thread() is self._t:
+            return
+        self._q.put(None)
+        self._t.join(timeout=5)
+
+
 class _Container:
     def __init__(self, model, processor, vlm: bool) -> None:
         self.model = model
@@ -56,7 +106,6 @@ class _Load:
     """One in-flight container load: provider-owned, shared by waiters."""
     def __init__(self) -> None:
         self.event = threading.Event()
-        self.thread = None
         self.container = None
         self.error = None
 
@@ -72,6 +121,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         self._loads: dict[str, _Load] = {}
         self._profiles: list = []
         self._lock = threading.Lock()
+        self._lane = _Lane()
 
     def track_profiles(self, profiles) -> None:
         self._profiles = list(profiles)
@@ -92,7 +142,12 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
     def artifact_ready(self, profile) -> bool | None:
         if profile.source is None:
             return None
-        return self._store.is_ready(profile.source)
+        if not self._store.is_ready(profile.source):
+            return False
+        adapter = getattr(profile, "adapter", None)
+        if adapter is not None and not self._store.is_ready(adapter):
+            return False
+        return True
 
     def requires_load(self, profile) -> bool:
         with self._lock:
@@ -149,6 +204,7 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
 
     def close(self) -> None:
         self.evict_resident()
+        self._lane.stop()
 
     def validate(self, request, profile) -> None:
         # mlx-lm/vlm's sampler surface has no presence/frequency penalty;
@@ -171,14 +227,15 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
                                 "this provider")
 
     def _ensure_container(self, profile, token):
-        """Return the resident container, joining or starting a
+        """Return the resident container, joining or running a
         provider-owned load when needed.
 
-        The blocking model load runs on a dedicated daemon thread, not the
-        job's worker: a request whose caller disconnects mid-load stops
-        waiting immediately (a confirmable CANCELLED), while the load still
-        completes and caches the container for the next caller. Concurrent
-        callers for the same alias share one in-flight load.
+        The first caller runs the load itself - always on the lane for
+        the serving path, so every array is produced on the thread that
+        later generates. A caller that disconnects mid-load stops
+        waiting immediately (a confirmable CANCELLED) while the lane
+        still completes and caches the container. Concurrent callers
+        for the same alias share one in-flight load.
         """
         with self._lock:
             container = self._containers.get(profile.alias)
@@ -188,16 +245,14 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if load is None:
                 load = _Load()
                 self._loads[profile.alias] = load
-                load.thread = threading.Thread(
-                    target=self._load_worker, args=(profile, load),
-                    daemon=True, name=f"oap-mlx-load-{profile.alias}")
-                load.thread.start()
+                owner = True
+            else:
+                owner = False
+        if owner:
+            self._load_worker(profile, load)
         while not load.event.wait(0.25):
             if token is not None and token.is_cancelled:
                 raise PlatformError(ErrorCode.CANCELLED)
-            if not load.thread.is_alive():
-                raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
-                                    "model load worker ended without result")
         if token is not None and token.is_cancelled:
             raise PlatformError(ErrorCode.CANCELLED)
         if load.error is not None:
@@ -259,7 +314,15 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
             if lm is None:
                 raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                     "mlx-lm not installed")
-            model, processor = lm.load(path)
+            adapter_dir = None
+            adapter = getattr(profile, "adapter", None)
+            if adapter is not None:
+                if not self._store.is_ready(adapter):
+                    raise PlatformError(
+                        ErrorCode.PROVIDER_UNAVAILABLE,
+                        "adapter artifact not pulled")
+                adapter_dir = self._store.directory(adapter)
+            model, processor = lm.load(path, adapter_path=adapter_dir)
         container = _Container(model, processor, vision)
         with self._lock:
             # Epoch guard: an eviction during load discards this container.
@@ -273,6 +336,11 @@ class MLXProvider(LLMProvider, ModelCacheEvicting, ProviderReadiness):
         if _import_mlx_lm() is None:
             raise PlatformError(ErrorCode.PROVIDER_UNAVAILABLE,
                                 "mlx-lm not installed")
+        return self._lane.run(
+            lambda: self._complete_on_lane(request, profile, token),
+            token)
+
+    def _complete_on_lane(self, request, profile, token):
         with self._lock:
             self._serving_add(profile.alias)
         try:
